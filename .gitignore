@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Created by the one-click installer: the private Python, the virtual
+# environment, and the bootstrap download cache.
+installer_files/
+
+# Written by setup; points at wherever the models were installed. Machine
+# specific, never committed.
+install.json
+
+# Default install root when setup is not given another directory. Holds the
+# llama.cpp runtime, the GGUF weights, the projector, logs and cache.
+user_data/

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prompt-master-standalone"
+version = "1.0.0"
+description = "LTX-Video 2.3 prompt generator with a local llama.cpp/Gemma runtime"
+requires-python = ">=3.12"
+# numpy is required by the vendored upstream imaging.py: style_hint() uses it
+# for the flat-cel detector that hardens the I2V cartoon medium law.
+dependencies = ["PySide6==6.8.1", "Pillow==11.0.0", "httpx==0.28.1", "psutil==6.1.1", "numpy==2.2.1"]
+
+[project.scripts]
+prompt-master = "prompt_master.app:main"
+prompt-master-setup = "prompt_master.setup_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+prompt_master = ["release-manifest.json"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
