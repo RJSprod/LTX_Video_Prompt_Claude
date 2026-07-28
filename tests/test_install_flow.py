@@ -8,6 +8,8 @@ and the console setup that the one-click installer drives.
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import re
 import zipfile
@@ -19,7 +21,9 @@ from prompt_master.core.models import GpuInfo
 from prompt_master.core.paths import DEFAULT_SUBDIR, ROOT_ENV, AppPaths
 from prompt_master.inference.device_detection import (PINNED, QUANTIZATIONS,
     recommended_quantization, runtime_component_id, vram_shortfall_mb)
-from prompt_master.provisioning import installer
+from prompt_master.provisioning import importer, installer, verifier
+from prompt_master.provisioning.importer import LocalSource, SourceMismatch
+from prompt_master.provisioning.manifest import Component
 from prompt_master import setup_cli
 
 
@@ -240,6 +244,288 @@ def test_no_gpu_is_a_clean_exit(monkeypatch):
     monkeypatch.setattr(setup_cli, "detect_gpus", lambda: [])
     with pytest.raises(SystemExit, match="no CUDA GPU"):
         setup_cli.ask_gpu(None)
+
+
+# ── supplying the model from disk instead of downloading it ──────────────────
+#
+# The model is one 16-27 GiB file, and a connection that cannot carry it is not
+# something setup can fix. Anyone who already has it hands it over instead.
+
+def pin_to_file(monkeypatch, path, key="model-Q6_K_P"):
+    """Rewrite the manifest so ``key`` pins the bytes of ``path`` — a test can
+    then supply a file that really is the pinned artifact without writing 21 GiB."""
+    components = dict(installer.load_components())
+    body = path.read_bytes()
+    components[key] = dataclasses.replace(components[key], size=len(body),
+                                          sha256=hashlib.sha256(body).hexdigest())
+    monkeypatch.setattr(installer, "load_components", lambda: components)
+    return components
+
+
+def pinned(path, component_id="model-Q6_K_P", destination="models/model.gguf"):
+    """A manifest entry for a file that exists, so a supplied copy can match it."""
+    body = path.read_bytes()
+    return Component(component_id, "https://example.invalid/model.gguf", destination,
+                     len(body), hashlib.sha256(body).hexdigest(), "pinned")
+
+
+def their_file(tmp_path, name="Gemma4-Q6_K_P.gguf", body=b"pretend gguf" * 512):
+    path = tmp_path / "downloads" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    return path
+
+
+def test_a_supplied_file_is_moved_not_copied(tmp_path):
+    """The whole point of handing over a 21 GiB file already on the disk is not
+    to end up with two of them."""
+    source = their_file(tmp_path)
+    destination = tmp_path / "user_data" / "models" / "model.gguf"
+
+    assert importer.adopt(pinned(source), destination, LocalSource(source)) == destination
+    assert destination.read_bytes() == b"pretend gguf" * 512
+    assert not source.exists()
+
+
+def test_keeping_the_source_copies_instead(tmp_path):
+    source = their_file(tmp_path)
+    destination = tmp_path / "user_data" / "models" / "model.gguf"
+
+    importer.adopt(pinned(source), destination, LocalSource(source, move=False))
+    assert source.exists() and destination.read_bytes() == source.read_bytes()
+
+
+def test_adopting_clears_the_abandoned_download_it_replaces(tmp_path):
+    """The 175 MiB of a download that never finished is dead weight once the
+    file arrives from disk — and a part file blocks a later resume anyway."""
+    source = their_file(tmp_path)
+    destination = tmp_path / "user_data" / "models" / "model.gguf"
+    destination.parent.mkdir(parents=True)
+    part = destination.with_name(destination.name + ".part")
+    part.write_bytes(b"an interrupted download")
+
+    importer.adopt(pinned(source), destination, LocalSource(source))
+    assert not part.exists()
+
+
+def test_a_file_already_at_the_destination_is_left_where_it_is(tmp_path):
+    destination = tmp_path / "user_data" / "models" / "model.gguf"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"already installed")
+
+    assert importer.adopt(pinned(destination), destination, LocalSource(destination)) == destination
+    assert destination.read_bytes() == b"already installed"
+
+
+def test_a_file_that_is_not_the_pinned_artifact_is_refused_and_left_alone(tmp_path):
+    """Refusing before the move matters: their only copy must survive a no."""
+    source = their_file(tmp_path)
+    component = dataclasses.replace(pinned(source), sha256="0" * 64)
+    destination = tmp_path / "user_data" / "models" / "model.gguf"
+
+    with pytest.raises(SourceMismatch, match="pinned SHA-256"):
+        importer.adopt(component, destination, LocalSource(source))
+    assert source.exists() and not destination.exists()
+
+
+def test_the_wrong_size_is_refused_without_reading_the_file(tmp_path, monkeypatch):
+    """21 GiB takes minutes to hash. The two ordinary mistakes — the wrong
+    quantization, a half-finished download — are visible from the size alone."""
+    source = their_file(tmp_path)
+    component = dataclasses.replace(pinned(source), size=22758955104)
+    monkeypatch.setattr(verifier, "digest_of", lambda *_a, **_k: pytest.fail("must not hash"))
+
+    problem = importer.size_problem(component, source)
+    assert "6.00 KiB" in problem and "21.20 GiB" in problem
+
+
+def test_a_cross_drive_move_copies_then_removes_the_original(tmp_path, monkeypatch):
+    """os.replace cannot cross volumes, which is the ordinary case here: the
+    model was downloaded to C: and the install root is on D:."""
+    source = their_file(tmp_path)
+    destination = tmp_path / "user_data" / "models" / "model.gguf"
+    monkeypatch.setattr(importer.os, "replace", _refusing_replace(destination))
+    seen = []
+
+    importer.adopt(pinned(source), destination, LocalSource(source), lambda done, total: seen.append(done))
+    assert destination.read_bytes() == b"pretend gguf" * 512
+    assert not source.exists()
+    assert seen and seen[-1] == destination.stat().st_size   # the copy reported progress
+
+
+def _refusing_replace(destination):
+    """os.replace that fails for the destination itself, as a cross-volume
+    rename does, but still works for the .part the copy renames into place."""
+    real = importer.os.replace
+
+    def replace(source, target):
+        if Path(target) == destination and Path(source).suffix != ".part":
+            raise OSError(17, "cross-device link")
+        return real(source, target)
+
+    return replace
+
+
+def test_a_cross_drive_move_checks_for_room_first(tmp_path, monkeypatch):
+    source = their_file(tmp_path)
+    destination = tmp_path / "user_data" / "models" / "model.gguf"
+    destination.parent.mkdir(parents=True)
+    monkeypatch.setattr(importer.os, "replace", _refusing_replace(destination))
+    monkeypatch.setattr(importer.shutil, "disk_usage", lambda _path: _Usage(64))
+
+    with pytest.raises(OSError, match="free"):
+        importer.adopt(pinned(source), destination, LocalSource(source))
+    assert source.exists() and not destination.exists()
+
+
+@dataclasses.dataclass
+class _Usage:
+    free: int
+
+
+def test_the_manifest_can_name_what_a_file_actually_is():
+    """"That is the Q4_K_M build" ends an investigation that "hash mismatch"
+    only starts."""
+    components = installer.load_components()
+    assert installer.identify(components["model-Q4_K_M"].sha256) == "model-Q4_K_M"
+    assert installer.identify(components["mmproj"].sha256.upper()) == "mmproj"
+    assert installer.identify("0" * 64) is None
+
+
+def test_a_supplied_component_drops_out_of_the_download_estimate():
+    card = gpu(name="NVIDIA GeForce RTX 5090", total=32607)
+    whole, _ = installer.download_estimate(card, "Q6_K_P")
+    without_model, _ = installer.download_estimate(card, "Q6_K_P", {"model-Q6_K_P"})
+
+    assert whole - without_model == installer.load_components()["model-Q6_K_P"].size
+    assert installer.format_download_size(card, "Q6_K_P", {"model-Q6_K_P", "mmproj"}) == "the runtime archives only"
+
+
+def test_fetch_installs_a_supplied_component_and_downloads_the_rest(tmp_path, monkeypatch):
+    downloaded, adopted = [], []
+
+    def fake_download(component, target, progress=None, notice=None):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.suffix == ".zip":
+            with zipfile.ZipFile(target, "w") as bundle: bundle.writestr("llama-server.exe", b"exe")
+        else:
+            target.write_bytes(b"downloaded")
+        downloaded.append(component.component_id); return target
+
+    def fake_adopt(component, target, source, progress=None):
+        target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(b"from disk")
+        adopted.append((component.component_id, source.path.name)); return target
+
+    monkeypatch.setattr(installer, "download", fake_download)
+    monkeypatch.setattr(installer, "adopt", fake_adopt)
+    card = gpu(name="NVIDIA GeForce RTX 5090", total=32607)
+
+    installed = installer.fetch(AppPaths(tmp_path), card, "Q6_K_P",
+                                sources={"model-Q6_K_P": LocalSource(tmp_path / "mine.gguf", checked=True)})
+
+    assert adopted == [("model-Q6_K_P", "mine.gguf")]
+    assert downloaded == ["llama-runtime-cuda13", "llama-runtime-cuda13-cudart", "mmproj"]
+    assert (tmp_path / installed.model).read_bytes() == b"from disk"
+
+    # A file for a component this install does not use is refused rather than
+    # ignored — otherwise it would be quietly downloaded instead.
+    with pytest.raises(RuntimeError, match="model-Q4_K_M"):
+        installer.fetch(AppPaths(tmp_path), card, "Q6_K_P",
+                        sources={"model-Q4_K_M": LocalSource(tmp_path / "mine.gguf", checked=True)})
+
+
+# ── the question that offers it ──────────────────────────────────────────────
+
+def answers(monkeypatch, *replies):
+    queue = iter(replies)
+    monkeypatch.setattr(setup_cli, "ask", lambda *_args, **_kwargs: next(queue))
+
+
+def test_declining_the_question_downloads_exactly_as_before(monkeypatch):
+    answers(monkeypatch, "N")
+    assert setup_cli.ask_local_model("Q6_K_P", setup_cli.Steps(4)) == ("Q6_K_P", {})
+
+
+def test_an_accepted_file_is_recorded_as_checked_and_moved(monkeypatch, tmp_path, capsys):
+    source = their_file(tmp_path)
+    monkeypatch.setattr(setup_cli, "accept_file", lambda component, path: (None, component.component_id))
+    answers(monkeypatch, "Y", f'"{source}"')      # Windows "Copy as path" quotes it
+
+    quant, sources = setup_cli.ask_local_model("Q6_K_P", setup_cli.Steps(4))
+
+    assert quant == "Q6_K_P"
+    supplied = sources["model-Q6_K_P"]
+    assert supplied.path == source and supplied.move and supplied.checked
+    assert "MOVED" in capsys.readouterr().out       # said before the file is taken
+
+
+def test_a_file_that_is_a_different_quantization_offers_to_install_that_instead(monkeypatch, tmp_path):
+    """Better to install what they have as what it is than as what was asked for."""
+    source = their_file(tmp_path, name="Gemma4-Q4_K_M.gguf")
+    monkeypatch.setattr(setup_cli, "accept_file",
+                        lambda component, path: ("not Q6_K_P — it is model-Q4_K_M", "model-Q4_K_M"))
+    answers(monkeypatch, "Y", str(source), "Y")
+
+    quant, sources = setup_cli.ask_local_model("Q6_K_P", setup_cli.Steps(4))
+    assert quant == "Q4_K_M" and set(sources) == {"model-Q4_K_M"}
+
+
+def test_a_projector_beside_the_model_is_offered_too(monkeypatch, tmp_path):
+    """Both files come from the same repository, so having one usually means
+    having the other — and it is another download from the host that failed."""
+    source = their_file(tmp_path)
+    projector = source.parent / Path(installer.load_components()["mmproj"].destination).name
+    projector.write_bytes(b"a small stand-in for the projector")
+    pin_to_file(monkeypatch, projector, "mmproj")
+    monkeypatch.setattr(setup_cli, "accept_file", lambda component, path: (None, component.component_id))
+    answers(monkeypatch, "Y", str(source), "Y")
+
+    _quant, sources = setup_cli.ask_local_model("Q6_K_P", setup_cli.Steps(4))
+    assert sources["mmproj"].path == projector
+
+
+def test_a_named_file_that_is_not_the_pinned_one_stops_an_unattended_run(monkeypatch, tmp_path):
+    """--yes asks nothing, so there is no "use it anyway" to fall back on."""
+    source = their_file(tmp_path)
+    monkeypatch.setattr(setup_cli, "accept_file", lambda component, path: ("that is model-Q4_K_M", "model-Q4_K_M"))
+    options = setup_cli.parse_args(["--model-file", str(source), "--yes"])
+
+    with pytest.raises(SystemExit, match="model-Q4_K_M"):
+        setup_cli.supplied_files(options, "Q6_K_P")
+
+
+def test_the_wizard_vets_a_supplied_model_the_same_way(monkeypatch, tmp_path):
+    """The wizard is what an existing install re-runs setup from, so it has to
+    offer the same way out of a download that will not finish."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    widgets = pytest.importorskip("PySide6.QtWidgets")
+    from prompt_master.ui.setup_wizard import SetupWizard
+
+    source = their_file(tmp_path)
+    pin_to_file(monkeypatch, source)
+    widgets.QApplication.instance() or widgets.QApplication([])
+    wizard = SetupWizard(AppPaths(tmp_path / "user_data"))
+    wizard.quant.setCurrentText("Q6_K_P")
+
+    assert wizard._vet_model_file() == {}                     # empty field still downloads
+    wizard.model_file.setText(f'"{source}"')
+    supplied = wizard._vet_model_file()["model-Q6_K_P"]
+    assert supplied.path == source and supplied.move and supplied.checked
+
+    monkeypatch.setattr(widgets.QMessageBox, "question",
+                        staticmethod(lambda *_a, **_k: widgets.QMessageBox.No))
+    wizard.model_file.setText(str(tmp_path / "not-the-pinned-one.gguf"))
+    assert wizard._vet_model_file() is None                   # refused, and the page holds
+
+
+def test_named_files_can_be_kept_where_they_are(monkeypatch, tmp_path):
+    source, projector = their_file(tmp_path), their_file(tmp_path, name="mmproj.gguf")
+    monkeypatch.setattr(setup_cli, "accept_file", lambda component, path: (None, component.component_id))
+    options = setup_cli.parse_args(["--model-file", str(source), "--mmproj-file", str(projector), "--keep-source"])
+
+    sources = setup_cli.supplied_files(options, "Q6_K_P")
+    assert set(sources) == {"model-Q6_K_P", "mmproj"}
+    assert not any(source.move for source in sources.values())
 
 
 # ── the one-click installer's choice of interpreter ──────────────────────────

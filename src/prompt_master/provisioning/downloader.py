@@ -26,7 +26,11 @@ Notice = Callable[[str], None]
 
 
 def _client() -> httpx.Client:
-    return httpx.Client(follow_redirects=True, timeout=httpx.Timeout(600, connect=30))
+    # The read timeout is per block, not for the whole transfer, so it is the
+    # length of silence that counts as a stall. A minute is generous for a CDN
+    # that is still sending; ten would be ten minutes of a progress bar that
+    # has stopped moving before the retry that fixes it.
+    return httpx.Client(follow_redirects=True, timeout=httpx.Timeout(60, connect=30))
 
 
 def _retryable(error: httpx.HTTPError) -> bool:

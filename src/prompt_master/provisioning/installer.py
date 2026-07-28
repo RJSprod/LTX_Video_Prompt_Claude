@@ -19,7 +19,7 @@ The order below is load-bearing and is upstream's:
 from __future__ import annotations
 
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +30,7 @@ from prompt_master.imaging.preprocess import image_data_url
 from prompt_master.inference.device_detection import list_llama_devices, runtime_component_id
 from prompt_master.provisioning.downloader import download
 from prompt_master.provisioning.extractor import extract_zips_atomic
+from prompt_master.provisioning.importer import LocalSource, adopt
 from prompt_master.provisioning.manifest import Component, load_manifest
 
 # Upstream's context size. Exposed here because it is the one setup value that
@@ -80,8 +81,22 @@ def resolve(gpu: GpuInfo, quantization: str) -> list[Component]:
     return [components[key] for key in ids]
 
 
-def download_estimate(gpu: GpuInfo, quantization: str) -> tuple[int, bool]:
-    """``(bytes, exact)`` for one install's downloads.
+def identify(sha256: str) -> str | None:
+    """The component a file's SHA-256 belongs to, if the manifest pins one.
+
+    What turns "that file is not the Q6_K_P build" into "that file is the
+    Q4_K_M build", which is the difference between a dead end and an answer.
+    """
+    for key, component in load_components().items():
+        if component.sha256.casefold() == sha256.casefold(): return key
+    return None
+
+
+def download_estimate(gpu: GpuInfo, quantization: str, skip: Collection[str] = ()) -> tuple[int, bool]:
+    """``(bytes, exact)`` for one install's downloads, ignoring ``skip``.
+
+    Components supplied from a local file are skipped: they are installed from
+    disk, so counting them would quote a download that is not going to happen.
 
     ``size`` is optional in the manifest because some publishers do not report
     one — the llama.cpp release archives are exactly that case, so a total that
@@ -91,12 +106,14 @@ def download_estimate(gpu: GpuInfo, quantization: str) -> tuple[int, bool]:
     at all. The SHA-256 is mandatory either way, so a missing size costs
     precision in a progress message and nothing more.
     """
-    sizes = [component.size for component in resolve(gpu, quantization)]
+    sizes = [component.size for key, component in zip(component_ids(gpu, quantization),
+                                                      resolve(gpu, quantization)) if key not in skip]
     return sum(size for size in sizes if size is not None), all(size is not None for size in sizes)
 
 
-def format_download_size(gpu: GpuInfo, quantization: str) -> str:
-    known, exact = download_estimate(gpu, quantization)
+def format_download_size(gpu: GpuInfo, quantization: str, skip: Collection[str] = ()) -> str:
+    known, exact = download_estimate(gpu, quantization, skip)
+    if not known: return "nothing" if exact else "the runtime archives only"
     return f"{'about' if exact else 'at least'} {known / 2 ** 30:.1f} GiB"
 
 
@@ -110,11 +127,24 @@ class Installed:
 
 
 def fetch(paths: AppPaths, gpu: GpuInfo, quantization: str, *,
+          sources: Mapping[str, LocalSource] | None = None,
           on_status: StatusFn = _ignore_status,
           on_progress: ProgressFn = _ignore_progress) -> Installed:
-    """Download, verify and extract everything. No state is written here."""
+    """Download, verify and extract everything. No state is written here.
+
+    A component named in ``sources`` is taken from the file the caller supplies
+    instead of downloaded — same verification, same destination, same result.
+    """
     components = resolve(gpu, quantization)
     ids = component_ids(gpu, quantization)
+    supplied = dict(sources or {})
+    unused = set(supplied) - set(ids)
+    if unused:
+        # A file supplied for a component this install does not use — a Q4_K_M
+        # model while installing Q6_K_P — would otherwise be silently ignored
+        # and quietly downloaded instead.
+        raise RuntimeError(f"This install uses no {', '.join(sorted(unused))}; "
+                           f"it installs {', '.join(ids)}")
     paths.create_managed_dirs()
 
     runtime_archives: list[Path] = []
@@ -122,12 +152,15 @@ def fetch(paths: AppPaths, gpu: GpuInfo, quantization: str, *,
     share = 1.0 / (len(ids) + 1)  # the extract step is the final share
     for number, (key, component) in enumerate(zip(ids, components)):
         target = paths.contained(component.destination)
-        on_status(f"Downloading {key}…")
-        artifact = download(
-            component, target,
-            lambda done, total, n=number: on_progress(share * (n + done / max(total, 1))),
-            lambda text, k=key: on_status(f"{k}: {text}"),
-        )
+        report = (lambda done, total, n=number: on_progress(share * (n + done / max(total, 1))))
+        source = supplied.get(key)
+        if source is not None:
+            on_status(f"Installing {key} from {source.path.name}…")
+            artifact = adopt(component, target, source, report)
+        else:
+            on_status(f"Downloading {key}…")
+            artifact = download(component, target, report,
+                                lambda text, k=key: on_status(f"{k}: {text}"))
         if key.startswith("llama-runtime-"):
             runtime_archives.append(artifact)
         elif key.startswith("model-"):
@@ -218,12 +251,14 @@ def validate(paths: AppPaths, *, on_status: StatusFn = _ignore_status) -> None:
 
 
 def provision(paths: AppPaths, gpu: GpuInfo, quantization: str, *,
+              sources: Mapping[str, LocalSource] | None = None,
               context_size: int = DEFAULT_CONTEXT_SIZE,
               gpu_layers: str = FULL_OFFLOAD,
               on_status: StatusFn = _ignore_status,
               on_progress: ProgressFn = _ignore_progress) -> dict:
     """Full setup: fetch, record, validate, and point future launches here."""
-    installed = fetch(paths, gpu, quantization, on_status=on_status, on_progress=on_progress)
+    installed = fetch(paths, gpu, quantization, sources=sources,
+                      on_status=on_status, on_progress=on_progress)
     state = write_state(paths, gpu, quantization, installed,
                         context_size=context_size, gpu_layers=gpu_layers)
     validate(paths, on_status=on_status)
