@@ -1,15 +1,17 @@
-"""Console setup — the same three questions the Qt wizard asks.
+"""Console setup — the same questions the Qt wizard asks.
 
 This is what the one-click installer runs after it has built the Python
 environment, and what ``python app.py --setup`` re-runs later. It asks where to
-install, which GPU to use and which quantization to download, then hands off to
-``provisioning.installer`` — the same pipeline the Qt wizard uses, so answering
-here and answering there produce the same install.
+install, which GPU to use, which quantization to download, and whether the model
+is already on this machine, then hands off to ``provisioning.installer`` — the
+same pipeline the Qt wizard uses, so answering here and answering there produce
+the same install.
 
 Every question can also be supplied as a flag, which is what makes an unattended
 reinstall possible:
 
     python app.py --setup --dir D:/PromptMaster --gpu 0 --quant Q6_K_P --yes
+    python app.py --setup --model-file D:/models/Gemma4-...-Q6_K_P.gguf --yes
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from prompt_master.core.models import GpuInfo
 from prompt_master.core.paths import AppPaths
 from prompt_master.inference.device_detection import (QUANTIZATIONS, detect_gpus,
     recommended_quantization, runtime_component_id, vram_shortfall_mb)
-from prompt_master.provisioning import installer
+from prompt_master.provisioning import importer, installer, verifier
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -171,6 +173,96 @@ def ask_gpu(preselected: int | None = None, steps: Steps | None = None) -> GpuIn
     return gpus[choose("What is your GPU?", labels)]
 
 
+def read_path(prompt: str) -> Path | None:
+    """A path typed or pasted at the console. Windows "Copy as path" quotes it."""
+    answer = ask(prompt).strip().strip('"').strip("'")
+    return Path(answer).expanduser() if answer else None
+
+
+def check_file(component, path: Path) -> str:
+    """The SHA-256 of ``path``, with a progress line — it is a long read."""
+    print(f"\nChecking {path.name} against the pinned SHA-256 "
+          f"({importer.human(path.stat().st_size)} to read)…")
+    reporter = ConsoleProgress()
+    reporter.status(component.component_id)
+    try:
+        digest = verifier.digest_of(path, lambda done, total: reporter.progress(done / total))
+    finally:
+        reporter.done()
+    return digest
+
+
+def accept_file(component, path: Path) -> tuple[str | None, str | None]:
+    """Vet a supplied file: ``(refusal, what it actually is)``.
+
+    Naming what the file is whenever the manifest can say — "that is the Q4_K_M
+    build" — ends an investigation that "hash mismatch" only starts.
+    """
+    problem = importer.size_problem(component, path)
+    if problem:
+        return problem, None
+    digest = check_file(component, path)
+    if digest.casefold() == component.sha256.casefold():
+        print("Verified: byte-for-byte the pinned build.\n")
+        return None, component.component_id
+    identified = installer.identify(digest)
+    named = f"it is {identified}" if identified else "it is not a file this build pins"
+    return f"{path.name} does not match {component.component_id} — {named}", identified
+
+
+def ask_local_model(quant: str, steps: Steps, *, move: bool = True) -> tuple[str, dict]:
+    """Question 4: a model already on this machine, instead of downloading it.
+
+    Returns the quantization to install and the files to install it from — the
+    quantization can change here, because a file that turns out to be a
+    different build is better installed as what it is than as what was asked for.
+    """
+    steps.ask("do you already have the model file?")
+    components = installer.load_components()
+    model = components[f"model-{quant}"]
+    print("The model is one large file. If you already have it — downloaded by hand,")
+    print("copied from another install, or fetched with a download manager — setup can")
+    print("take it from disk instead of downloading it again.\n")
+    print(f"For {quant} that file is")
+    print(f"  {Path(model.destination).name}  ({importer.human(model.size)})\n")
+    print("It is MOVED into the installation directory, not copied, so you are not left")
+    print("with two of them. Everything else is still downloaded normally.\n")
+    if not confirm("Use a model file you already have?", default=False):
+        return quant, {}
+
+    while True:
+        path = read_path("Full path to the .gguf file (blank to download instead)")
+        if path is None:
+            return quant, {}
+        refusal, identified = accept_file(model, path)
+        if refusal is None:
+            break
+        print(f"\n{refusal}")
+        switch = (identified or "").removeprefix("model-")
+        if switch in QUANTIZATIONS and confirm(f"\nInstall {switch} instead, since that is what you have?"):
+            quant, model = switch, components[identified]
+            break
+        if confirm("\nUse it anyway? The prompts are tuned for the pinned build", default=False):
+            break
+        print()
+
+    sources = {f"model-{quant}": importer.LocalSource(path, move=move, checked=True)}
+    projector = _projector_beside(components["mmproj"], path)
+    if projector is not None and confirm(f"\n{projector.name} is beside it — use that too?"):
+        if accept_file(components["mmproj"], projector)[0] is None:
+            sources["mmproj"] = importer.LocalSource(projector, move=move, checked=True)
+        else:
+            print("Leaving the projector to download.\n")
+    return quant, sources
+
+
+def _projector_beside(component, model_path: Path) -> Path | None:
+    """The vision projector, if it sits beside the model — it usually does, both
+    being files from the same repository."""
+    candidate = model_path.parent / Path(component.destination).name
+    return candidate if candidate.is_file() and candidate.stat().st_size == component.size else None
+
+
 def ask_quantization(gpu: GpuInfo, preselected: str | None = None, steps: Steps | None = None) -> str:
     if preselected is not None:
         if preselected not in QUANTIZATIONS:
@@ -207,15 +299,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help=f"llama.cpp context size (default {installer.DEFAULT_CONTEXT_SIZE})")
     parser.add_argument("--gpu-layers", default=installer.FULL_OFFLOAD,
                         help="llama.cpp --n-gpu-layers; lower it to spill layers to system RAM on a small card")
+    parser.add_argument("--model-file", help="Install this .gguf instead of downloading the model")
+    parser.add_argument("--mmproj-file", help="Install this .gguf instead of downloading the vision projector")
+    parser.add_argument("--keep-source", action="store_true",
+                        help="Copy --model-file/--mmproj-file into place instead of moving them")
     parser.add_argument("--yes", action="store_true", help="Do not ask for confirmation before downloading")
     return parser.parse_args(argv)
+
+
+def supplied_files(options: argparse.Namespace, quant: str) -> dict:
+    """The files named on the command line, each vetted before setup starts.
+
+    An unattended run gets no "use it anyway?" question, so a file that is not
+    the pinned artifact stops here rather than becoming an install that claims
+    to be something it is not.
+    """
+    components = installer.load_components()
+    wanted = {f"model-{quant}": options.model_file, "mmproj": options.mmproj_file}
+    sources = {}
+    for key, given in wanted.items():
+        if not given:
+            continue
+        path = Path(given).expanduser()
+        refusal, _ = accept_file(components[key], path)
+        if refusal is not None:
+            raise SystemExit(f"{refusal}\nSupply the pinned file, or drop the flag to download it.")
+        sources[key] = importer.LocalSource(path, move=not options.keep_source, checked=True)
+    return sources
 
 
 def run(argv: list[str] | None = None) -> int:
     options = parse_args(argv)
     banner("Prompt Master — model and hardware setup")
 
-    steps = Steps(sum(answer is None for answer in (options.directory, options.gpu, options.quant)))
+    # The local-file question is skipped when a file was named on the command
+    # line, and when --yes says nobody is watching.
+    asks_local = not (options.model_file or options.yes)
+    steps = Steps(sum(answer is None for answer in (options.directory, options.gpu, options.quant)) + asks_local)
 
     if options.directory:
         paths = AppPaths(Path(options.directory).expanduser().resolve())
@@ -225,15 +345,22 @@ def run(argv: list[str] | None = None) -> int:
 
     gpu = ask_gpu(options.gpu, steps)
     quant = ask_quantization(gpu, options.quant, steps)
+    if asks_local:
+        quant, sources = ask_local_model(quant, steps, move=not options.keep_source)
+    else:
+        sources = supplied_files(options, quant)
 
     banner("Downloading and verifying")
     print(f"GPU        : {gpu.name} (index {gpu.physical_index})")
     print(f"Runtime    : {runtime_component_id(gpu)}")
     print(f"Model      : {quant}")
     print(f"Directory  : {paths.root}")
-    print(f"Download   : {installer.format_download_size(gpu, quant)}")
-    print("\nEvery artifact is pinned by SHA-256 and verified after download. Interrupted")
-    print("downloads resume, so re-running setup does not start over.\n")
+    for key, source in sources.items():
+        print(f"From disk  : {key} ← {source.path}  ({'moved' if source.move else 'copied'})")
+    print(f"Download   : {installer.format_download_size(gpu, quant, sources)}")
+    print("\nEvery artifact is pinned by SHA-256 and verified after download. A dropped")
+    print("connection is retried from where it stopped, and interrupted downloads resume,")
+    print("so re-running setup does not start over.\n")
     if not options.yes and not confirm("Continue?"):
         print("Setup cancelled. Nothing was downloaded.")
         return 1
@@ -241,6 +368,7 @@ def run(argv: list[str] | None = None) -> int:
     reporter = ConsoleProgress()
     try:
         installer.provision(paths, gpu, quant,
+                            sources=sources,
                             context_size=options.context_size,
                             gpu_layers=options.gpu_layers,
                             on_status=reporter.status,

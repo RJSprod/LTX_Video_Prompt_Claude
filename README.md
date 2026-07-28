@@ -25,23 +25,48 @@ That is the whole install. It will:
    SHA-256, and without touching your PATH, registry or system Python;
 2. build an isolated environment in `installer_files\env` and install the five
    dependencies;
-3. ask you three questions (below) and download the model;
+3. ask you four questions (below) and download the model;
 4. launch the application.
 
 Re-running it is always safe — every step it has already done is skipped.
 
-### The three questions
+### The four questions
 
 | Question | What it decides |
 | --- | --- |
 | **Installation directory** | Where the runtime, model, projector, cache and logs live. The model alone is 16–27 GiB, so this can be a different drive from the checkout. |
 | **Which GPU** | Which card runs the model, and which pinned `llama.cpp` build gets downloaded — CUDA 12 or CUDA 13, chosen by compute capability. Skipped if you only have one. |
 | **Model quality** | `Q4_K_M`, `Q6_K_P` or `Q8_K_P`. The default is sized from your VRAM, and each option shows its download size and whether it fits. |
+| **A model you already have** | Optional. Point setup at a `.gguf` already on disk and it is installed from there instead of downloaded — see below. Answer no and everything downloads as before. |
+
+### Using a model you already have
+
+The model is one 16–27 GiB file, and a connection that cannot carry it is not
+something setup can fix. If you already have that file — downloaded by hand,
+copied from another install, or fetched with a download manager — hand it over:
+
+```
+python app.py --setup --model-file D:\models\Gemma4-...-Q6_K_P.gguf
+```
+
+or answer the fourth question and paste the path. Either way it is checked
+against the same pinned SHA-256 as a download, then **moved** into the
+installation directory rather than copied, so you are not left with two copies
+of a 21 GiB file. `--keep-source` copies instead. If the vision projector sits
+beside it — it usually does, both being files from the same repository — setup
+offers to take that too, and anything not supplied is still downloaded normally.
+
+A file that is not the pinned build is named rather than just rejected: "that is
+the `Q4_K_M` build" is an answer, and setup offers to install it as what it is.
+The same picker is on the Qt wizard's model page, for re-running setup later.
 
 Nothing is downloaded before you confirm. Every artifact is pinned by URL and
 verified by SHA-256 after download; interrupted downloads resume rather than
-restart. Setup only writes its state after it has generated one text prompt and
-one image prompt successfully, so a half-finished install cannot be launched.
+restart. A connection dropped mid-transfer — which a 16–27 GiB single file
+invites — is retried from where it stopped rather than ending setup, and only
+attempts that move no bytes at all count against the retry budget. Setup only
+writes its state after it has generated one text prompt and one image prompt
+successfully, so a half-finished install cannot be launched.
 
 ## Launch
 
@@ -57,7 +82,7 @@ there is nothing to activate first.
 | Command | Effect |
 | --- | --- |
 | `python app.py` | Open the application |
-| `python app.py --setup` | Re-run the three questions — change GPU, model or directory |
+| `python app.py --setup` | Re-run the questions — change GPU, model or directory |
 | `python app.py --version` | Print the version |
 | `cmd_windows.bat` | Open a shell with the environment active, for `pytest` |
 | `update_windows.bat` | Reinstall dependencies after pulling a new version |
@@ -68,6 +93,9 @@ For an unattended reinstall, every question has a flag:
 python app.py --setup --dir D:\PromptMaster --gpu 0 --quant Q6_K_P --yes
 ```
 
+`--model-file` and `--mmproj-file` install those from disk instead of
+downloading them; a file that is not the pinned artifact stops an unattended run
+rather than becoming an install that claims to be something it is not.
 `--gpu-layers` is there too, for a card that cannot hold its quantization
 entirely in VRAM.
 
@@ -90,6 +118,28 @@ Every control from the packaged build is present: 47 accents with 3 strengths,
 cameras, 10 transitions, 3 output formats, POV, wardrobe and undress, a lexicon,
 dialogue percentage, duration, FPS, dimensions, seed and extra negative terms.
 Results copy to the clipboard or save to `.txt`.
+
+### On a touch screen
+
+The window is laid out for a finger. Intent and the finished prompts sit side by
+side, so writing one and reading the other never scroll each other off the
+screen; the controls between them are grouped — shot, look, voice and music,
+wording — and scroll on their own; and the bar along the bottom holding the
+status, Clear, Cancel and Generate never scrolls at all.
+
+- **Drag to scroll.** The settings, both prompt boxes, the intent box and the
+  long drop-downs all take a kinetic flick. Mouse drags still select text: only
+  the touch gesture scrolls, so nothing a desktop user does changes. The scroll
+  bars are still there, and are wide enough to be worth aiming at.
+- **Nothing smaller than a fingertip.** Every button, drop-down, check box and
+  drop-down row is at least 48 logical pixels tall, and spin boxes get a full
+  height `−` and `+` either side of the value — hold either one to run it up —
+  in place of Qt's two stacked arrows, which are half that.
+- **View → Display size** switches between Comfortable, Large and Larger. It
+  restyles the window live, applies to the setup wizard too, and is remembered.
+
+The window opens on most of the screen rather than at a fixed size, and the
+divider between the two panes can be dragged to give either one more room.
 
 ## Requirements
 
@@ -129,23 +179,32 @@ What changed, and only this:
 | Setup questions | Qt wizard only | Console at install, Qt wizard still in Settings — both share one pipeline |
 | Install root | Beside the frozen `.exe` | `install.json` beside `app.py`, so models can live on another drive |
 | GPU support | RTX 3090 / 5090 only, others refused | Any NVIDIA card; 3090 and 5090 keep their exact pinned runtime and quantization |
+| Where the model comes from | Downloaded, always | Downloaded, or installed from a `.gguf` you already have — against the same pinned SHA-256 |
+| Window | One column of mouse-sized controls | Two panes, fingertip-sized targets, drag-to-scroll, a display-size setting |
 
-The GPU widening is the one behavioural change. It is pinned so that it cannot
-affect the two supported cards: `device_detection.PINNED` maps them to their
-original runtime and quantization before any heuristic runs, and
-`tests/test_install_flow.py` asserts that.
+Two behavioural changes, both bounded. The GPU widening is pinned so that it
+cannot affect the two supported cards: `device_detection.PINNED` maps them to
+their original runtime and quantization before any heuristic runs, and
+`tests/test_install_flow.py` asserts that. Supplying a model changes where the
+bytes come from and nothing else — the file is checked against the same pinned
+hash a download is, and lands at the same path, so everything downstream of
+setup cannot tell the two apart.
 
 ## Tests
 
 ```
-python -m pytest tests/        # 527 passed
+python -m pytest tests/        # 565 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
 - `test_prompt_engine.py` (26) — the adapter seam and the UI option sources
-- `test_core.py` (6) — multimodal requests, atomic JSON, SSE, zip-slip
-- `test_install_flow.py` (61) — install-root discovery, GPU sizing, manifest
-  resolution, console setup, the installer's interpreter and environment checks
+- `test_touch_ui.py` (11) — target sizes, drag-to-scroll and display size,
+  measured on a real window built offscreen
+- `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
+  download resume and retry
+- `test_install_flow.py` (79) — install-root discovery, GPU sizing, manifest
+  resolution, console setup, supplying a model from disk, and the installer's
+  interpreter and environment checks
 
 Output-level parity against an upstream checkout is checked separately:
 
@@ -163,11 +222,13 @@ app.py                     Command-line entry point
 requirements.txt           The five runtime dependencies
 src/prompt_master/
   app.py                   Argument handling and window startup
-  setup_cli.py             Console setup — the three questions
+  setup_cli.py             Console setup — the four questions
   prompt_engine/           Vendored upstream engine, untouched
   provisioning/installer.py  Download, verify, extract, validate — one pipeline
+  provisioning/importer.py   Installing a model you already have, instead
   inference/               llama-server process, streaming client, GPU detection
   ui/                      Main window and the Qt setup wizard
+  ui/touch.py              Fingertip sizing and drag-to-scroll, in one place
 installer_files/           Created by the installer (gitignored)
 user_data/                 Default install root (gitignored)
 ```
