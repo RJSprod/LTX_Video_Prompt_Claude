@@ -20,7 +20,7 @@ start_windows.bat
 
 That is the whole install. It will:
 
-1. find a Python 3.12+ interpreter, or install a private one under
+1. find a Python 3.12 or 3.13 interpreter, or install a private one under
    `installer_files\conda` if the machine has none — verified against a pinned
    SHA-256, and without touching your PATH, registry or system Python;
 2. build an isolated environment in `installer_files\env` and install the five
@@ -99,7 +99,12 @@ Results copy to the clipboard or save to `.txt`.
   capability. There is no CPU path — inference runs on the GPU through
   `llama.cpp`.
 - Roughly 20–30 GiB of disk for the model, plus ~1 GiB for the environment.
-- Python 3.12+ is used if present, and installed privately if not.
+- Python 3.12 or 3.13 is used if present, and installed privately if not. A
+  newer Python on the machine is skipped rather than used: the pinned
+  dependencies publish no wheels for it — PySide6 6.8.1 stops at 3.13 — so the
+  installer builds its environment on a version they cover instead. An
+  environment left behind by an earlier run on an unsupported Python is
+  rebuilt automatically the next time `start_windows.bat` runs.
 
 ## Relationship to the packaged build
 
@@ -133,14 +138,14 @@ original runtime and quantization before any heuristic runs, and
 ## Tests
 
 ```
-python -m pytest tests/        # 510 passed
+python -m pytest tests/        # 527 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
 - `test_prompt_engine.py` (26) — the adapter seam and the UI option sources
 - `test_core.py` (6) — multimodal requests, atomic JSON, SSE, zip-slip
-- `test_install_flow.py` (44) — install-root discovery, GPU sizing, manifest
-  resolution, console setup
+- `test_install_flow.py` (61) — install-root discovery, GPU sizing, manifest
+  resolution, console setup, the installer's interpreter and environment checks
 
 Output-level parity against an upstream checkout is checked separately:
 

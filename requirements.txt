@@ -6,6 +6,12 @@
 #
 # There is no PyTorch here. Inference runs in llama.cpp, which the setup step
 # downloads as a pinned prebuilt binary.
+#
+# These versions install on Python 3.12 and 3.13 only. PySide6 6.8.1 declares
+# Requires-Python <3.14, and Pillow 11.0.0 and numpy 2.2.1 publish no 3.14
+# wheels, so a 3.14 environment fails here rather than in the application. The
+# installer builds the environment on a matching interpreter; if these pins
+# move, move MIN_PYTHON/MAX_PYTHON in one_click.py with them.
 PySide6==6.8.1
 Pillow==11.0.0
 httpx==0.28.1
