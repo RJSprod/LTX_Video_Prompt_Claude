@@ -40,8 +40,11 @@ Re-running it is always safe — every step it has already done is skipped.
 
 Nothing is downloaded before you confirm. Every artifact is pinned by URL and
 verified by SHA-256 after download; interrupted downloads resume rather than
-restart. Setup only writes its state after it has generated one text prompt and
-one image prompt successfully, so a half-finished install cannot be launched.
+restart. A connection dropped mid-transfer — which a 16–27 GiB single file
+invites — is retried from where it stopped rather than ending setup, and only
+attempts that move no bytes at all count against the retry budget. Setup only
+writes its state after it has generated one text prompt and one image prompt
+successfully, so a half-finished install cannot be launched.
 
 ## Launch
 
@@ -138,12 +141,13 @@ original runtime and quantization before any heuristic runs, and
 ## Tests
 
 ```
-python -m pytest tests/        # 527 passed
+python -m pytest tests/        # 536 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
 - `test_prompt_engine.py` (26) — the adapter seam and the UI option sources
-- `test_core.py` (6) — multimodal requests, atomic JSON, SSE, zip-slip
+- `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
+  download resume and retry
 - `test_install_flow.py` (61) — install-root discovery, GPU sizing, manifest
   resolution, console setup, the installer's interpreter and environment checks
 

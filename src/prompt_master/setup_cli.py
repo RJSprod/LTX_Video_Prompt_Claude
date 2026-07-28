@@ -232,8 +232,9 @@ def run(argv: list[str] | None = None) -> int:
     print(f"Model      : {quant}")
     print(f"Directory  : {paths.root}")
     print(f"Download   : {installer.format_download_size(gpu, quant)}")
-    print("\nEvery artifact is pinned by SHA-256 and verified after download. Interrupted")
-    print("downloads resume, so re-running setup does not start over.\n")
+    print("\nEvery artifact is pinned by SHA-256 and verified after download. A dropped")
+    print("connection is retried from where it stopped, and interrupted downloads resume,")
+    print("so re-running setup does not start over.\n")
     if not options.yes and not confirm("Continue?"):
         print("Setup cancelled. Nothing was downloaded.")
         return 1

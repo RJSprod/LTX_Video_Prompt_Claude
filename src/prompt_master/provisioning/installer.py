@@ -126,6 +126,7 @@ def fetch(paths: AppPaths, gpu: GpuInfo, quantization: str, *,
         artifact = download(
             component, target,
             lambda done, total, n=number: on_progress(share * (n + done / max(total, 1))),
+            lambda text, k=key: on_status(f"{k}: {text}"),
         )
         if key.startswith("llama-runtime-"):
             runtime_archives.append(artifact)
