@@ -9,6 +9,7 @@ and the console setup that the one-click installer drives.
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -239,6 +240,224 @@ def test_no_gpu_is_a_clean_exit(monkeypatch):
     monkeypatch.setattr(setup_cli, "detect_gpus", lambda: [])
     with pytest.raises(SystemExit, match="no CUDA GPU"):
         setup_cli.ask_gpu(None)
+
+
+# ── the one-click installer's choice of interpreter ──────────────────────────
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture
+def one_click():
+    """``one_click.py`` loaded as a module — it sits beside app.py, not in src/."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "prompt_master_one_click", REPO_ROOT / "one_click.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def sandboxed(one_click, tmp_path, monkeypatch):
+    """The installer with the directories it writes to redirected into tmp_path."""
+    files = tmp_path / "installer_files"
+    files.mkdir()
+    monkeypatch.setattr(one_click, "INSTALLER_FILES", files)
+    monkeypatch.setattr(one_click, "ENV_DIR", files / "env")
+    monkeypatch.setattr(one_click, "CONDA_DIR", files / "conda")
+    monkeypatch.setattr(one_click, "REQUIREMENTS_MARKER", files / "requirements.installed")
+    return one_click
+
+
+@pytest.mark.parametrize("version,ok", [
+    ((3, 11), False),   # too old for the application
+    ((3, 12), True),
+    ((3, 13), True),
+    ((3, 14), False),   # too new for the pinned wheels
+    ((4, 0), False),
+    (None, False),      # an interpreter that would not report a version
+])
+def test_supported_pythons_are_a_range_not_a_floor(one_click, version, ok):
+    """PySide6 6.8.1 declares Requires-Python <3.14 and Pillow 11.0.0 and numpy
+    2.2.1 publish no 3.14 wheels, so a newer Python is a reason to skip an
+    interpreter rather than to prefer it."""
+    assert one_click.supported(version) is ok
+
+
+def test_pyproject_declares_the_same_range_the_installer_enforces(one_click):
+    expected = 'requires-python = ">={0}.{1},<{2}.{3}"'.format(
+        *one_click.MIN_PYTHON, *one_click.MAX_PYTHON)
+    assert expected in (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+
+def test_find_system_python_skips_a_python_the_pins_do_not_cover(one_click, monkeypatch, tmp_path):
+    """An interpreter that is too new fails at pip rather than at import, so it
+    has to be rejected before an environment is built on it."""
+    interpreter = tmp_path / "python"
+    interpreter.write_text("", encoding="utf-8")
+    monkeypatch.setattr(one_click.sys, "platform", "linux")
+    monkeypatch.setattr(one_click.sys, "version_info", (3, 14, 0))
+    monkeypatch.setattr(one_click.shutil, "which", lambda name: str(interpreter))
+
+    monkeypatch.setattr(one_click, "interpreter_version", lambda executable: (3, 14))
+    assert one_click.find_system_python() is None
+
+    monkeypatch.setattr(one_click, "interpreter_version", lambda executable: (3, 13))
+    assert one_click.find_system_python() == interpreter
+
+
+def test_py_launcher_is_asked_only_for_versions_in_the_range(one_click, monkeypatch):
+    """The launcher sees installs that are not on PATH, so what it is asked for
+    decides which Python a machine with several of them ends up using."""
+    probes = []
+
+    def fake_run(command, **_kwargs):
+        probes.append(command)
+        raise OSError("no interpreter here")
+
+    monkeypatch.setattr(one_click.sys, "platform", "win32")
+    monkeypatch.setattr(one_click.shutil, "which",
+                        lambda name: r"C:\Windows\py.exe" if name == "py" else None)
+    monkeypatch.setattr(one_click.subprocess, "run", fake_run)
+
+    assert one_click.find_system_python() is None
+    assert [command[1] for command in probes if command[0] == r"C:\Windows\py.exe"] == ["-3.13", "-3.12"]
+
+
+def test_the_private_python_is_reused_only_while_the_pins_cover_it(sandboxed, monkeypatch):
+    """The bootstrap is pinned to a 3.12 build, so reusing whatever is in
+    installer_files\\conda is safe only as long as it is still that build."""
+    one_click = sandboxed
+    private = one_click.CONDA_DIR / "python.exe"
+    private.parent.mkdir(parents=True)
+    private.write_text("bootstrap", encoding="utf-8")
+
+    monkeypatch.setattr(one_click, "interpreter_version", lambda executable: (3, 12))
+    assert one_click.bootstrap_miniconda() == private
+
+    monkeypatch.setattr(one_click, "interpreter_version", lambda executable: (3, 14))
+    monkeypatch.setattr(one_click.sys, "platform", "linux")
+    with pytest.raises(SystemExit, match="3.12 or 3.13"):
+        one_click.bootstrap_miniconda()
+    assert private.exists()      # nothing is deleted where nothing can replace it
+
+
+# ── the environment it builds ────────────────────────────────────────────────
+
+def stale_env(one_click, layout="Scripts/python.exe"):
+    interpreter = one_click.ENV_DIR.joinpath(*layout.split("/"))
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("stale", encoding="utf-8")
+    one_click.REQUIREMENTS_MARKER.write_text("hash of an earlier requirements.txt", encoding="utf-8")
+    return interpreter
+
+
+def creating_venv(one_click):
+    """A stand-in for ``python -m venv`` that produces an interpreter."""
+    def fake_run(command, **_kwargs):
+        created = Path(command[-1]) / "bin" / "python"
+        created.parent.mkdir(parents=True)
+        created.write_text("fresh", encoding="utf-8")
+
+    return fake_run
+
+
+def test_create_env_rebuilds_an_environment_built_on_an_unsupported_python(sandboxed, monkeypatch, capsys):
+    """The 3.14 case, which is what a machine that upgraded its Python ends up
+    with: the environment exists and its interpreter runs, so only the version
+    tells the installer that pip is about to fail."""
+    one_click = sandboxed
+    stale = stale_env(one_click)
+    monkeypatch.setattr(one_click, "interpreter_version", lambda executable: (3, 14))
+    monkeypatch.setattr(one_click, "run", creating_venv(one_click))
+
+    interpreter = one_click.create_env("python3.12")
+
+    assert interpreter == one_click.ENV_DIR / "bin" / "python"
+    assert not stale.exists()
+    # The marker lives outside the environment: left behind, it would tell the
+    # next step that the new, empty environment already has its dependencies.
+    assert not one_click.REQUIREMENTS_MARKER.exists()
+    assert "3.14" in capsys.readouterr().out
+
+
+def test_create_env_keeps_an_environment_the_pins_cover(sandboxed, monkeypatch):
+    one_click = sandboxed
+    existing = stale_env(one_click)
+    monkeypatch.setattr(one_click, "interpreter_version", lambda executable: (3, 13))
+    monkeypatch.setattr(one_click, "run", lambda *_a, **_k: pytest.fail("must not rebuild"))
+
+    assert one_click.create_env("python3.12") == existing
+    assert one_click.REQUIREMENTS_MARKER.is_file()
+
+
+def test_create_env_rebuilds_an_environment_whose_interpreter_no_longer_runs(sandboxed, monkeypatch):
+    one_click = sandboxed
+    stale_env(one_click)
+    monkeypatch.setattr(one_click, "interpreter_version", lambda executable: None)
+    monkeypatch.setattr(one_click, "run", creating_venv(one_click))
+
+    assert one_click.create_env("python3.12") == one_click.ENV_DIR / "bin" / "python"
+
+
+def test_create_env_refuses_to_delete_the_interpreter_it_is_running(sandboxed, monkeypatch):
+    """Windows cannot unlink a running python.exe. An installer started from
+    the stale environment has to say which file to run instead of leaving a
+    half-deleted one behind."""
+    one_click = sandboxed
+    stale = stale_env(one_click)
+    monkeypatch.setattr(one_click, "interpreter_version", lambda executable: (3, 14))
+    monkeypatch.setattr(one_click.sys, "executable", str(stale))
+
+    with pytest.raises(SystemExit, match="running from the environment"):
+        one_click.create_env("python3.12")
+    assert stale.exists()
+
+
+def test_install_requirements_refuses_an_environment_the_pins_cannot_fill(sandboxed, monkeypatch):
+    """pip's own diagnosis is forty lines of ignored versions ending in "No
+    matching distribution found", which is the error this replaces."""
+    one_click = sandboxed
+    monkeypatch.setattr(one_click, "interpreter_version", lambda executable: (3, 14))
+    monkeypatch.setattr(one_click, "run", lambda *_a, **_k: pytest.fail("pip must not run"))
+
+    with pytest.raises(SystemExit, match="3.14"):
+        one_click.install_requirements("python")
+
+
+def test_install_requirements_records_what_it_installed(sandboxed, monkeypatch):
+    one_click = sandboxed
+    commands = []
+    monkeypatch.setattr(one_click, "interpreter_version", lambda executable: (3, 12))
+    monkeypatch.setattr(one_click, "run", lambda command, **_k: commands.append(command))
+
+    one_click.install_requirements("python")
+    assert commands[-1][:4] == ["python", "-m", "pip", "install"]
+    assert one_click.REQUIREMENTS_MARKER.is_file()
+
+    commands.clear()
+    one_click.install_requirements("python")
+    assert commands == []
+
+
+def test_start_windows_bat_enforces_the_same_range(one_click):
+    """The .bat chooses the interpreter that runs one_click.py, so a range that
+    disagrees with MIN_PYTHON/MAX_PYTHON reinstates the failure before any of
+    the Python above gets a chance to reject it."""
+    text = (REPO_ROOT / "start_windows.bat").read_text(encoding="utf-8")
+    minors = range(one_click.MAX_PYTHON[1] - 1, one_click.MIN_PYTHON[1] - 1, -1)
+
+    probed = re.search(r"for %%V in \(([^)]*)\) do", text).group(1).split()
+    assert probed == ["{0}.{1}".format(one_click.MIN_PYTHON[0], minor) for minor in minors]
+
+    guard = "({0},{1}) <= sys.version_info[:2] < ({2},{3})".format(
+        *one_click.MIN_PYTHON, *one_click.MAX_PYTHON)
+    assert guard in text
+    # Both interpreters a previous run may have left behind are version-tested,
+    # or a stale environment is picked up again and pip fails exactly as before.
+    assert text.count("call :supported") == 2
 
 
 # ── launcher ─────────────────────────────────────────────────────────────────

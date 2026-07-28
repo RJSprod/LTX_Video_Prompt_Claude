@@ -29,20 +29,32 @@ echo "%CD%" | findstr /C:"!" /C:"%%" /C:"^" /C:"&" /C:"=" >nul && (
 
 set "PYTHON_CMD="
 
-rem --- 1. the environment a previous run already built -----------------------
-if exist "installer_files\env\Scripts\python.exe" (
+rem --- 1. the environment a previous run already built, if the Python it was
+rem        built with is one the pinned dependencies still cover. A newer one
+rem        is not good enough: PySide6 6.8.1 stops at 3.13, so an environment
+rem        on 3.14 cannot install requirements.txt and has to be rebuilt. -----
+if not exist "installer_files\env\Scripts\python.exe" goto :no_env
+call :supported "installer_files\env\Scripts\python.exe"
+if not errorlevel 1 (
     set "PYTHON_CMD=installer_files\env\Scripts\python.exe"
     goto :found
 )
+echo The environment in installer_files\env was built with a Python the pinned
+echo dependencies do not support. It will be rebuilt automatically.
+echo.
+:no_env
 
 rem --- 2. a private Python a previous run already bootstrapped ---------------
-if exist "installer_files\conda\python.exe" (
+if not exist "installer_files\conda\python.exe" goto :no_conda
+call :supported "installer_files\conda\python.exe"
+if not errorlevel 1 (
     set "PYTHON_CMD=installer_files\conda\python.exe"
     goto :found
 )
+:no_conda
 
 rem --- 3. the py launcher, which sees installs that are not on PATH ----------
-for %%V in (3.14 3.13 3.12) do (
+for %%V in (3.13 3.12) do (
     py -%%V -c "import sys" >nul 2>&1
     if not errorlevel 1 (
         set "PYTHON_CMD=py -%%V"
@@ -114,3 +126,10 @@ echo.
 pause
 endlocal
 exit /b 1
+
+rem --- returns 0 when %1 is a Python the pinned dependencies have wheels for.
+rem     Kept out of the blocks above so its parentheses and "<" stay quoted.
+rem     Keep the range in step with MIN_PYTHON/MAX_PYTHON in one_click.py. ----
+:supported
+"%~1" -c "import sys; sys.exit(0 if (3,12) <= sys.version_info[:2] < (3,14) else 1)" >nul 2>&1
+exit /b %errorlevel%

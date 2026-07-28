@@ -9,8 +9,8 @@ or directly with any Python 3.8+:
 It does four things, each skippable once already done, so re-running it is
 always safe:
 
-1. finds a Python 3.12+ interpreter, downloading a hash-pinned Miniconda only if
-   the machine has none;
+1. finds a Python 3.12 or 3.13 interpreter, downloading a hash-pinned Miniconda
+   only if the machine has none;
 2. builds an isolated environment under ``installer_files/env`` and installs the
    five runtime dependencies into it;
 3. runs the setup questions — install directory, GPU, model quantization — and
@@ -44,12 +44,19 @@ INSTALLER_FILES = HERE / "installer_files"
 ENV_DIR = INSTALLER_FILES / "env"
 CONDA_DIR = INSTALLER_FILES / "conda"
 DOWNLOADS = INSTALLER_FILES / "downloads"
+REQUIREMENTS_MARKER = INSTALLER_FILES / "requirements.installed"
 
 # The application targets 3.12; the vendored prompt engine and the app both use
-# syntax and typing behaviour from it.
+# syntax and typing behaviour from it. The upper bound comes from the pinned
+# dependencies rather than from the code: PySide6 6.8.1 declares
+# Requires-Python <3.14, and neither Pillow 11.0.0 nor numpy 2.2.1 publishes a
+# 3.14 wheel, so an environment built on a newer interpreter cannot install
+# requirements.txt at all. A newer Python is therefore a reason to skip an
+# interpreter, not to prefer it; move this bound only together with the pins.
 MIN_PYTHON = (3, 12)
+MAX_PYTHON = (3, 14)          # exclusive
 
-# Bootstrap interpreter, used only when the machine has no Python 3.12+. It is
+# Bootstrap interpreter, used only when the machine has no supported Python. It is
 # pinned by version and verified by SHA-256 before it is executed, on the same
 # principle as the model manifest: nothing unverified is ever run. Only its
 # bundled python.exe is used — no conda command is invoked, and conda is not put
@@ -81,6 +88,45 @@ def run(command, **kwargs):
     return result
 
 
+def supported(version):
+    """True for a (major, minor) the pinned dependencies publish wheels for."""
+    return version is not None and MIN_PYTHON <= tuple(version) < MAX_PYTHON
+
+
+def supported_versions():
+    """The supported range as prose, e.g. "3.12 or 3.13"."""
+    names = ["{0}.{1}".format(MIN_PYTHON[0], minor)
+             for minor in range(MIN_PYTHON[1], MAX_PYTHON[1])]
+    if len(names) == 1:
+        return names[0]
+    return "{0} or {1}".format(", ".join(names[:-1]), names[-1])
+
+
+def entry_point():
+    return "start_windows.bat" if sys.platform == "win32" else "python one_click.py"
+
+
+def running_inside(directory):
+    try:
+        return directory.resolve() in Path(sys.executable).resolve().parents
+    except OSError:
+        return False
+
+
+def remove_tree(directory, purpose):
+    """Delete a directory the installer owns, refusing to delete the interpreter
+    it is itself running under: Windows cannot unlink a running executable, so
+    that rebuild has to be started from somewhere else."""
+    if running_inside(directory):
+        raise SystemExit(
+            "This installer is running from the {0} it has to rebuild:\n"
+            "  {1}\n"
+            "Windows cannot delete an interpreter while it is executing. Run {2} "
+            "instead — it starts from a different Python and rebuilds "
+            "automatically.".format(purpose, sys.executable, entry_point()))
+    shutil.rmtree(str(directory))
+
+
 # ── step 0: sanity ───────────────────────────────────────────────────────────
 
 def check_path():
@@ -105,7 +151,7 @@ def check_path():
               "  {0}\n".format(text))
 
 
-# ── step 1: a Python 3.12+ interpreter ───────────────────────────────────────
+# ── step 1: a supported Python interpreter ───────────────────────────────────
 
 def interpreter_version(executable):
     """(major, minor) for an interpreter, or None if it will not report one."""
@@ -123,17 +169,24 @@ def interpreter_version(executable):
 
 
 def find_system_python():
-    """The newest suitable interpreter already on this machine, if any."""
+    """The newest suitable interpreter already on this machine, if any.
+
+    "Suitable" is a range, not a floor: an interpreter newer than the pinned
+    dependencies support is skipped exactly like one that is too old, because
+    the environment it builds cannot install requirements.txt.
+    """
     candidates = []
-    if sys.version_info[:2] >= MIN_PYTHON:
+    if supported(sys.version_info[:2]):
         candidates.append(Path(sys.executable))
     if sys.platform == "win32":
         # The py launcher knows about installs that are not on PATH.
         launcher = shutil.which("py")
         if launcher:
-            for minor in range(20, MIN_PYTHON[1] - 1, -1):
+            for minor in range(MAX_PYTHON[1] - 1, MIN_PYTHON[1] - 1, -1):
                 candidates.append("{0} -3.{1}".format(launcher, minor))
-    for name in ("python3.14", "python3.13", "python3.12", "python3", "python"):
+    names = ["python{0}.{1}".format(MIN_PYTHON[0], minor)
+             for minor in range(MAX_PYTHON[1] - 1, MIN_PYTHON[1] - 1, -1)]
+    for name in names + ["python3", "python"]:
         found = shutil.which(name)
         if found:
             candidates.append(Path(found))
@@ -151,8 +204,7 @@ def find_system_python():
             candidate = Path(result.stdout.strip())
         if not Path(candidate).is_file():
             continue
-        version = interpreter_version(candidate)
-        if version is not None and version >= MIN_PYTHON:
+        if supported(interpreter_version(candidate)):
             return Path(candidate)
     return None
 
@@ -202,16 +254,23 @@ def _digest_matches(path, size, sha256):
 def bootstrap_miniconda():
     """Install the pinned Miniconda privately and return its python.exe."""
     existing = CONDA_DIR / "python.exe"
-    if existing.is_file():
+    if existing.is_file() and supported(interpreter_version(existing)):
         return existing
     if sys.platform != "win32":
         raise SystemExit(
-            "No Python {0}.{1}+ was found, and the bundled bootstrap is Windows-only.\n"
-            "Install Python {0}.{1} or newer and run the installer again."
-            .format(MIN_PYTHON[0], MIN_PYTHON[1])
+            "No Python {0} was found, and the bundled bootstrap is Windows-only.\n"
+            "Install Python {0} and run the installer again.\n"
+            "A newer Python will not do: the pinned dependencies publish no wheels for it."
+            .format(supported_versions())
         )
+    if existing.is_file():
+        # A private Python from an earlier run that the pins no longer cover, or
+        # one replaced by hand. The pinned build is what goes back in its place.
+        print("The private Python in {0} is not one the pinned dependencies support; "
+              "replacing it.".format(CONDA_DIR))
+        remove_tree(CONDA_DIR, "private Python")
 
-    banner("No Python {0}.{1}+ found — installing a private one".format(*MIN_PYTHON))
+    banner("No Python {0} found — installing a private one".format(supported_versions()))
     print("Nothing is added to PATH or the registry, and your system Python is untouched.")
     print("Everything goes into {0}\n".format(CONDA_DIR))
     installer = verified_download(MINICONDA["url"], DOWNLOADS / MINICONDA["filename"],
@@ -246,19 +305,44 @@ def env_python():
     return None
 
 
+def env_problem(existing):
+    """Why the environment on disk cannot be used, in one clause."""
+    if existing is None:
+        return "it has no interpreter"
+    version = interpreter_version(existing)
+    if version is None:
+        return "its interpreter does not run"
+    return ("it was built with Python {0}.{1}, which the pinned dependencies "
+            "publish no wheels for".format(version[0], version[1]))
+
+
+def remove_env():
+    """Delete the environment and the marker that says what is installed in it.
+
+    The marker lives outside ENV_DIR, so leaving it behind would make the next
+    dependency install think a freshly created, empty environment was already
+    populated.
+    """
+    remove_tree(ENV_DIR, "environment")
+    if REQUIREMENTS_MARKER.is_file():
+        REQUIREMENTS_MARKER.unlink()
+
+
 def create_env(python, reinstall=False):
     if reinstall and ENV_DIR.exists():
         print("Removing {0}".format(ENV_DIR))
-        shutil.rmtree(str(ENV_DIR))
+        remove_env()
     existing = env_python()
-    if existing is not None and interpreter_version(existing) is not None:
+    if existing is not None and supported(interpreter_version(existing)):
         print("Environment already present: {0}".format(ENV_DIR))
         return existing
     if ENV_DIR.exists():
-        # Present but not usable — a half-created venv, or one whose base
-        # interpreter was uninstalled. Rebuilding is the only repair.
-        print("Environment at {0} is unusable; rebuilding it.".format(ENV_DIR))
-        shutil.rmtree(str(ENV_DIR))
+        # Present but not usable — a half-created venv, one whose base
+        # interpreter was uninstalled, or one built on a Python the pins do not
+        # cover. Rebuilding is the only repair.
+        print("Environment at {0} is unusable: {1}. Rebuilding it."
+              .format(ENV_DIR, env_problem(existing)))
+        remove_env()
     banner("Creating the environment")
     ENV_DIR.parent.mkdir(parents=True, exist_ok=True)
     run([python, "-m", "venv", ENV_DIR])
@@ -269,16 +353,29 @@ def create_env(python, reinstall=False):
 
 
 def install_requirements(python, update=False):
-    marker = INSTALLER_FILES / "requirements.installed"
+    version = interpreter_version(python)
+    if not supported(version):
+        # pip's own diagnosis of this is forty lines of ignored versions ending
+        # in "No matching distribution found", so say it plainly first.
+        raise SystemExit(
+            "The environment at {0} runs Python {1}, and requirements.txt pins versions "
+            "that only publish wheels for Python {2}.\n"
+            "Delete that directory and run {3} again to rebuild it on a supported "
+            "interpreter.".format(
+                ENV_DIR,
+                "{0}.{1}".format(*version) if version else "an interpreter that does not report a version",
+                supported_versions(),
+                entry_point()))
     requirements = HERE / "requirements.txt"
     current = hashlib.sha256(requirements.read_bytes()).hexdigest()
-    if not update and marker.is_file() and marker.read_text(encoding="utf-8").strip() == current:
+    if (not update and REQUIREMENTS_MARKER.is_file()
+            and REQUIREMENTS_MARKER.read_text(encoding="utf-8").strip() == current):
         print("Dependencies already installed.")
         return
     banner("Installing dependencies")
     run([python, "-m", "pip", "install", "--upgrade", "pip"])
     run([python, "-m", "pip", "install", "-r", requirements])
-    marker.write_text(current, encoding="utf-8")
+    REQUIREMENTS_MARKER.write_text(current, encoding="utf-8")
 
 
 # ── step 3 and 4: setup and launch ───────────────────────────────────────────
@@ -341,5 +438,5 @@ def main():
 if __name__ == "__main__":
     if sys.version_info < (3, 8):
         sys.exit("This installer needs Python 3.8 or newer to run (it will install "
-                 "Python {0}.{1} for the application itself).".format(*MIN_PYTHON))
+                 "Python {0} for the application itself).".format(supported_versions()))
     sys.exit(main())
