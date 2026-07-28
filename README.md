@@ -119,6 +119,28 @@ cameras, 10 transitions, 3 output formats, POV, wardrobe and undress, a lexicon,
 dialogue percentage, duration, FPS, dimensions, seed and extra negative terms.
 Results copy to the clipboard or save to `.txt`.
 
+### On a touch screen
+
+The window is laid out for a finger. Intent and the finished prompts sit side by
+side, so writing one and reading the other never scroll each other off the
+screen; the controls between them are grouped — shot, look, voice and music,
+wording — and scroll on their own; and the bar along the bottom holding the
+status, Clear, Cancel and Generate never scrolls at all.
+
+- **Drag to scroll.** The settings, both prompt boxes, the intent box and the
+  long drop-downs all take a kinetic flick. Mouse drags still select text: only
+  the touch gesture scrolls, so nothing a desktop user does changes. The scroll
+  bars are still there, and are wide enough to be worth aiming at.
+- **Nothing smaller than a fingertip.** Every button, drop-down, check box and
+  drop-down row is at least 48 logical pixels tall, and spin boxes get a full
+  height `−` and `+` either side of the value — hold either one to run it up —
+  in place of Qt's two stacked arrows, which are half that.
+- **View → Display size** switches between Comfortable, Large and Larger. It
+  restyles the window live, applies to the setup wizard too, and is remembered.
+
+The window opens on most of the screen rather than at a fixed size, and the
+divider between the two panes can be dragged to give either one more room.
+
 ## Requirements
 
 - Windows x64
@@ -158,6 +180,7 @@ What changed, and only this:
 | Install root | Beside the frozen `.exe` | `install.json` beside `app.py`, so models can live on another drive |
 | GPU support | RTX 3090 / 5090 only, others refused | Any NVIDIA card; 3090 and 5090 keep their exact pinned runtime and quantization |
 | Where the model comes from | Downloaded, always | Downloaded, or installed from a `.gguf` you already have — against the same pinned SHA-256 |
+| Window | One column of mouse-sized controls | Two panes, fingertip-sized targets, drag-to-scroll, a display-size setting |
 
 Two behavioural changes, both bounded. The GPU widening is pinned so that it
 cannot affect the two supported cards: `device_detection.PINNED` maps them to
@@ -170,11 +193,13 @@ setup cannot tell the two apart.
 ## Tests
 
 ```
-python -m pytest tests/        # 554 passed
+python -m pytest tests/        # 565 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
 - `test_prompt_engine.py` (26) — the adapter seam and the UI option sources
+- `test_touch_ui.py` (11) — target sizes, drag-to-scroll and display size,
+  measured on a real window built offscreen
 - `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
   download resume and retry
 - `test_install_flow.py` (79) — install-root discovery, GPU sizing, manifest
@@ -203,6 +228,7 @@ src/prompt_master/
   provisioning/importer.py   Installing a model you already have, instead
   inference/               llama-server process, streaming client, GPU detection
   ui/                      Main window and the Qt setup wizard
+  ui/touch.py              Fingertip sizing and drag-to-scroll, in one place
 installer_files/           Created by the installer (gitignored)
 user_data/                 Default install root (gitignored)
 ```

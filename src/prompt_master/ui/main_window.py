@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from PySide6.QtCore import QObject, QThread, Signal, Slot
-from PySide6.QtWidgets import (QCheckBox,QComboBox,QFileDialog,QFormLayout,QHBoxLayout,QLabel,QMainWindow,QMessageBox,QPlainTextEdit,QPushButton,QSpinBox,QDoubleSpinBox,QVBoxLayout,QWidget,QScrollArea)
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtGui import QActionGroup
+from PySide6.QtWidgets import (QApplication,QCheckBox,QComboBox,QFileDialog,QFrame,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QMainWindow,QMessageBox,QPlainTextEdit,QPushButton,QScrollArea,QSizePolicy,QSpinBox,QDoubleSpinBox,QSplitter,QTextEdit,QVBoxLayout,QWidget)
 import threading
 
 from prompt_master.core.models import PromptRequest
@@ -11,6 +12,7 @@ from prompt_master.prompt_engine import options as opt
 from prompt_master.prompt_engine.adapter import PromptEngine, VisionUnavailable
 from prompt_master.core.paths import AppPaths
 from prompt_master.inference.service import InferenceService
+from prompt_master.ui import touch
 from prompt_master.ui.setup_wizard import SetupWizard
 
 
@@ -64,41 +66,187 @@ class GenerationWorker(QObject):
 
 
 class MainWindow(QMainWindow):
+    """The window, laid out for a finger.
+
+    Two panes side by side rather than one tall column: writing an intent and
+    reading the prompt it produced are the two things done most, and neither
+    should scroll the other off the screen. The settings between them are
+    grouped and scroll on their own, and the bar along the bottom — status,
+    Clear, Cancel, Generate — never scrolls at all, because the button pressed
+    most often is the one that should never have to be found.
+
+    Sizes come from ``ui.touch``: every target is at least a fingertip tall, and
+    the scale that multiplies them is a menu item, since a tablet held at arm's
+    length and a desk monitor do not agree on how big "big enough" is.
+    """
+
     def __init__(self, paths: AppPaths | None = None):
-        super().__init__(); self.paths = paths or AppPaths.discover(); self.service = InferenceService(self.paths); self.thread = None; self.setWindowTitle("Prompt Master Standalone"); self.resize(1050, 760); self.image_path: Path | None = None; self.engine = PromptEngine()
-        settings_menu=self.menuBar().addMenu("Settings"); models_action=settings_menu.addAction("Models and Hardware…"); models_action.triggered.connect(self.open_setup)
-        root=QWidget(); layout=QVBoxLayout(root); self.intent=QPlainTextEdit(); self.intent.setPlaceholderText("Describe the video you want to create…"); layout.addWidget(QLabel("Intent")); layout.addWidget(self.intent)
-        image_row=QHBoxLayout(); self.image_label=QLabel("Text only"); browse=QPushButton("Browse image…"); remove=QPushButton("Remove image"); browse.clicked.connect(self.browse_image); remove.clicked.connect(self.remove_image); image_row.addWidget(self.image_label,1); image_row.addWidget(browse); image_row.addWidget(remove); layout.addLayout(image_row)
+        super().__init__(); self.paths = paths or AppPaths.discover(); self.service = InferenceService(self.paths); self.thread = None; self.setWindowTitle("Prompt Master Standalone"); self.image_path: Path | None = None; self.engine = PromptEngine()
+        self.build_menus()
+        splitter=QSplitter(Qt.Orientation.Horizontal); splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self.compose_pane()); splitter.addWidget(self.output_pane())
+        splitter.setStretchFactor(0,4); splitter.setStretchFactor(1,5)
+        central=QWidget(); page=QVBoxLayout(central); page.addWidget(splitter,1); page.addLayout(self.action_bar())
+        self.setCentralWidget(central)
+        self.apply_scale(touch.load_scale(self.paths), remember=False)
+        self.fill_screen(); self.refresh_status()
+
+    # ── layout ───────────────────────────────────────────────────────────────
+
+    def build_menus(self):
+        settings_menu=self.menuBar().addMenu("Settings"); settings_menu.addAction("Models and Hardware…").triggered.connect(self.open_setup)
+        view_menu=self.menuBar().addMenu("View"); sizes=view_menu.addMenu("Display size"); self.size_actions=QActionGroup(self); self.size_actions.setExclusive(True)
+        for name in touch.SCALES:
+            action=sizes.addAction(name); action.setCheckable(True); action.setData(name); self.size_actions.addAction(action)
+            action.triggered.connect(lambda _checked=False,chosen=name: self.apply_scale(chosen))
+
+    def compose_pane(self) -> QWidget:
+        """Intent and image stay put; the settings under them scroll."""
+        pane=QWidget(); column=QVBoxLayout(pane)
+        column.addWidget(self.heading("Intent"))
+        self.intent=QPlainTextEdit(); self.intent.setPlaceholderText("Describe the video you want to create…")
+        self.intent.setSizePolicy(QSizePolicy.Policy.Expanding,QSizePolicy.Policy.Fixed); touch.flickable(self.intent)
+        column.addWidget(self.intent)
+        column.addLayout(self.image_row())
+        column.addWidget(self.settings_area(),1)
+        return pane
+
+    def image_row(self) -> QHBoxLayout:
+        row=QHBoxLayout(); self.image_label=QLabel("No image — text to video"); self.image_label.setWordWrap(True)
+        browse=QPushButton("Attach image…"); browse.clicked.connect(self.browse_image)
+        self.remove_button=QPushButton("Remove"); self.remove_button.setEnabled(False); self.remove_button.clicked.connect(self.remove_image)
+        row.addWidget(self.image_label,1); row.addWidget(browse); row.addWidget(self.remove_button)
+        return row
+
+    def settings_area(self) -> QScrollArea:
+        page=QWidget(); column=QVBoxLayout(page); column.setContentsMargins(0,0,0,0)
+        for title,fields in self.controls(): column.addWidget(self.section(title,fields))
+        column.addStretch(1)
+        area=QScrollArea(); area.setWidgetResizable(True); area.setWidget(page); area.setFrameShape(QFrame.Shape.NoFrame)
+        touch.flickable(area)
+        return area
+
+    def controls(self):
+        """Every control, grouped by what it changes about the shot."""
         d=opt.DEFAULTS
-        form=QFormLayout()
         self.mode=self.combo(opt.VIDEO_MODES,d["video_mode"])
-        self.seconds=QDoubleSpinBox(); self.seconds.setRange(1,60); self.seconds.setSingleStep(0.5); self.seconds.setValue(d["seconds"])
+        self.seconds=QDoubleSpinBox(); self.seconds.setRange(1,60); self.seconds.setSingleStep(0.5); self.seconds.setValue(d["seconds"]); self.seconds.setSuffix(" s")
         self.fps=QSpinBox(); self.fps.setRange(8,60); self.fps.setValue(d["fps"])
+        self.dimensions=self.combo([("704x1216","704 × 1216 (portrait)"),("1216x704","1216 × 704 (landscape)"),("768x768","768 × 768 (square)"),("1920x1080","1920 × 1080"),("1080x1920","1080 × 1920")],f"{d['output_width']}x{d['output_height']}")
+        self.seed=QSpinBox(); self.seed.setRange(0,2**31-1); self.seed.setValue(d["seed"])
         self.style=self.grouped_combo(opt.STYLES_GROUPED,d["style"])
         self.camera=self.combo(opt.CAMERAS,d["camera"])
         self.transition=self.combo(opt.TRANSITIONS,d["transition"])
         self.pov=self.combo(opt.POV,d["pov"])
+        self.wardrobe=self.combo(opt.WARDROBE,d["wardrobe"])
+        self.undress=QCheckBox("Undress sequence"); self.undress.setChecked(d["undress"])
         self.accent=self.combo(opt.ACCENTS,d["accent"])
         self.accent_strength=self.combo(opt.ACCENT_STRENGTHS,d["accent_strength"])
         self.dialogue=QSpinBox(); self.dialogue.setRange(0,100); self.dialogue.setValue(d["dialogue"]); self.dialogue.setSuffix("%")
         self.music=self.combo(opt.MUSIC,d["music"])
-        self.music_bg=QCheckBox("Play low under the scene"); self.music_bg.setChecked(d["music_bg"])
-        self.wardrobe=self.combo(opt.WARDROBE,d["wardrobe"])
-        self.undress=QCheckBox("Undress sequence"); self.undress.setChecked(d["undress"])
-        self.lexicon=QPlainTextEdit(); self.lexicon.setMaximumHeight(70); self.lexicon.setPlaceholderText("Name = description, one per line. Only names present in the intent are used.")
+        self.music_bg=QCheckBox("Music plays low under the scene"); self.music_bg.setChecked(d["music_bg"])
         self.output_format=self.combo(opt.OUTPUT_FORMATS,d["fmt"])
-        self.dimensions=self.combo([("704x1216","704 × 1216 (portrait)"),("1216x704","1216 × 704 (landscape)"),("768x768","768 × 768 (square)"),("1920x1080","1920 × 1080"),("1080x1920","1080 × 1920")],f"{d['output_width']}x{d['output_height']}")
-        self.seed=QSpinBox(); self.seed.setRange(0,2**31-1); self.seed.setValue(d["seed"])
-        self.negative_extra=QPlainTextEdit(); self.negative_extra.setMaximumHeight(50)
-        self.smart=QCheckBox("Second pass over the finished script"); self.smart.setChecked(d["smart_negative"])
-        for label,widget in [("Video mode",self.mode),("Duration (seconds)",self.seconds),("FPS",self.fps),("Dimensions",self.dimensions),("Seed",self.seed),("Style",self.style),("Camera",self.camera),("Transition",self.transition),("First person",self.pov),("Accent",self.accent),("Accent strength",self.accent_strength),("Dialogue / talk",self.dialogue),("Music",self.music),("Music background",self.music_bg),("Wardrobe",self.wardrobe),("Undress",self.undress),("Lexicon",self.lexicon),("Output format",self.output_format),("Extra negative terms",self.negative_extra),("Smart negative",self.smart)]: form.addRow(label,widget)
-        layout.addLayout(form); actions=QHBoxLayout(); self.generate_button=QPushButton("Generate"); self.generate_button.clicked.connect(self.generate); self.cancel_button=QPushButton("Cancel"); self.cancel_button.setEnabled(False); self.cancel_button.clicked.connect(self.cancel_generation); clear=QPushButton("Clear"); clear.clicked.connect(self.clear); actions.addWidget(self.generate_button); actions.addWidget(self.cancel_button); actions.addWidget(clear); layout.addLayout(actions)
-        self.positive=QPlainTextEdit(); self.negative=QPlainTextEdit(); layout.addWidget(QLabel("Positive prompt")); layout.addWidget(self.positive); layout.addWidget(QLabel("Negative prompt")); layout.addWidget(self.negative)
-        copies=QHBoxLayout()
-        for label,source in [("Copy Positive",self.positive),("Copy Negative",self.negative)]: button=QPushButton(label); button.clicked.connect(lambda _=False,s=source: self.copy(s)); copies.addWidget(button)
-        both=QPushButton("Copy Both"); both.clicked.connect(self.copy_both); copies.addWidget(both)
-        save=QPushButton("Save .txt…"); save.clicked.connect(self.save); copies.addWidget(save); layout.addLayout(copies); self.status=QLabel("GPU: not configured · Model: not configured · Server: stopped · Generation: idle"); layout.addWidget(self.status)
-        scroll=QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(root); self.setCentralWidget(scroll); self.refresh_status()
+        self.smart=QCheckBox("Smart negative — a second pass over the finished script"); self.smart.setChecked(d["smart_negative"])
+        self.lexicon=QPlainTextEdit(); self.lexicon.setPlaceholderText("Name = description, one per line. Only names present in the intent are used."); touch.flickable(self.lexicon)
+        self.negative_extra=QPlainTextEdit(); self.negative_extra.setPlaceholderText("Extra terms to keep out of the shot, comma separated."); touch.flickable(self.negative_extra)
+        return [
+            ("Shot", [("Video mode",self.mode),("Duration",touch.stepper(self.seconds)),
+                      ("FPS",touch.stepper(self.fps)),("Dimensions",self.dimensions),
+                      ("Seed",touch.stepper(self.seed))]),
+            ("Look", [("Style",self.style),("Camera",self.camera),("Transition",self.transition),
+                      ("First person",self.pov),("Wardrobe",self.wardrobe),(None,self.undress)]),
+            ("Voice and music", [("Accent",self.accent),("Accent strength",self.accent_strength),
+                                 ("Dialogue / talk",touch.stepper(self.dialogue)),("Music",self.music),
+                                 (None,self.music_bg)]),
+            ("Wording", [("Output format",self.output_format),(None,self.smart),
+                         ("Lexicon",self.lexicon),("Extra negative terms",self.negative_extra)]),
+        ]
+
+    def section(self, title, fields) -> QGroupBox:
+        """One group, two columns wide. A control with no caption of its own —
+        a check box says what it is — takes the full width."""
+        box=QGroupBox(title); grid=QGridLayout(box); grid.setColumnStretch(0,1); grid.setColumnStretch(1,1)
+        row=column=0
+        for caption,widget in fields:
+            span=2 if caption is None or isinstance(widget,QPlainTextEdit) else 1
+            if span == 2 and column: row+=1; column=0
+            grid.addWidget(self.field(caption,widget),row,column,1,span)
+            column+=span
+            if column >= 2: row+=1; column=0
+        return box
+
+    @staticmethod
+    def field(caption, widget) -> QWidget:
+        """Caption above its control, not beside it: the control gets the whole
+        column width, which is what makes it wide enough to hit."""
+        if caption is None: return widget
+        holder=QWidget(); column=QVBoxLayout(holder); column.setContentsMargins(0,0,0,0); column.setSpacing(2)
+        label=QLabel(caption); label.setObjectName("fieldLabel"); label.setBuddy(widget)
+        column.addWidget(label); column.addWidget(widget)
+        return holder
+
+    def output_pane(self) -> QWidget:
+        """The finished prompts. QTextEdit rather than QPlainTextEdit for these
+        two alone: it scrolls by pixel, so a flick through a long script glides
+        instead of stepping a line at a time."""
+        pane=QWidget(); column=QVBoxLayout(pane)
+        self.positive=QTextEdit(); self.negative=QTextEdit()
+        for edit in (self.positive,self.negative): edit.setAcceptRichText(False); touch.flickable(edit)
+        column.addLayout(self.output_header("Positive prompt",self.positive)); column.addWidget(self.positive,3)
+        column.addLayout(self.output_header("Negative prompt",self.negative)); column.addWidget(self.negative,2)
+        row=QHBoxLayout()
+        both=QPushButton("Copy both"); both.clicked.connect(self.copy_both)
+        save=QPushButton("Save .txt…"); save.clicked.connect(self.save)
+        row.addWidget(both,1); row.addWidget(save,1); column.addLayout(row)
+        return pane
+
+    def output_header(self, title, source) -> QHBoxLayout:
+        row=QHBoxLayout(); row.addWidget(self.heading(title)); row.addStretch(1)
+        copy=QPushButton("Copy"); copy.clicked.connect(lambda _=False,s=source: self.copy(s)); row.addWidget(copy)
+        return row
+
+    def action_bar(self) -> QHBoxLayout:
+        """Always on screen: what the app is doing, and the button pressed most."""
+        bar=QHBoxLayout(); self.status=QLabel("Starting…"); self.status.setObjectName("status"); self.status.setWordWrap(True)
+        clear=QPushButton("Clear"); clear.clicked.connect(self.clear)
+        self.cancel_button=QPushButton("Cancel"); self.cancel_button.setEnabled(False); self.cancel_button.clicked.connect(self.cancel_generation)
+        self.generate_button=QPushButton("Generate"); self.generate_button.setObjectName("primary"); self.generate_button.clicked.connect(self.generate)
+        bar.addWidget(self.status,1); bar.addWidget(clear); bar.addWidget(self.cancel_button); bar.addWidget(self.generate_button)
+        return bar
+
+    @staticmethod
+    def heading(text) -> QLabel:
+        label=QLabel(text); label.setObjectName("sectionTitle"); return label
+
+    # ── size ─────────────────────────────────────────────────────────────────
+
+    def apply_scale(self, name: str, remember: bool = True):
+        """Restyle everything for the chosen display size, live.
+
+        The style sheet goes on the application rather than this window so the
+        setup wizard is sized by the same choice.
+        """
+        self.scale_name=name; scale=touch.SCALES[name]; m=touch.metrics(scale)
+        application=QApplication.instance()
+        (application or self).setStyleSheet(touch.stylesheet(scale))
+        for action in self.size_actions.actions(): action.setChecked(action.data() == name)
+        self.intent.setMinimumHeight(m["target"]*3)
+        self.intent.setMaximumHeight(m["target"]*4)
+        for edit in (self.lexicon,self.negative_extra): edit.setMinimumHeight(m["target"]*2); edit.setMaximumHeight(m["target"]*3)
+        for edit in (self.positive,self.negative): edit.setMinimumHeight(m["target"]*3)
+        self.generate_button.setMinimumWidth(m["target"]*4)
+        for box in self.findChildren(QComboBox): box.setMaxVisibleItems(8)
+        if remember: touch.save_scale(self.paths,name)
+
+    def fill_screen(self):
+        """Open on most of the screen rather than a fixed 1050×760, which on a
+        touch panel is a window in the corner of a display it could have used."""
+        screen=self.screen() or QApplication.primaryScreen()
+        if screen is None: self.resize(1280,860); return
+        available=screen.availableGeometry()
+        self.resize(min(1600,int(available.width()*0.92)),min(1050,int(available.height()*0.92)))
+        self.setMinimumSize(min(880,available.width()),min(620,available.height()))
+        self.move(available.center()-self.rect().center())
 
     @staticmethod
     def combo(options, default=None):
@@ -108,7 +256,7 @@ class MainWindow(QMainWindow):
         if default is not None:
             index=box.findData(default)
             if index >= 0: box.setCurrentIndex(index)
-        return box
+        return touch.touchable_popup(box)
 
     @staticmethod
     def grouped_combo(groups, default=None):
@@ -123,7 +271,7 @@ class MainWindow(QMainWindow):
         if default is not None:
             index=box.findData(default)
             if index >= 0: box.setCurrentIndex(index)
-        return box
+        return touch.touchable_popup(box)
 
     @staticmethod
     def chosen(box, fallback=""):
@@ -132,8 +280,15 @@ class MainWindow(QMainWindow):
 
     def browse_image(self):
         filename,_=QFileDialog.getOpenFileName(self,"Reference image","","Images (*.png *.jpg *.jpeg *.webp)")
-        if filename: self.image_path=Path(filename); self.image_label.setText(filename); self.select(self.mode,"i2v")
-    def remove_image(self): self.image_path=None; self.image_label.setText("Text only"); self.select(self.mode,"t2v")
+        if not filename: return
+        self.image_path=Path(filename)
+        # The name, not the path: a full path pushes the buttons beside it off
+        # the pane, and the path is still there to hover or long-press for.
+        self.image_label.setText(f"Image: {self.image_path.name}"); self.image_label.setToolTip(filename)
+        self.remove_button.setEnabled(True); self.select(self.mode,"i2v")
+    def remove_image(self):
+        self.image_path=None; self.image_label.setText("No image — text to video"); self.image_label.setToolTip("")
+        self.remove_button.setEnabled(False); self.select(self.mode,"t2v")
     @staticmethod
     def select(box,value):
         index=box.findData(value)
