@@ -57,6 +57,8 @@ class PromptRequest:
     style: str = "off"
     # a key from prompt_engine.motion.PRESETS; "default" is upstream unchanged
     motion: str = "default"
+    # prompt_engine.speech multiplier: 1 leaves the intent exactly as typed
+    speech: int = 1
     # RANDOM_SEED asks for a new one per generation; the UI resolves it
     seed: int = 7
     negative_extra: str = ""

@@ -29,7 +29,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QAbstractSpinBox,
                                QComboBox, QHBoxLayout, QPushButton, QScroller,
-                               QScrollerProperties, QStyledItemDelegate, QWidget)
+                               QScrollerProperties, QSlider, QStyle,
+                               QStyledItemDelegate, QWidget)
 
 from prompt_master.core.config import atomic_write_json, read_json
 
@@ -108,6 +109,22 @@ QPushButton#stepper {{
 
 QCheckBox {{ min-height: {m['target']}px; spacing: {m['gap']}px; }}
 QCheckBox::indicator {{ width: {m['indicator']}px; height: {m['indicator']}px; }}
+
+/* A slider is dragged, so its handle is the target: a thumb, not a sliver.
+   The filled side is the one colour in the window besides the primary action,
+   because a slider with no fill does not say which way is more. */
+QSlider {{ min-height: {m['target']}px; }}
+QSlider::groove:horizontal {{
+    height: {round(m['bar'] / 2)}px; border-radius: {round(m['bar'] / 4)}px;
+    background: rgba(128, 128, 128, 0.35);
+}}
+QSlider::sub-page:horizontal {{ background: #2563eb; border-radius: {round(m['bar'] / 4)}px; }}
+QSlider::handle:horizontal {{
+    width: {round(m['target'] * 0.7)}px; border-radius: {round(m['target'] * 0.35)}px;
+    margin: -{round(m['target'] * 0.33)}px 0;
+    background: palette(button); border: 2px solid #2563eb;
+}}
+QSlider::handle:horizontal:pressed {{ background: #2563eb; }}
 
 QPlainTextEdit, QTextEdit {{ padding: {m['pad']}px; border-radius: {m['pad']}px; font-size: {m['output']}px; }}
 
@@ -203,6 +220,25 @@ def _step_button(text: str, step) -> QPushButton:
     button.setAutoRepeatInterval(90)
     button.clicked.connect(step)
     return button
+
+
+class TouchSlider(QSlider):
+    """A slider that goes where it is tapped.
+
+    Qt's default is to page the handle one step toward the tap, which needs
+    several taps to cross the track and a precise drag to land on a value. It
+    also matters inside a flickable area: a tap is unambiguous where a drag has
+    to be told apart from a scroll.
+    """
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self.maximum() > self.minimum():
+            span = self.width() if self.orientation() == Qt.Orientation.Horizontal else self.height()
+            along = event.position().x() if self.orientation() == Qt.Orientation.Horizontal \
+                else span - event.position().y()
+            self.setValue(QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
+                                                         int(along), span))
+        super().mousePressEvent(event)
 
 
 def touchable_popup(box: QComboBox) -> QComboBox:

@@ -134,7 +134,28 @@ generation finishes, so a shot worth keeping can be reproduced.
 | **Inertia** | Weight and abruptness: hard starts and stops, angles that cut rather than ease, momentum that reads as impact. Runs hotter and narrower, and puts floaty drift in the negative. |
 | **Flow** | Continuity and detail: one unbroken camera gesture, every action carrying from beat to beat, the words spent on how motion travels rather than on more events. Runs cooler and steadier, and puts stutter and snap cuts in the negative. |
 
-Each preset pulls three levers and only three: a directive appended *after* the
+**Extra speech** is a slider from 1× to 10×. At the far left — the default —
+the intent goes to the engine exactly as you typed it. Above that, a pass runs
+over the intent *before* the brief is built: it writes extra lines in the voice
+the intent already quotes and mixes them back in, so what the engine receives is
+a director's request that simply had more speech in it. 10× means ten times the
+lines the intent quoted, up to a ceiling of 30.
+
+Two things worth knowing about it:
+
+- The **dialogue budget moves with the slider.** Upstream tells the model how
+  many spoken lines a shot of this length should carry — at 20% that is about
+  two — so twenty extra lines against that budget would be eighteen lines the
+  model is told to drop. The slider lifts the budget from your own setting
+  toward 100%, never below it, and only for that generation; the dial itself is
+  untouched. The line under the slider names the figure it will use.
+- An intent with **no quoted speech** gets lines written for the scene instead,
+  from the people and mood the brief describes.
+
+The pass never costs you a generation: if it fails or comes back empty, the shot
+is written from your intent as typed and the status says which happened.
+
+Each motion preset pulls three levers and only three: a directive appended *after* the
 engine's finished system prompt, terms merged into the extra negatives the
 engine already accepts as an input, and the sampling temperature of the writer
 pass. The smart-negative pass keeps upstream's own numbers. Default appends
@@ -206,30 +227,35 @@ What changed, and only this:
 | Window | One column of mouse-sized controls | Two panes, fingertip-sized targets, drag-to-scroll, a display-size setting |
 | Motion | One way of writing it | Default is that way exactly; **Inertia** and **Flow** are opt-in |
 | Seed | A number | A number, or `-1` for a fresh one each generation |
+| Speech | Whatever the intent quotes | That, or up to 10× more written in the same voice — opt-in |
 
-Three behavioural changes, all bounded, and only one of them can reach a prompt.
-The GPU widening is pinned so that it cannot affect the two supported cards:
-`device_detection.PINNED` maps them to their original runtime and quantization
-before any heuristic runs, and `tests/test_install_flow.py` asserts that. The
-motion presets are opt-in and additive — Default appends nothing, adds no terms
-and samples at upstream's own temperatures, so an untouched control is an
-untouched prompt, and `prompt_engine/motion.py` holds the whole of the
-difference the other two make. Supplying a model changes where the
-bytes come from and nothing else — the file is checked against the same pinned
-hash a download is, and lands at the same path, so everything downstream of
-setup cannot tell the two apart.
+Four behavioural changes, all bounded, and the two that can reach a prompt are
+both opt-in and both open on the old behaviour. The GPU widening is pinned so
+that it cannot affect the two supported cards: `device_detection.PINNED` maps
+them to their original runtime and quantization before any heuristic runs, and
+`tests/test_install_flow.py` asserts that. The motion presets are additive —
+Default appends nothing, adds no terms and samples at upstream's own
+temperatures, so an untouched control is an untouched prompt, and
+`prompt_engine/motion.py` holds the whole of the difference the other two make.
+Extra speech is a pass over the intent that does not run at 1×, and the engine
+still only ever reads an intent: `prompt_engine/speech.py` writes the lines and
+mixes them in before the brief is built, and changes nothing about how the brief
+is then built from it. Supplying a model changes where the bytes come from and
+nothing else — the file is checked against the same pinned hash a download is,
+and lands at the same path, so everything downstream of setup cannot tell the
+two apart.
 
 ## Tests
 
 ```
-python -m pytest tests/        # 577 passed
+python -m pytest tests/        # 588 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
-- `test_prompt_engine.py` (36) — the adapter seam, the motion presets and the
-  UI option sources
-- `test_touch_ui.py` (13) — target sizes, drag-to-scroll and display size,
-  measured on a real window built offscreen
+- `test_prompt_engine.py` (44) — the adapter seam, the motion presets, speech
+  expansion and the UI option sources
+- `test_touch_ui.py` (16) — target sizes, drag-to-scroll, the sliders and the
+  display size, measured on a real window built offscreen
 - `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
   download resume and retry
 - `test_install_flow.py` (79) — install-root discovery, GPU sizing, manifest
@@ -255,6 +281,7 @@ src/prompt_master/
   setup_cli.py             Console setup — the four questions
   prompt_engine/           Vendored upstream engine, untouched
   prompt_engine/motion.py  The three motion settings — ours, applied at the seams
+  prompt_engine/speech.py  The extra-speech pass over the intent — ours, before the brief
   provisioning/installer.py  Download, verify, extract, validate — one pipeline
   provisioning/importer.py   Installing a model you already have, instead
   inference/               llama-server process, streaming client, GPU detection

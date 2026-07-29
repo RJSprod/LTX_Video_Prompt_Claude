@@ -17,6 +17,7 @@ from PIL import Image
 
 from prompt_master.core.models import RANDOM_SEED, PromptRequest, draw_seed
 from prompt_master.prompt_engine import motion
+from prompt_master.prompt_engine import speech
 from prompt_master.prompt_engine import options as opt
 from prompt_master.prompt_engine.adapter import PromptEngine, VisionUnavailable
 from prompt_master.prompt_engine.upstream import brain
@@ -324,6 +325,107 @@ def test_every_preset_is_offered_with_its_name_first():
     assert [key for key, _ in motion.OPTIONS] == list(motion.PRESETS)
     for key, label in motion.OPTIONS:
         assert label.split(" —")[0].casefold() in (key, "default")
+
+
+# ── speech expansion ─────────────────────────────────────────────────────────
+#
+# A pass over the intent, before the brief is built. At 1x it does not run at
+# all, which is the behaviour this application has always had.
+
+SPOKEN = 'Ada slams the door and says "Get back inside" while rain hammers the porch'
+
+
+def answering(*lines):
+    """A model that returns these lines, ignoring what it was asked."""
+    return lambda messages, **kwargs: ["\n".join(lines)]
+
+
+def test_the_slider_at_one_leaves_the_intent_exactly_as_typed():
+    request = PromptRequest(intent=SPOKEN, video_mode="t2v", dialogue=20, speech=speech.NONE)
+    unchanged, note = speech.expand(request, lambda *a, **k: pytest.fail("no pass at 1x"))
+    assert unchanged is request and note == ""
+
+
+def test_extra_lines_are_mixed_into_the_intent_the_engine_reads():
+    """The lines have to be in the brief, not appended to the finished shot —
+    the engine writes the shot, and it only ever sees the intent."""
+    request = PromptRequest(intent=SPOKEN, video_mode="t2v", dialogue=20, speech=3)
+    model = answering('"Don\'t make me come out there"', '"You will catch your death out here"')
+
+    expanded, note = speech.expand(request, model)
+
+    assert "Get back inside" in expanded.intent          # the original survives
+    assert "Don't make me come out there" in expanded.intent
+    assert "2 extra lines in the same voice" == note
+    # And it reaches the engine as part of the director's request.
+    assert "You will catch your death out here" in PromptEngine().build(expanded).user
+
+
+def test_the_multiplier_counts_total_lines_not_added_ones():
+    assert speech.wanted(1, 4) == 0
+    assert speech.wanted(10, 1) == 9                     # ten times one line
+    assert speech.wanted(3, 2) == 4                      # three times two lines
+    assert speech.wanted(10, 20) == speech.LINE_CEILING - 20
+
+
+def test_the_dialogue_budget_is_lifted_from_the_users_setting_never_below_it():
+    """Twenty extra lines against a budget of two is nineteen lines the model is
+    being told to drop, so the budget moves with the slider."""
+    assert speech.dialogue_floor(speech.NONE, 20) == 20  # 1x changes nothing
+    assert speech.dialogue_floor(10, 20) == 100
+    assert speech.dialogue_floor(10, 0) == 100           # a zero dial is still lifted
+    assert speech.dialogue_floor(3, 80) >= 80            # a high dial is never lowered
+    assert speech.dialogue_floor(5, 20) == 56
+    for multiplier in range(speech.NONE, speech.MOST + 1):
+        assert 20 <= speech.dialogue_floor(multiplier, 20) <= 100
+
+
+def test_an_intent_with_no_speech_gets_lines_written_for_the_scene():
+    silent = PromptRequest(intent="A lone runner crosses a bridge at dawn",
+                           video_mode="t2v", speech=4)
+    model = answering('"The bridge is longer than it looks"', '"I can make it before the light"')
+
+    expanded, note = speech.expand(silent, model)
+    assert "written for the scene" in note
+    assert "The bridge is longer than it looks" in expanded.intent
+    # And the pass says so: the system prompt for that case is a different one.
+    assert speech.messages(silent.intent, [], 3)[0]["content"] == speech.SYSTEM_UNQUOTED
+    assert speech.messages(SPOKEN, ["Get back inside"], 3)[0]["content"] == speech.SYSTEM
+
+
+def test_a_reply_that_wanders_is_cleaned_rather_than_trusted():
+    request = PromptRequest(intent=SPOKEN, video_mode="t2v", speech=10)
+    model = answering(
+        'Here are the lines you asked for:',
+        '1. "The storm is not going to wait for you"',
+        '"Too short"',                                   # under five words
+        '"Get back inside"',                             # already in the intent
+        '"' + " ".join(["word"] * 40) + '"',             # a speech, not a line
+        '"You will catch your death out here"')
+
+    expanded, _note = speech.expand(request, model)
+    kept = speech.quoted_lines(expanded.intent.split("in the same voices:")[1])
+    assert kept == ["The storm is not going to wait for you",
+                    "You will catch your death out here"]
+
+
+def test_a_failed_pass_costs_the_extra_lines_and_not_the_shot():
+    """Upstream's second pass never raises for the same reason: the user pressed
+    a button for a generation, not for an expansion."""
+    def broken(messages, **kwargs):
+        raise RuntimeError("llama-server died")
+
+    request = PromptRequest(intent=SPOKEN, video_mode="t2v", dialogue=20, speech=10)
+    same, note = speech.expand(request, broken)
+    assert same.intent == SPOKEN and "skipped" in note
+    # The budget still moves: it is the half of "more speech" that still works.
+    assert same.dialogue == 100
+
+
+def test_quoted_lines_reads_both_kinds_of_quote_and_keeps_the_order():
+    found = speech.quoted_lines('He says "first line here" then she says “second line here”')
+    assert found == ["first line here", "second line here"]
+    assert speech.quoted_lines("nothing quoted at all") == []
 
 
 # ── random seed ──────────────────────────────────────────────────────────────
