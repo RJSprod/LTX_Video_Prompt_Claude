@@ -884,6 +884,42 @@ def test_the_version_pager_shows_without_a_tap(qt, chat_window):
     assert plain.pager is None and not plain.actions_row.isVisibleTo(plain)
 
 
+def test_nothing_is_shown_before_it_is_in_the_layout(qt, chat_window):
+    """A widget made visible while it still has no parent *is* a top-level
+    window, and Qt duly puts one on the screen: a bare white rectangle that
+    flashes up and vanishes the instant the layout claims it.
+
+    The transcript is rebuilt on every send, so one widget doing this in a
+    constructor is a window flashing in the corner of the screen every time
+    anybody says anything. Nothing rendered here may be shown before the row
+    it belongs to exists.
+    """
+    from PySide6.QtWidgets import QWidget
+
+    page = chat_window.chat
+    page.conversation.append("user", "one")
+    page.conversation.append("assistant", "first try")
+    page.conversation.messages[-1].add_version("second try")
+
+    shown, original = [], QWidget.setVisible
+
+    def watched(widget, visible):
+        if visible and widget.parentWidget() is None:
+            shown.append(type(widget).__name__)
+        return original(widget, visible)
+
+    QWidget.setVisible = watched
+    try:
+        page.render()
+    finally:
+        QWidget.setVisible = original
+
+    assert shown == []
+    # And the case that used to do it is still the case being covered: a reply
+    # with a pager is the one bubble with something to show without a tap.
+    assert page.bubbles[2].pager is not None
+
+
 # ── it follows the newest message until you scroll away ──────────────────────
 
 def test_the_transcript_follows_new_content_only_while_it_is_at_the_end(qt, chat_window):

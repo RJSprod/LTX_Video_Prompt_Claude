@@ -149,6 +149,13 @@ class MessageBubble(QWidget):
         row = QHBoxLayout(self)
         row.setContentsMargins(0, page.metrics["gap"] if opens_run else 2, 0, 0)
         row.setSpacing(round(page.metrics["gap"] / 2))
+        # ``stack`` has no widget of its own until it joins ``row`` below, so
+        # anything put in it stays unparented until then. Everything built here
+        # is therefore parented to the bubble explicitly, and nothing is made
+        # visible before this constructor has finished assembling the row: a
+        # widget shown while it has no parent *is* a top-level window, and Qt
+        # duly puts one on the screen — a bare white rectangle that flashes up
+        # and vanishes the instant the layout claims it.
         stack = QVBoxLayout()
         stack.setSpacing(2)
         stack.addWidget(self.frame_for(message))
@@ -162,11 +169,14 @@ class MessageBubble(QWidget):
             row.addWidget(self.face(opens_run), 0, Qt.AlignmentFlag.AlignTop)
             row.addLayout(stack)
             row.addStretch(1)
+        # Now that everything is in the tree: the ⋯ waits for a tap, and the row
+        # under the bubble is there only for a pager.
+        self.set_revealed(False)
         self.set_max_width(page.bubble_width())
 
     def frame_for(self, message: Message) -> QFrame:
         """The bubble: the picture if there is one, then the words."""
-        self.frame = QFrame()
+        self.frame = QFrame(self)
         self.frame.setObjectName("bubbleYou" if self.mine else "bubbleThem")
         pad = self.page.metrics["pad"]
         column = QVBoxLayout(self.frame)
@@ -208,8 +218,11 @@ class MessageBubble(QWidget):
         The pager is shown whenever a reply has more than one version, because
         "2/3" is the only thing that says an earlier attempt is still there.
         The menu button is not: it appears on the message being tapped.
+
+        Neither is decided here. Both are ``set_revealed``'s to say, and it is
+        called once the row exists — see the constructor.
         """
-        holder = QWidget()
+        holder = QWidget(self)
         row = QHBoxLayout(holder)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(round(self.page.metrics["gap"] / 2))
@@ -222,17 +235,15 @@ class MessageBubble(QWidget):
         self.actions_button.setObjectName("bubbleAction")
         self.actions_button.setToolTip("What to do with this message")
         self.actions_button.clicked.connect(self.open_menu)
-        self.actions_button.hide()
         row.addWidget(self.actions_button)
         if not self.mine:
             row.addStretch(1)
         self.actions_row = holder
-        holder.setVisible(self.pager is not None)
         return holder
 
     def versions(self) -> QWidget:
         """The pager a regenerate leaves behind."""
-        holder = QWidget()
+        holder = QWidget(self)
         row = QHBoxLayout(holder)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(2)
