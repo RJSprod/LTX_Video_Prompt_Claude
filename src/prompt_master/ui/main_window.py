@@ -392,7 +392,7 @@ class MainWindow(QMainWindow):
     def refresh_status(self):
         from prompt_master.core.config import read_json
         state=read_json(self.paths.data/"setup-state.json")
-        self.status.setText(f"GPU: {state.get('gpu_device_name',state.get('gpu_name','not configured'))} · Model: {state.get('quantization','not configured')} · Server: {'running' if self.service.process.running else 'stopped'} · Generation: idle")
+        self.status.setText(f"Device: {state.get('gpu_device_name',state.get('gpu_name','not configured'))} · Model: {state.get('quantization','not configured')} · Server: {'running' if self.service.process.running else 'stopped'} · Generation: idle")
     def open_setup(self):
         self.service.stop(); wizard=SetupWizard(self.paths,self)
         if wizard.exec() and wizard.completed:

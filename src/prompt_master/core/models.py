@@ -67,8 +67,23 @@ class PromptRequest:
     output_height: int = 1216
 
 
+# The device index that means "no card: run the model on the processor and
+# system RAM". Every index nvidia-smi reports is zero or greater, so a negative
+# one cannot collide with a real GPU.
+CPU_INDEX = -1
+
+
 @dataclass(frozen=True, slots=True)
 class GpuInfo:
+    """One device the model can be installed for: a CUDA GPU, or the processor.
+
+    Setup describes hardware with a single type so the processor travels the
+    same path a card does — the same manifest lookup, the same download, the
+    same state file. ``is_cpu`` is what tells the two apart, and for the
+    processor ``memory_total_mb``/``memory_free_mb`` are system RAM rather than
+    VRAM.
+    """
+
     physical_index: int
     uuid: str
     name: str
@@ -77,18 +92,25 @@ class GpuInfo:
     driver_version: str
     # nvidia-smi --query-gpu=compute_cap, e.g. 8.6 for Ampere, 12.0 for
     # Blackwell. None when the installed driver is too old to report it; the
-    # runtime choice then falls back to the model number.
+    # runtime choice then falls back to the model number. Always None for the
+    # processor, which has no CUDA compute capability at all.
     compute_capability: float | None = None
 
     @property
+    def is_cpu(self) -> bool:
+        """True for the processor rather than a CUDA card."""
+        return self.physical_index == CPU_INDEX
+
+    @property
     def supported(self) -> bool:
-        """Every CUDA GPU nvidia-smi reports is provisionable.
+        """Every CUDA GPU nvidia-smi reports is provisionable, as is the CPU.
 
         The upstream build accepted only an RTX 3090 or 5090 and refused
         everything else outright. Those two cards keep their pinned runtime and
         quantization (see ``device_detection.PINNED``); any other NVIDIA card is
         now sized from its own VRAM and compute capability instead of being
-        rejected. A card too small for a full offload is warned about at setup,
-        not blocked.
+        rejected, and a machine with no NVIDIA card at all can install the
+        CPU runtime instead. A card too small for a full offload is warned about
+        at setup, not blocked.
         """
         return True

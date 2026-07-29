@@ -19,7 +19,7 @@ VERSION = "1.0.0"
 USAGE = """Prompt Master Standalone — LTX-Video 2.3 prompt generator
 
   python app.py                 Open the application
-  python app.py --setup         Choose GPU, model and install directory
+  python app.py --setup         Choose device, model and install directory
   python app.py --setup --help  Setup options for unattended reinstall
   python app.py --version       Print the version
 """

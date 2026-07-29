@@ -17,10 +17,11 @@ from pathlib import Path
 
 import pytest
 
-from prompt_master.core.models import GpuInfo
+from prompt_master.core.models import CPU_INDEX, GpuInfo
 from prompt_master.core.paths import DEFAULT_SUBDIR, ROOT_ENV, AppPaths
-from prompt_master.inference.device_detection import (PINNED, QUANTIZATIONS,
-    recommended_quantization, runtime_component_id, vram_shortfall_mb)
+from prompt_master.inference.device_detection import (CPU_DEFAULT_QUANT, CPU_DEVICE,
+    CPU_GPU_LAYERS, CPU_RUNTIME, PINNED, QUANTIZATIONS, recommended_quantization,
+    runtime_component_id, vram_shortfall_mb)
 from prompt_master.provisioning import importer, installer, verifier
 from prompt_master.provisioning.importer import LocalSource, SourceMismatch
 from prompt_master.provisioning.manifest import Component
@@ -29,6 +30,11 @@ from prompt_master import setup_cli
 
 def gpu(name="NVIDIA GeForce RTX 4090", total=24564, compute=None, index=0):
     return GpuInfo(index, f"GPU-{index}", name, total, total - 2000, "560.94", compute)
+
+
+def cpu(name="Intel(R) Core(TM) i7-13700K", total=65413):
+    """The processor, as ``detect_cpu`` reports it: no card, system RAM."""
+    return GpuInfo(CPU_INDEX, "CPU", name, total, total - 20000, "AMD64", None)
 
 
 # ── the two pinned cards must not move ───────────────────────────────────────
@@ -114,6 +120,123 @@ def test_component_ids_pair_the_runtime_with_its_cuda_dlls():
     releases; a mismatched pair produces a runtime that cannot start."""
     ids = installer.component_ids(gpu(name="NVIDIA GeForce RTX 3090"), "Q4_K_M")
     assert ids == ("llama-runtime-cuda12", "llama-runtime-cuda12-cudart", "model-Q4_K_M", "mmproj")
+
+
+# ── the processor, for a machine with no card to give the model ──────────────
+
+def test_the_cpu_is_a_device_like_any_other():
+    assert cpu().is_cpu and not gpu().is_cpu
+    assert runtime_component_id(cpu()) == CPU_RUNTIME
+
+
+def test_the_cpu_runtime_needs_no_cuda_dlls_beside_it():
+    """The CUDA program archive is pinned separately from its cudart release
+    and useless without it. The CPU archive carries everything it needs, so a
+    third component would be a download with nothing to pair to."""
+    ids = installer.component_ids(cpu(), "Q4_K_M")
+    assert ids == (CPU_RUNTIME, "model-Q4_K_M", "mmproj")
+    assert not any(key.endswith("-cudart") for key in ids)
+
+
+@pytest.mark.parametrize("quant", QUANTIZATIONS)
+def test_every_cpu_combination_resolves_to_pinned_components(quant):
+    components = installer.resolve(cpu(), quant)
+    assert len(components) == 3
+    for component in components:
+        component.validate()          # HTTPS, 64-char SHA-256, no "latest"
+    assert installer.format_download_size(cpu(), quant).startswith("at least")
+
+
+def test_the_cpu_is_never_short_of_memory_at_any_quantization():
+    """A shortfall measures what would spill out of VRAM into system RAM. In
+    CPU mode the weights are in system RAM already, so there is nothing to
+    measure and nothing for either front end to warn about — including on a
+    machine with far less RAM than the weights are large."""
+    assert all(vram_shortfall_mb(cpu(), quant) == 0 for quant in QUANTIZATIONS)
+    assert vram_shortfall_mb(cpu(total=8192), "Q8_K_P") == 0
+    with pytest.raises(ValueError):
+        vram_shortfall_mb(cpu(), "Q2_K")      # an unknown name is still an error
+
+
+def test_the_cpu_default_is_the_lightest_build_not_the_largest_that_fits():
+    """A card takes the biggest quantization its VRAM holds. Every byte of the
+    weights crosses the memory bus on a processor, so the default there is the
+    smallest pinned build — and it does not move with how much RAM is fitted."""
+    assert recommended_quantization(cpu(total=65413)) == CPU_DEFAULT_QUANT
+    assert recommended_quantization(cpu(total=262144)) == CPU_DEFAULT_QUANT
+    assert recommended_quantization(gpu(total=262144)) == "Q8_K_P"
+
+
+def test_cpu_state_records_no_offload_and_asks_llama_nothing(tmp_path, monkeypatch):
+    """--device none is the whole answer, so the CUDA device probe must not run
+    — there is no CUDA device for it to find — and a layer count passed in from
+    the command line must not survive into the state as a fiction."""
+    monkeypatch.setattr(installer, "list_llama_devices",
+                        lambda *_a, **_k: pytest.fail("must not probe for a CUDA device"))
+    installed = installer.Installed("runtime/llama-server.exe", "models/m.gguf", "models/p.gguf")
+
+    state = installer.write_state(AppPaths(tmp_path), cpu(), "Q4_K_M", installed,
+                                  gpu_layers=installer.FULL_OFFLOAD)
+
+    assert state["gpu_device"] == CPU_DEVICE == "none"
+    assert state["gpu_layers"] == CPU_GPU_LAYERS == "0"
+    assert state["gpu_index"] == CPU_INDEX
+    assert state["gpu_device_name"] == cpu().name
+    assert json.loads((tmp_path / "data" / "setup-state.json").read_text(encoding="utf-8")) == state
+
+
+def test_a_cpu_install_hides_every_card_from_llama_server(tmp_path, monkeypatch):
+    """CUDA_VISIBLE_DEVICES is set from the GPU index for a card. In CPU mode
+    the index is -1, which as a value would hide nothing meaningful, so the
+    variable is emptied instead: a card in the machine must not be picked up."""
+    from prompt_master.inference.llama_process import LlamaProcess
+
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, command, env=None, **_kwargs):
+            captured["command"], captured["env"] = command, env
+
+        def poll(self): return None
+
+    monkeypatch.setattr("prompt_master.inference.llama_process.subprocess.Popen", FakePopen)
+    LlamaProcess().start(tmp_path / "llama-server.exe", tmp_path / "m.gguf", tmp_path / "p.gguf",
+                         CPU_INDEX, CPU_DEVICE, 16384, tmp_path / "log.txt",
+                         gpu_layers=CPU_GPU_LAYERS)
+
+    command = captured["command"]
+    assert command[command.index("--device") + 1] == "none"
+    assert command[command.index("--n-gpu-layers") + 1] == "0"
+    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == ""
+
+
+def test_a_cpu_install_is_given_longer_to_load_before_it_is_called_dead(tmp_path, monkeypatch):
+    """17-27 GiB into system RAM takes longer than filling VRAM does. The wait
+    is a start-up allowance, not a warning and not a limit on generation."""
+    from prompt_master.inference import service as service_module
+
+    waited = []
+    paths = AppPaths(tmp_path)
+    paths.create_managed_dirs()
+    for relative in ("runtime/llama-server.exe", "models/m.gguf", "models/p.gguf"):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"stand-in")
+    state = {"runtime": "runtime/llama-server.exe", "model": "models/m.gguf",
+             "mmproj": "models/p.gguf", "gpu_index": CPU_INDEX, "gpu_device": CPU_DEVICE,
+             "context_size": 16384, "gpu_layers": CPU_GPU_LAYERS}
+    paths.state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    inference = service_module.InferenceService(paths)
+    monkeypatch.setattr(inference.process, "start", lambda *_a, **_k: None)
+    monkeypatch.setattr(inference.process, "wait_ready", lambda timeout: waited.append(timeout))
+    inference.client()
+    assert waited == [service_module.CPU_READY_TIMEOUT]
+
+    paths.state_file.write_text(json.dumps({**state, "gpu_index": 0, "gpu_device": "CUDA0"}),
+                                encoding="utf-8")
+    inference.client()
+    assert waited[-1] == service_module.GPU_READY_TIMEOUT
 
 
 def test_missing_component_set_fails_before_any_download():
@@ -202,22 +325,25 @@ def test_setup_flags_cover_every_question():
     assert (options.directory, options.gpu, options.quant, options.yes) == ("D:/PM", 1, "Q8_K_P", True)
     assert options.context_size == installer.DEFAULT_CONTEXT_SIZE
     assert options.gpu_layers == installer.FULL_OFFLOAD
+    assert options.cpu is False
+
+    cpu_run = setup_cli.parse_args(["--dir", "D:/PM", "--cpu", "--quant", "Q4_K_M", "--yes"])
+    assert cpu_run.cpu and cpu_run.gpu is None
 
 
 def test_preselected_gpu_index_must_exist(monkeypatch):
-    monkeypatch.setattr(setup_cli, "detect_gpus", lambda: [gpu(index=0)])
-    assert setup_cli.ask_gpu(0).physical_index == 0
+    monkeypatch.setattr(setup_cli, "detect_devices", lambda: [gpu(index=0), cpu()])
+    assert setup_cli.ask_device(0).physical_index == 0
     with pytest.raises(SystemExit, match="No GPU with index 3"):
-        setup_cli.ask_gpu(3)
+        setup_cli.ask_device(3)
 
 
-def test_missing_driver_is_reported_not_raised(monkeypatch):
-    def explode():
-        raise RuntimeError("nvidia-smi is not available.")
-
-    monkeypatch.setattr(setup_cli, "detect_gpus", explode)
-    with pytest.raises(SystemExit, match="nvidia-smi"):
-        setup_cli.ask_gpu(None)
+def test_a_missing_index_points_at_the_cpu_rather_than_stopping_there(monkeypatch):
+    """--gpu 3 on a machine without one is now a wrong answer to a question
+    that has another answer, so the message has to name it."""
+    monkeypatch.setattr(setup_cli, "detect_devices", lambda: [cpu()])
+    with pytest.raises(SystemExit, match="--cpu"):
+        setup_cli.ask_device(0)
 
 
 def test_preselected_quantization_must_be_known(monkeypatch):
@@ -234,16 +360,43 @@ def test_choose_accepts_letters_and_numbers(monkeypatch):
     assert setup_cli.choose("pick", ["one", "two"]) == 0   # "?" retried, then "A"
 
 
-def test_single_gpu_is_not_a_question(monkeypatch, capsys):
-    monkeypatch.setattr(setup_cli, "detect_gpus", lambda: [gpu(index=2)])
+def test_a_single_gpu_is_still_the_default_answer(monkeypatch, capsys):
+    """One card no longer means one option — the processor is offered beside it
+    — but the card stays first, so pressing Enter installs what it always did."""
+    monkeypatch.setattr(setup_cli, "detect_devices", lambda: [gpu(index=2), cpu()])
+    # What pressing Enter does: ask() returns the default it was offered.
+    monkeypatch.setattr(setup_cli, "ask", lambda _prompt, default="": default)
+
+    device = setup_cli.ask_device(None)
+
+    assert device.physical_index == 2
+    listed = capsys.readouterr().out
+    assert "A) NVIDIA GeForce RTX 4090" in listed and "(recommended)" in listed
+    assert "B) Intel(R) Core(TM) i7-13700K" in listed
+
+
+def test_no_gpu_selects_the_cpu_instead_of_exiting(monkeypatch, capsys):
+    """The machine this feature exists for: no card, no driver, one answer."""
+    monkeypatch.setattr(setup_cli, "detect_devices", lambda: [cpu()])
     monkeypatch.setattr(setup_cli, "ask", lambda *_a, **_k: pytest.fail("should not ask"))
-    assert setup_cli.ask_gpu(None).physical_index == 2
+
+    device = setup_cli.ask_device(None)
+
+    assert device.is_cpu
+    assert "No CUDA GPU" in capsys.readouterr().out
 
 
-def test_no_gpu_is_a_clean_exit(monkeypatch):
-    monkeypatch.setattr(setup_cli, "detect_gpus", lambda: [])
-    with pytest.raises(SystemExit, match="no CUDA GPU"):
-        setup_cli.ask_gpu(None)
+def test_the_cpu_flag_skips_the_scan_entirely(monkeypatch):
+    """--cpu is an answer, not a preference: a machine with a card that should
+    stay free must not need nvidia-smi to say so."""
+    monkeypatch.setattr(setup_cli, "detect_devices", lambda: pytest.fail("must not scan"))
+    monkeypatch.setattr(setup_cli, "detect_cpu", cpu)
+    assert setup_cli.ask_device(None, cpu=True).is_cpu
+
+
+def test_cpu_and_gpu_together_are_refused():
+    with pytest.raises(SystemExit, match="--cpu and --gpu"):
+        setup_cli.run(["--cpu", "--gpu", "0"])
 
 
 # ── supplying the model from disk instead of downloading it ──────────────────
@@ -516,6 +669,51 @@ def test_the_wizard_vets_a_supplied_model_the_same_way(monkeypatch, tmp_path):
                         staticmethod(lambda *_a, **_k: widgets.QMessageBox.No))
     wizard.model_file.setText(str(tmp_path / "not-the-pinned-one.gguf"))
     assert wizard._vet_model_file() is None                   # refused, and the page holds
+
+
+def test_the_wizard_offers_the_processor_beside_any_card(monkeypatch, tmp_path):
+    """Settings → Models and Hardware is where an installed app goes back to
+    change its mind, so the option has to be on that page too."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    widgets = pytest.importorskip("PySide6.QtWidgets")
+    from prompt_master.ui import setup_wizard as wizard_module
+
+    monkeypatch.setattr(wizard_module, "detect_devices", lambda: [gpu(), cpu()])
+    widgets.QApplication.instance() or widgets.QApplication([])
+    wizard = wizard_module.SetupWizard(AppPaths(tmp_path / "user_data"))
+
+    wizard._page_changed(1)
+    assert [wizard.gpu.itemData(row).is_cpu for row in range(wizard.gpu.count())] == [False, True]
+    assert "Intel(R) Core(TM) i7-13700K" in wizard.gpu.itemText(1)
+    assert wizard.gpu.currentIndex() == 0                  # the card is still the default
+
+    wizard.gpu.setCurrentIndex(1)
+    wizard._page_changed(2)
+    assert wizard.quant.currentText() == CPU_DEFAULT_QUANT
+    described = wizard.recommendation.text()
+    assert "processor and system RAM" in described
+    # A disclaimer, not a warning: nothing about RAM size or speed.
+    assert "Warning" not in described and "slow" not in described
+
+
+def test_the_wizard_falls_back_to_the_processor_when_the_scan_fails(monkeypatch, tmp_path):
+    """A missing driver used to leave an empty combo box on a page that could
+    not be left. It now leaves the one device that machine actually has."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    widgets = pytest.importorskip("PySide6.QtWidgets")
+    from prompt_master.ui import setup_wizard as wizard_module
+
+    def explode():
+        raise RuntimeError("nvidia-smi is not available.")
+
+    monkeypatch.setattr(wizard_module, "detect_devices", explode)
+    monkeypatch.setattr(wizard_module, "detect_cpu", cpu)
+    widgets.QApplication.instance() or widgets.QApplication([])
+    wizard = wizard_module.SetupWizard(AppPaths(tmp_path / "user_data"))
+
+    wizard._page_changed(1)
+    assert wizard.gpu.count() == 1 and wizard.gpu.currentData().is_cpu
+    assert "nvidia-smi" in wizard.hardware_status.text()
 
 
 def test_named_files_can_be_kept_where_they_are(monkeypatch, tmp_path):

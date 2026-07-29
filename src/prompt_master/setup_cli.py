@@ -2,15 +2,16 @@
 
 This is what the one-click installer runs after it has built the Python
 environment, and what ``python app.py --setup`` re-runs later. It asks where to
-install, which GPU to use, which quantization to download, and whether the model
-is already on this machine, then hands off to ``provisioning.installer`` — the
-same pipeline the Qt wizard uses, so answering here and answering there produce
-the same install.
+install, which device to run on, which quantization to download, and whether the
+model is already on this machine, then hands off to ``provisioning.installer`` —
+the same pipeline the Qt wizard uses, so answering here and answering there
+produce the same install.
 
 Every question can also be supplied as a flag, which is what makes an unattended
 reinstall possible:
 
     python app.py --setup --dir D:/PromptMaster --gpu 0 --quant Q6_K_P --yes
+    python app.py --setup --cpu --quant Q4_K_M --yes
     python app.py --setup --model-file D:/models/Gemma4-...-Q6_K_P.gguf --yes
 """
 
@@ -24,7 +25,7 @@ from pathlib import Path
 
 from prompt_master.core.models import GpuInfo
 from prompt_master.core.paths import AppPaths
-from prompt_master.inference.device_detection import (QUANTIZATIONS, detect_gpus,
+from prompt_master.inference.device_detection import (QUANTIZATIONS, detect_cpu, detect_devices,
     recommended_quantization, runtime_component_id, vram_shortfall_mb)
 from prompt_master.provisioning import importer, installer, verifier
 
@@ -144,33 +145,46 @@ def ask_directory(default: Path, steps: Steps) -> AppPaths:
         return AppPaths(root)
 
 
-def ask_gpu(preselected: int | None = None, steps: Steps | None = None) -> GpuInfo:
+def device_label(device: GpuInfo) -> str:
+    """One line describing a device in the menu."""
+    if device.is_cpu:
+        return f"{device.name} — {device.memory_total_mb} MiB of system RAM — no GPU used"
+    return f"{device.name} — {device.memory_total_mb} MiB — driver {device.driver_version}"
+
+
+def ask_device(preselected: int | None = None, cpu: bool = False,
+               steps: Steps | None = None) -> GpuInfo:
+    """Which device runs the model: a CUDA GPU, or the processor.
+
+    The processor is always the last option, so a machine with no NVIDIA driver
+    has one answer rather than none, and a machine with a card can still choose
+    to keep it free. A detected GPU stays the default — a run that took the
+    first option before this question learned about the CPU still takes it.
+    """
+    if cpu:
+        device = detect_cpu()
+        print(f"Using the processor: {device.name} ({device.memory_total_mb} MiB of system RAM)")
+        return device
     if preselected is None and steps is not None:
-        steps.ask("which GPU should run the model?")
-    try:
-        gpus = detect_gpus()
-    except RuntimeError as exc:
-        # A missing driver is the single most likely first-run failure, and a
-        # traceback is a poor way to say "install the NVIDIA driver".
-        raise SystemExit(f"{exc}\n\nThis application runs the model on an NVIDIA GPU through llama.cpp.")
-    if not gpus:
-        raise SystemExit(
-            "nvidia-smi reported no CUDA GPU.\n"
-            "This application runs the model on an NVIDIA GPU through llama.cpp; there is no CPU path."
-        )
+        steps.ask("what should run the model?")
+    devices = detect_devices()
+    gpus = [device for device in devices if not device.is_cpu]
     if preselected is not None:
         for gpu in gpus:
             if gpu.physical_index == preselected:
                 print(f"Using GPU {preselected}: {gpu.name}")
                 return gpu
-        raise SystemExit(f"No GPU with index {preselected}. Detected: " +
-                         ", ".join(f"{g.physical_index}={g.name}" for g in gpus))
-    if len(gpus) == 1:
-        gpu = gpus[0]
-        print(f"Found one CUDA GPU: {gpu.name} ({gpu.memory_total_mb} MiB, driver {gpu.driver_version})")
-        return gpu
-    labels = [f"{gpu.name} — {gpu.memory_total_mb} MiB — driver {gpu.driver_version}" for gpu in gpus]
-    return gpus[choose("What is your GPU?", labels)]
+        detected = ", ".join(f"{gpu.physical_index}={gpu.name}" for gpu in gpus) or "no CUDA GPU"
+        raise SystemExit(f"No GPU with index {preselected}. Detected: {detected}\n"
+                         "Pass --cpu to run on the processor and system RAM instead.")
+    if not gpus:
+        device = devices[0]
+        print("No CUDA GPU was detected, so this install will run on the processor:")
+        print(f"  {device.name} ({device.memory_total_mb} MiB of system RAM)")
+        return device
+    print(f"Found {len(gpus)} CUDA GPU(s). The processor is offered too, for a machine")
+    print("whose card should stay free or whose driver is not installed.\n")
+    return devices[choose("What should run the model?", [device_label(d) for d in devices])]
 
 
 def read_path(prompt: str) -> Path | None:
@@ -272,6 +286,18 @@ def ask_quantization(gpu: GpuInfo, preselected: str | None = None, steps: Steps 
     if steps is not None:
         steps.ask("which model quality?")
     recommended = recommended_quantization(gpu)
+    if gpu.is_cpu:
+        # Sized against nothing, so measured against nothing: the download is
+        # what differs between these three here, and all three are offered.
+        print(f"{gpu.name} — {gpu.memory_total_mb} MiB of system RAM.\n")
+        labels = [f"{quant} — {installer.format_download_size(gpu, quant)} to download"
+                  for quant in QUANTIZATIONS]
+        quant = QUANTIZATIONS[choose("Which quantization?", labels,
+                                     list(QUANTIZATIONS).index(recommended))]
+        print("\nThis install runs on the processor and system RAM. No NVIDIA GPU or driver is")
+        print("used, and none is required. You can change the quantization at any time with")
+        print("`python app.py --setup`.")
+        return quant
     labels = []
     for quant in QUANTIZATIONS:
         shortfall = vram_shortfall_mb(gpu, quant)
@@ -294,11 +320,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                                      description="Configure the local model and runtime.")
     parser.add_argument("--dir", dest="directory", help="Installation directory for models and runtime")
     parser.add_argument("--gpu", type=int, help="Physical GPU index, as reported by nvidia-smi")
+    parser.add_argument("--cpu", action="store_true",
+                        help="Run on the processor and system RAM instead of a GPU")
     parser.add_argument("--quant", choices=list(QUANTIZATIONS), help="GGUF quantization to download")
     parser.add_argument("--context-size", type=int, default=installer.DEFAULT_CONTEXT_SIZE,
                         help=f"llama.cpp context size (default {installer.DEFAULT_CONTEXT_SIZE})")
     parser.add_argument("--gpu-layers", default=installer.FULL_OFFLOAD,
-                        help="llama.cpp --n-gpu-layers; lower it to spill layers to system RAM on a small card")
+                        help="llama.cpp --n-gpu-layers; lower it to spill layers to system RAM on a "
+                             "small card. Not used with --cpu, which offloads nothing by definition")
     parser.add_argument("--model-file", help="Install this .gguf instead of downloading the model")
     parser.add_argument("--mmproj-file", help="Install this .gguf instead of downloading the vision projector")
     parser.add_argument("--keep-source", action="store_true",
@@ -330,12 +359,16 @@ def supplied_files(options: argparse.Namespace, quant: str) -> dict:
 
 def run(argv: list[str] | None = None) -> int:
     options = parse_args(argv)
+    if options.cpu and options.gpu is not None:
+        raise SystemExit("--cpu and --gpu name different devices. Pass one of them.")
     banner("Prompt Master — model and hardware setup")
 
     # The local-file question is skipped when a file was named on the command
     # line, and when --yes says nobody is watching.
     asks_local = not (options.model_file or options.yes)
-    steps = Steps(sum(answer is None for answer in (options.directory, options.gpu, options.quant)) + asks_local)
+    answered = (options.directory is not None, options.gpu is not None or options.cpu,
+                options.quant is not None)
+    steps = Steps(sum(not given for given in answered) + asks_local)
 
     if options.directory:
         paths = AppPaths(Path(options.directory).expanduser().resolve())
@@ -343,7 +376,7 @@ def run(argv: list[str] | None = None) -> int:
         paths = ask_directory(AppPaths.discover().root, steps)
     paths.create_managed_dirs()
 
-    gpu = ask_gpu(options.gpu, steps)
+    gpu = ask_device(options.gpu, options.cpu, steps)
     quant = ask_quantization(gpu, options.quant, steps)
     if asks_local:
         quant, sources = ask_local_model(quant, steps, move=not options.keep_source)
@@ -351,7 +384,7 @@ def run(argv: list[str] | None = None) -> int:
         sources = supplied_files(options, quant)
 
     banner("Downloading and verifying")
-    print(f"GPU        : {gpu.name} (index {gpu.physical_index})")
+    print(f"Device     : {gpu.name}" + ("" if gpu.is_cpu else f" (index {gpu.physical_index})"))
     print(f"Runtime    : {runtime_component_id(gpu)}")
     print(f"Model      : {quant}")
     print(f"Directory  : {paths.root}")
