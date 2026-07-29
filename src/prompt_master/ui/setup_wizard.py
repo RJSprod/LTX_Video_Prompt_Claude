@@ -55,7 +55,8 @@ class SetupWizard(QWizard):
         browse=QPushButton("Browse…"); browse.clicked.connect(self._browse_model)
         row=QHBoxLayout(); row.addWidget(self.model_file); row.addWidget(browse)
         form.addRow("Model file you already have",row)
-        form.addRow(QLabel("It is moved into the installation directory, not copied."))
+        form.addRow(QLabel("It is moved into the installation directory under its own name — "
+                           "not copied, and not renamed."))
         self.quant.currentTextChanged.connect(self._describe_quant); self.addPage(page)
 
     def _browse_model(self):

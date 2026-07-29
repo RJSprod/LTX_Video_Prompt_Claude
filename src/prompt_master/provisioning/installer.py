@@ -168,6 +168,10 @@ def fetch(paths: AppPaths, gpu: GpuInfo, quantization: str, *,
             on_status(f"Downloading {key}…")
             artifact = download(component, target, report,
                                 lambda text, k=key: on_status(f"{k}: {text}"))
+        # What was installed, never what was asked for: a file supplied from
+        # disk keeps its own name, so ``adopt`` can hand back a path in the same
+        # folder under a different one. The state file records this, and it is
+        # the only thing that ever reads a model's name.
         if key.startswith("llama-runtime-"):
             runtime_archives.append(artifact)
         elif key.startswith("model-"):

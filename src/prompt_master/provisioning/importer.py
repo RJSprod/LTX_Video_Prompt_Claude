@@ -6,10 +6,17 @@ copied from another install, pulled with a download manager that resumes better
 than we can — should be able to hand it over instead.
 
 What arrives here is treated exactly like something downloaded: checked against
-the pinned SHA-256 before it is installed, and put at the same path under the
-install root, so nothing downstream can tell the difference. The default is to
-*move* it rather than copy it, because the point of supplying a 21 GiB file you
-already have is not to end up with two of them.
+the pinned SHA-256 before it is installed, and put in the same folder under the
+install root. The default is to *move* it rather than copy it, because the point
+of supplying a 21 GiB file you already have is not to end up with two of them.
+
+The folder, and not the file name. A supplied file keeps the name it arrived
+with, because it is a file the person handing it over still has to recognise:
+renaming ``MyMerge-Q5_K_M.gguf`` to the pinned build's name leaves a models
+folder claiming to hold something it does not, and leaves them looking for a
+file that no longer exists under any name they chose. Nothing downstream needs
+a particular name — what was installed is recorded in the state file as the
+path it actually went to, and that is the only thing that ever reads it.
 """
 
 from __future__ import annotations
@@ -75,21 +82,34 @@ def inspect(component: Component, path: Path, progress: Progress | None = None) 
         raise SourceMismatch(f"{path.name} does not match the pinned SHA-256 for {component.component_id}") from exc
 
 
+def installed_as(destination: Path, source: LocalSource) -> Path:
+    """Where a supplied file lands: the manifest's folder, under its own name."""
+    return destination.with_name(source.path.expanduser().resolve().name)
+
+
 def adopt(component: Component, destination: Path, source: LocalSource,
           progress: Progress | None = None) -> Path:
-    """Install ``source`` as ``component``. Returns the installed path."""
+    """Install ``source`` as ``component``. Returns the installed path.
+
+    ``destination`` is where a download of this component would have gone. Only
+    its folder is used — see the module docstring — so the path returned is not
+    necessarily the one passed in, and callers must record what comes back
+    rather than what they asked for.
+    """
     path = source.path.expanduser().resolve()
     if not source.checked:
         inspect(component, path, progress)
     destination.parent.mkdir(parents=True, exist_ok=True)
     # An abandoned download of the same artifact is now dead weight, and a
-    # part file at full size would block a later resume anyway.
+    # part file at full size would block a later resume anyway. It is looked for
+    # under the manifest's own name, which is what that download would have used.
     destination.with_name(destination.name + ".part").unlink(missing_ok=True)
-    if destination.is_file() and destination.samefile(path):
+    installed = installed_as(destination, source)
+    if installed.is_file() and installed.samefile(path):
         if progress: progress(1, 1)
-        return destination
-    _install(path, destination, component.size or path.stat().st_size, move=source.move, progress=progress)
-    return destination
+        return installed
+    _install(path, installed, component.size or path.stat().st_size, move=source.move, progress=progress)
+    return installed
 
 
 def _install(source: Path, destination: Path, size: int, *, move: bool,

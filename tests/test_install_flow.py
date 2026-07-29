@@ -604,18 +604,33 @@ def test_a_supplied_file_is_moved_not_copied(tmp_path):
     to end up with two of them."""
     source = their_file(tmp_path)
     destination = tmp_path / "user_data" / "models" / "model.gguf"
+    installed = destination.with_name(source.name)
 
-    assert importer.adopt(pinned(source), destination, LocalSource(source)) == destination
-    assert destination.read_bytes() == b"pretend gguf" * 512
+    assert importer.adopt(pinned(source), destination, LocalSource(source)) == installed
+    assert installed.read_bytes() == b"pretend gguf" * 512
     assert not source.exists()
+
+
+def test_a_supplied_file_keeps_the_name_it_arrived_with(tmp_path):
+    """It goes into the folder the manifest names, not under the file name the
+    manifest names. A models folder that renamed somebody's file to the pinned
+    build's name would claim to hold something it does not."""
+    source = their_file(tmp_path, name="MyMerge-Q5_K_M.gguf")
+    destination = tmp_path / "user_data" / "models" / "Gemma4-26B-Q6_K_P.gguf"
+
+    installed = importer.adopt(pinned(source), destination, LocalSource(source))
+
+    assert installed.name == "MyMerge-Q5_K_M.gguf"
+    assert installed.parent == destination.parent
+    assert not destination.exists(), "nothing was written under the pinned name"
 
 
 def test_keeping_the_source_copies_instead(tmp_path):
     source = their_file(tmp_path)
     destination = tmp_path / "user_data" / "models" / "model.gguf"
 
-    importer.adopt(pinned(source), destination, LocalSource(source, move=False))
-    assert source.exists() and destination.read_bytes() == source.read_bytes()
+    installed = importer.adopt(pinned(source), destination, LocalSource(source, move=False))
+    assert source.exists() and installed.read_bytes() == source.read_bytes()
 
 
 def test_adopting_clears_the_abandoned_download_it_replaces(tmp_path):
@@ -667,13 +682,14 @@ def test_a_cross_drive_move_copies_then_removes_the_original(tmp_path, monkeypat
     model was downloaded to C: and the install root is on D:."""
     source = their_file(tmp_path)
     destination = tmp_path / "user_data" / "models" / "model.gguf"
-    monkeypatch.setattr(importer.os, "replace", _refusing_replace(destination))
+    installed = destination.with_name(source.name)
+    monkeypatch.setattr(importer.os, "replace", _refusing_replace(installed))
     seen = []
 
     importer.adopt(pinned(source), destination, LocalSource(source), lambda done, total: seen.append(done))
-    assert destination.read_bytes() == b"pretend gguf" * 512
+    assert installed.read_bytes() == b"pretend gguf" * 512
     assert not source.exists()
-    assert seen and seen[-1] == destination.stat().st_size   # the copy reported progress
+    assert seen and seen[-1] == installed.stat().st_size   # the copy reported progress
 
 
 def _refusing_replace(destination):
@@ -693,7 +709,7 @@ def test_a_cross_drive_move_checks_for_room_first(tmp_path, monkeypatch):
     source = their_file(tmp_path)
     destination = tmp_path / "user_data" / "models" / "model.gguf"
     destination.parent.mkdir(parents=True)
-    monkeypatch.setattr(importer.os, "replace", _refusing_replace(destination))
+    monkeypatch.setattr(importer.os, "replace", _refusing_replace(destination.with_name(source.name)))
     monkeypatch.setattr(importer.shutil, "disk_usage", lambda _path: _Usage(64))
 
     with pytest.raises(OSError, match="free"):
@@ -1488,3 +1504,109 @@ def test_a_projector_that_was_recorded_and_then_deleted_is_still_an_error(tmp_pa
 
     with pytest.raises(RuntimeError, match="vision projector is missing"):
         InferenceService(paths).client()
+
+
+# ── a supplied file keeps its own name ───────────────────────────────────────
+
+def test_fetch_records_the_supplied_file_under_the_name_it_arrived_with(tmp_path, monkeypatch):
+    """End to end, with the real adopt: what setup writes into the state file
+    is the path the model actually went to. Nothing renames a file somebody
+    handed over, and nothing needs it renamed."""
+    components = installer.load_components()
+
+    def fake_download(component, target, progress=None, notice=None):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.suffix == ".zip":
+            with zipfile.ZipFile(target, "w") as bundle:
+                bundle.writestr("llama-server.exe", b"exe")
+        else:
+            target.write_bytes(b"downloaded")
+        return target
+
+    monkeypatch.setattr(installer, "download", fake_download)
+    mine = tmp_path / "downloads" / "MyMerge-Q5_K_M.gguf"
+    mine.parent.mkdir(parents=True)
+    mine.write_bytes(b"pretend gguf")
+    paths = AppPaths(tmp_path / "install")
+
+    installed = installer.fetch(paths, gpu(name="NVIDIA GeForce RTX 5090", total=32607), "Q6_K_P",
+                                sources={"model-Q6_K_P": LocalSource(mine, checked=True)})
+
+    assert installed.model == "models/MyMerge-Q5_K_M.gguf"
+    assert (paths.root / installed.model).is_file()
+    assert not (paths.root / components["model-Q6_K_P"].destination).exists()
+    assert not mine.exists(), "it was moved, not copied"
+    # What was downloaded still lands on the pinned name, which is what the
+    # resume and the download cache are keyed on.
+    assert installed.mmproj == components["mmproj"].destination
+
+
+def test_a_model_with_any_name_at_all_is_what_the_server_is_pointed_at(tmp_path, monkeypatch):
+    """Nothing downstream parses a model's name: the recorded path is handed to
+    llama-server as it stands, spaces, brackets and all."""
+    from prompt_master.inference.service import InferenceService
+
+    odd = "Some Merge (v2) [uncensored].Q5_K_M.gguf"
+    paths = AppPaths(tmp_path)
+    paths.create_managed_dirs()
+    for relative in ("runtime/llama-server.exe", f"models/{odd}"):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"stand-in")
+    paths.state_file.write_text(json.dumps({
+        "runtime": "runtime/llama-server.exe", "model": f"models/{odd}", "mmproj": "",
+        "gpu_index": 0, "gpu_device": "CUDA0", "context_size": 16384, "gpu_layers": "all",
+    }), encoding="utf-8")
+
+    started = []
+    service = InferenceService(paths)
+    monkeypatch.setattr(service.process, "start", lambda *args, **kwargs: started.append(args))
+    monkeypatch.setattr(service.process, "wait_ready", lambda timeout: None)
+    service.client()
+
+    assert started[0][1] == tmp_path / "models" / odd
+
+
+def test_a_projector_that_is_not_named_like_the_pinned_one_is_still_found(tmp_path):
+    """A model supplied by hand carries whatever naming its publisher chose.
+    Insisting on the pinned projector's name would mean only the pinned pair is
+    ever offered."""
+    component = installer.load_components()["mmproj"]
+    folder = tmp_path / "gguf"
+    folder.mkdir()
+    model = folder / "MyMerge-Q5_K_M.gguf"
+    model.write_bytes(b"weights")
+
+    assert setup_cli._projector_beside(component, model) is None
+    theirs = folder / "MyMerge-mmproj-f16.gguf"
+    theirs.write_bytes(b"a stand-in for the projector")
+    assert setup_cli._projector_beside(component, model) == theirs
+
+
+def test_a_projector_beside_an_unpinned_model_can_be_taken_anyway(monkeypatch, tmp_path):
+    """The same question the model itself gets, for the same reason: the
+    projector beside an unpinned model is the one that model needs, and it will
+    not match a hash pinned to a different build."""
+    source = their_file(tmp_path, name="MyMerge-Q5_K_M.gguf")
+    projector = source.parent / "MyMerge-mmproj-f16.gguf"
+    projector.write_bytes(b"a stand-in for the projector")
+    monkeypatch.setattr(setup_cli, "accept_file",
+                        lambda component, path: ("that is not the pinned projector", None))
+    # Use a local model / the path / use it anyway / take the projector / anyway.
+    answers(monkeypatch, "Y", str(source), "Y", "Y", "Y")
+
+    quant, sources = setup_cli.ask_local_model("Q6_K_P", setup_cli.Steps(4))
+
+    assert quant == "Q6_K_P" and set(sources) == {"model-Q6_K_P", "mmproj"}
+    assert sources["mmproj"].path == projector
+
+
+def test_declining_that_question_leaves_the_projector_to_download(monkeypatch, tmp_path):
+    source = their_file(tmp_path, name="MyMerge-Q5_K_M.gguf")
+    (source.parent / "MyMerge-mmproj-f16.gguf").write_bytes(b"a stand-in for the projector")
+    monkeypatch.setattr(setup_cli, "accept_file",
+                        lambda component, path: ("that is not the pinned projector", None))
+    answers(monkeypatch, "Y", str(source), "Y", "Y", "N")
+
+    _quant, sources = setup_cli.ask_local_model("Q6_K_P", setup_cli.Steps(4))
+    assert set(sources) == {"model-Q6_K_P"}

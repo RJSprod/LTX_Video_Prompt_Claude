@@ -73,9 +73,24 @@ python app.py --setup --model-file D:\models\Gemma4-...-Q6_K_P.gguf
 or answer the fourth question and paste the path. Either way it is checked
 against the same pinned SHA-256 as a download, then **moved** into the
 installation directory rather than copied, so you are not left with two copies
-of a 21 GiB file. `--keep-source` copies instead. If the vision projector sits
-beside it — it usually does, both being files from the same repository — setup
-offers to take that too, and anything not supplied is still downloaded normally.
+of a 21 GiB file. `--keep-source` copies instead.
+
+**It keeps its own file name.** A supplied file goes into the folder the
+manifest names, not under the file name the manifest names: a models folder that
+renamed `MyMerge-Q5_K_M.gguf` to the pinned build's name would claim to hold
+something it does not, and would leave you looking for a file that no longer
+exists under any name you chose. Nothing downstream needs a particular name —
+what was installed is recorded in the state file as the path it actually went
+to, and that is the only thing that ever reads it. What is *downloaded* still
+lands on the pinned name, which is what the resume and the download cache are
+keyed on.
+
+If the vision projector sits beside it — it usually does, both being files from
+the same repository — setup offers to take that too. It is found by the pinned
+name first and then by any name a projector goes by, so the projector beside a
+model you supplied is offered even though its naming is its publisher's. Setup
+asks before taking one that does not match the pinned hash, the same way it asks
+about the model. Anything not supplied is still downloaded normally.
 
 A file that is not the pinned build is named rather than just rejected: "that is
 the `Q4_K_M` build" is an answer, and setup offers to install it as what it is.
@@ -457,7 +472,7 @@ What changed, and only this:
 | GPU support | RTX 3090 / 5090 only, others refused | Any NVIDIA card; 3090 and 5090 keep their exact pinned runtime and quantization |
 | Running without a card | Not possible | The processor and system RAM are an option in both front ends, on the pinned CPU build of `llama.cpp` |
 | Running with a card too small for the model | Not possible | Mixed mode: same CUDA install, weights in system RAM, nothing resident on the card, which keeps the work `llama.cpp` can give it |
-| Where the model comes from | Downloaded, always | Downloaded, or installed from a `.gguf` you already have — against the same pinned SHA-256 |
+| Where the model comes from | Downloaded, always | Downloaded, or installed from a `.gguf` you already have — against the same pinned SHA-256, and keeping its own file name |
 | Window | One column of mouse-sized controls | Two panes, fingertip-sized targets, drag-to-scroll, five display sizes from Smaller to Larger |
 | Changing device | Re-run setup | That, or Settings → What runs the model, which swaps the llama.cpp build and keeps the model that is installed |
 | Changing model | Re-run setup, downloading another pinned quantization | That, or Settings → Which model runs — any `.gguf` on the machine, read where it is, with its vision projector optional |
