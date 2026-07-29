@@ -72,6 +72,18 @@ DEFAULT_CONTEXT = 8192
 # person looking at it.
 STICKY_MARGIN = 24
 
+# How long after the last change to the settings panel it is written to the
+# character. Long enough that holding + on a stepper is one write rather than
+# forty, and short enough that letting go of it and looking at the panel shows
+# the change already saved.
+SETTINGS_WRITE_DELAY = 600
+
+# What the settings panel says about itself. It is the panel's own line rather
+# than the window's status bar because it is about the panel, and because the
+# status bar is busy saying what the model is doing.
+SETTINGS_SAVED = "Saved with the character."
+SETTINGS_UNSAVED = "Not saved yet — saving…"
+
 
 class ChatWorker(QObject):
     """One reply, streamed off the UI thread."""
@@ -137,6 +149,13 @@ class MessageBubble(QWidget):
         row = QHBoxLayout(self)
         row.setContentsMargins(0, page.metrics["gap"] if opens_run else 2, 0, 0)
         row.setSpacing(round(page.metrics["gap"] / 2))
+        # ``stack`` has no widget of its own until it joins ``row`` below, so
+        # anything put in it stays unparented until then. Everything built here
+        # is therefore parented to the bubble explicitly, and nothing is made
+        # visible before this constructor has finished assembling the row: a
+        # widget shown while it has no parent *is* a top-level window, and Qt
+        # duly puts one on the screen — a bare white rectangle that flashes up
+        # and vanishes the instant the layout claims it.
         stack = QVBoxLayout()
         stack.setSpacing(2)
         stack.addWidget(self.frame_for(message))
@@ -150,11 +169,14 @@ class MessageBubble(QWidget):
             row.addWidget(self.face(opens_run), 0, Qt.AlignmentFlag.AlignTop)
             row.addLayout(stack)
             row.addStretch(1)
+        # Now that everything is in the tree: the ⋯ waits for a tap, and the row
+        # under the bubble is there only for a pager.
+        self.set_revealed(False)
         self.set_max_width(page.bubble_width())
 
     def frame_for(self, message: Message) -> QFrame:
         """The bubble: the picture if there is one, then the words."""
-        self.frame = QFrame()
+        self.frame = QFrame(self)
         self.frame.setObjectName("bubbleYou" if self.mine else "bubbleThem")
         pad = self.page.metrics["pad"]
         column = QVBoxLayout(self.frame)
@@ -196,8 +218,11 @@ class MessageBubble(QWidget):
         The pager is shown whenever a reply has more than one version, because
         "2/3" is the only thing that says an earlier attempt is still there.
         The menu button is not: it appears on the message being tapped.
+
+        Neither is decided here. Both are ``set_revealed``'s to say, and it is
+        called once the row exists — see the constructor.
         """
-        holder = QWidget()
+        holder = QWidget(self)
         row = QHBoxLayout(holder)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(round(self.page.metrics["gap"] / 2))
@@ -210,17 +235,15 @@ class MessageBubble(QWidget):
         self.actions_button.setObjectName("bubbleAction")
         self.actions_button.setToolTip("What to do with this message")
         self.actions_button.clicked.connect(self.open_menu)
-        self.actions_button.hide()
         row.addWidget(self.actions_button)
         if not self.mine:
             row.addStretch(1)
         self.actions_row = holder
-        holder.setVisible(self.pager is not None)
         return holder
 
     def versions(self) -> QWidget:
         """The pager a regenerate leaves behind."""
-        holder = QWidget()
+        holder = QWidget(self)
         row = QHBoxLayout(holder)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(2)
@@ -385,6 +408,14 @@ class ChatPage(QWidget):
         # are reset by anything that changes what you are looking at.
         self.revealed = -1
         self.pinned = True
+        # The settings panel writes itself back a moment after it stops being
+        # touched, so a value that was changed is a value that is saved without
+        # anything having to be pressed. Built before the panel it belongs to.
+        self._settings_problem = ""
+        self._settings_timer = QTimer(self)
+        self._settings_timer.setSingleShot(True)
+        self._settings_timer.setInterval(SETTINGS_WRITE_DELAY)
+        self._settings_timer.timeout.connect(self.persist_settings)
 
         column = QVBoxLayout(self)
         self.bars = {"character": _bar(self.character_row()),
@@ -480,7 +511,14 @@ class ChatPage(QWidget):
         return area
 
     def settings_area(self) -> QScrollArea:
-        """Temperature and its neighbours, saved with the character."""
+        """Temperature and its neighbours, saved with the character.
+
+        Everything in here belongs to the character rather than to the app, so
+        a change to it is a change to a file on disk. That happens on its own a
+        moment after the control stops moving — see ``SETTINGS_WRITE_DELAY`` —
+        and Save is what makes it happen now and say so. The button is not the
+        only way to save; it is the way to be told that it saved.
+        """
         box = QGroupBox("How this character replies")
         column = QVBoxLayout(box)
         self.temperature = QDoubleSpinBox()
@@ -499,17 +537,25 @@ class ChatPage(QWidget):
         self.seed.setSpecialValueText("Random each reply (-1)")
         for caption, widget in (("Temperature", self.temperature), ("Top-p", self.top_p),
                                 ("Reply length (tokens)", self.max_tokens), ("Seed", self.seed)):
+            widget.valueChanged.connect(self._settings_touched)
             column.addWidget(touch.labelled(caption, touch.stepper(widget)))
         self.system = QPlainTextEdit()
         self.system.setPlaceholderText(
             "Leave empty to use the character's context as written. Anything here replaces the "
             "whole system message — {{char}} and {{user}} still work.")
+        self.system.textChanged.connect(self._settings_touched)
         touch.flickable(self.system)
         column.addWidget(touch.labelled("Custom system message", self.system), 1)
-        note = QLabel("Saved with the character.")
-        note.setObjectName("fieldLabel")
-        note.setWordWrap(True)
-        column.addWidget(note)
+        self.settings_note = QLabel(SETTINGS_SAVED)
+        self.settings_note.setObjectName("fieldLabel")
+        self.settings_note.setWordWrap(True)
+        column.addWidget(self.settings_note)
+        self.save_settings_button = QPushButton("Save")
+        self.save_settings_button.setToolTip(
+            "Write these to the character now. They apply to the next reply either way.")
+        self.save_settings_button.setEnabled(False)   # a character just opened is saved
+        self.save_settings_button.clicked.connect(self.save_settings)
+        column.addWidget(self.save_settings_button)
 
         area = QScrollArea()
         area.setWidgetResizable(True)
@@ -619,28 +665,74 @@ class ChatPage(QWidget):
         self.system.blockSignals(True)
         self.system.setPlainText(character.system)
         self.system.blockSignals(False)
+        # Filling the panel in is not a change to it, and the write the timer
+        # was holding was for the character that is no longer open.
+        self._settings_timer.stop()
+        self._settings_state(saved=True)
 
-    def persist_settings(self) -> None:
-        """Write the panel back to the character it belongs to.
+    def _settings_touched(self, *_args) -> None:
+        """A control in the panel moved: write it once it has stopped moving.
 
-        Called at the points where the values have stopped moving — sending,
-        switching character, closing — rather than on every tick of a spin box,
-        because each one of those would rewrite the file.
+        Restarting the timer on every tick is what turns a stepper held down
+        from forty writes into one, and what makes typing a temperature save
+        the number rather than each prefix of it.
         """
         if self.character is None:
             return
+        self.settings_note.setText(SETTINGS_UNSAVED)
+        self.save_settings_button.setEnabled(True)
+        self._settings_timer.start()
+
+    def save_settings(self) -> None:
+        """The panel's Save button: write now, and say where it went.
+
+        The values are live either way — a generation reads them off these
+        controls — so this is about the file and about being told, which is the
+        half that was missing when the only way to save was to close the panel.
+        """
+        if self.character is None:
+            self.set_status("There is no character open to save these to.")
+            return
+        name = self.character.name
+        if self.persist_settings():
+            self.set_status(f"How {name} replies is saved.")
+        else:
+            self.set_status(f"Could not save how {name} replies — {self._settings_problem}")
+
+    def persist_settings(self) -> bool:
+        """Write the panel back to the character it belongs to.
+
+        Called by the timer a moment after the last change, by Save, and at
+        every point where the panel is about to stop being the open character's
+        — sending, switching character, closing the pane, shutting down — so
+        that no path out of the panel can drop what was typed into it.
+        """
+        self._settings_timer.stop()
+        if self.character is None:
+            return False
         updated = Character(name=self.character.name, context=self.character.context,
                             greeting=self.character.greeting,
                             temperature=self.temperature.value(), top_p=self.top_p.value(),
                             max_reply_tokens=self.max_tokens.value(), seed=self.seed.value(),
                             system=self.system.toPlainText().strip())
-        if updated == self.character:
-            return
-        try:
-            self.characters.save(updated)
-        except (OSError, ValueError):
-            return                      # a settings write must never lose a chat
-        self.character = updated
+        if updated != self.character:
+            try:
+                self.characters.save(updated)
+            except (OSError, ValueError) as exc:
+                # Reported rather than swallowed: a write that silently failed
+                # is what "the temperature will not stick" looks like from the
+                # outside. It still must not take the chat down with it.
+                self._settings_state(saved=False, problem=str(exc))
+                return False
+            self.character = updated
+        self._settings_state(saved=True)
+        return True
+
+    def _settings_state(self, saved: bool, problem: str = "") -> None:
+        """What the panel says about itself, and whether Save is worth pressing."""
+        self._settings_problem = problem
+        self.settings_note.setText(SETTINGS_SAVED if saved else f"Not saved — {problem}")
+        self.save_settings_button.setEnabled(not saved)
 
     def open_characters(self) -> None:
         self.persist_settings()
@@ -791,10 +883,25 @@ class ChatPage(QWidget):
             item = self.transcript_column.takeAt(0)
             widget = item.widget()
             if widget is not None:
-                # Unparented first: taking a widget out of a layout leaves it
-                # parented and visible where it was, so a rebuild that only
-                # schedules deletion paints the old transcript underneath the
-                # new one until the event loop gets around to it.
+                # Hidden, then unparented, and the order is the whole of it.
+                #
+                # Unparenting alone was the first half of a bug worth stating.
+                # Taking a widget out of a layout leaves it parented and visible
+                # where it was, so a rebuild that only schedules deletion paints
+                # the old transcript underneath the new one until the event loop
+                # gets around to it — which is why the unparenting is here.
+                #
+                # But a widget with no parent *is* a top-level window, and Qt
+                # marks a reparented widget hidden only if it was never created.
+                # These were on screen, so they are created, so they kept their
+                # "not hidden" state and Qt duly put each one on the screen as a
+                # window of its own on the next pass through the event loop: a
+                # blank rectangle per message, flashing up and vanishing again
+                # every time the transcript was rebuilt — which is every send.
+                #
+                # hide() first makes that state explicit, and the widget stays
+                # hidden through the reparenting and on into deletion.
+                widget.hide()
                 widget.setParent(None)
                 widget.deleteLater()
         self.bubbles = []
@@ -929,8 +1036,30 @@ class ChatPage(QWidget):
             return
         self.attachment = Path(filename)
         self.attach_button.setText(f"Attached: {self.attachment.name}")
+        # Said now rather than when the reply fails: whether a picture can be
+        # sent depends on the model running, and a model chosen by hand may have
+        # no vision projector at all.
+        if not self._vision_ready():
+            self.set_status(f"{self.attachment.name} is attached, but the model running has no "
+                            "vision projector and cannot be shown it. Choose one under "
+                            "Settings → Which model runs.")
+            return
         self.set_status(f"{self.attachment.name} goes with your next message. "
                         "Press Attach again to change it.")
+
+    def _vision_ready(self) -> bool:
+        """Whether a picture can reach the model — false only when it is known to be.
+
+        A warning about the projector has to be confident: an install that is
+        not set up yet, or a state file that cannot be read, is setup's problem
+        to describe and not a reason to tell somebody their model cannot see.
+        """
+        if not self.paths.configured:
+            return True
+        try:
+            return bool(self.service_provider().vision_ready())
+        except Exception:
+            return True
 
     def clear_attachment(self) -> None:
         self.attachment = None

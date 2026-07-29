@@ -27,6 +27,7 @@ from pathlib import Path
 
 from prompt_master.core.models import GpuInfo
 from prompt_master.core.paths import AppPaths
+from prompt_master.inference import model_choice
 from prompt_master.inference.device_detection import (QUANTIZATIONS, detect_cpu, detect_devices,
     mixed_device, recommended_quantization, runtime_component_id, vram_shortfall_mb)
 from prompt_master.provisioning import importer, installer, verifier
@@ -255,7 +256,8 @@ def ask_local_model(quant: str, steps: Steps, *, move: bool = True) -> tuple[str
     print(f"For {quant} that file is")
     print(f"  {Path(model.destination).name}  ({importer.human(model.size)})\n")
     print("It is MOVED into the installation directory, not copied, so you are not left")
-    print("with two of them. Everything else is still downloaded normally.\n")
+    print("with two of them. It keeps its own file name — nothing here renames a file you")
+    print("supplied. Everything else is still downloaded normally.\n")
     if not confirm("Use a model file you already have?", default=False):
         return quant, {}
 
@@ -278,7 +280,16 @@ def ask_local_model(quant: str, steps: Steps, *, move: bool = True) -> tuple[str
     sources = {f"model-{quant}": importer.LocalSource(path, move=move, checked=True)}
     projector = _projector_beside(components["mmproj"], path)
     if projector is not None and confirm(f"\n{projector.name} is beside it — use that too?"):
-        if accept_file(components["mmproj"], projector)[0] is None:
+        refusal, _ = accept_file(components["mmproj"], projector)
+        take = refusal is None
+        if refusal is not None:
+            # The same question the model itself gets, for the same reason: the
+            # projector beside an unpinned model is the one that model needs,
+            # and it is not going to match a hash pinned to a different build.
+            print(f"\n{refusal}")
+            take = confirm("\nUse it anyway? A projector has to be the one made for this model",
+                           default=False)
+        if take:
             sources["mmproj"] = importer.LocalSource(projector, move=move, checked=True)
         else:
             print("Leaving the projector to download.\n")
@@ -286,10 +297,21 @@ def ask_local_model(quant: str, steps: Steps, *, move: bool = True) -> tuple[str
 
 
 def _projector_beside(component, model_path: Path) -> Path | None:
-    """The vision projector, if it sits beside the model — it usually does, both
-    being files from the same repository."""
-    candidate = model_path.parent / Path(component.destination).name
-    return candidate if candidate.is_file() and candidate.stat().st_size == component.size else None
+    """The vision projector, if one obviously sits beside the model.
+
+    Both files come from the same repository, so having one usually means
+    having the other, and it is another download from the host that failed.
+
+    The pinned file is looked for by name and size first, so a pinned pair is
+    found exactly as it always was. Failing that, anything beside it that is
+    named like a projector will do: a model supplied by hand carries whatever
+    naming its publisher chose, and insisting on the pinned name would mean
+    only the pinned pair is ever offered.
+    """
+    pinned = model_path.parent / Path(component.destination).name
+    if pinned.is_file() and pinned.stat().st_size == component.size:
+        return pinned
+    return model_choice.projector_beside(model_path)
 
 
 def system_ram_note(device: GpuInfo) -> list[str]:

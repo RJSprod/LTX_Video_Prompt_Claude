@@ -19,6 +19,7 @@ import pytest
 
 from prompt_master.core.models import CPU_INDEX, GpuInfo
 from prompt_master.core.paths import DEFAULT_SUBDIR, ROOT_ENV, AppPaths
+from prompt_master.inference import model_choice
 from prompt_master.inference.device_detection import (CPU_DEVICE, CPU_RUNTIME, NO_OFFLOAD,
     PINNED, QUANTIZATIONS, SYSTEM_RAM_DEFAULT_QUANT, mixed_device, recommended_quantization,
     runtime_component_id, vram_shortfall_mb)
@@ -433,6 +434,28 @@ def test_contained_still_refuses_escapes(tmp_path):
         AppPaths(tmp_path).contained("../outside")
 
 
+def test_locate_contains_a_relative_path_and_takes_an_absolute_one(tmp_path):
+    """The weights may live outside the install root — see AppPaths.locate —
+    and a relative path is still held to it exactly as it always was."""
+    paths = AppPaths(tmp_path)
+    outside = tmp_path.parent / "elsewhere" / "model.gguf"
+
+    assert paths.locate("models/model.gguf") == (tmp_path / "models" / "model.gguf").resolve()
+    assert paths.locate(outside) == outside.resolve()
+    with pytest.raises(ValueError):
+        paths.locate("../escape.gguf")
+
+
+def test_record_keeps_our_own_files_relative_and_leaves_the_rest_where_they_are(tmp_path):
+    """The install stays movable: everything under the root is recorded
+    relative to it, and only a file somewhere else is pinned to a drive."""
+    paths = AppPaths(tmp_path)
+    outside = tmp_path.parent / "elsewhere" / "model.gguf"
+
+    assert paths.record(tmp_path / "models" / "model.gguf") == "models/model.gguf"
+    assert paths.record(outside) == str(outside.resolve())
+
+
 # ── console setup ────────────────────────────────────────────────────────────
 
 def test_setup_flags_cover_every_question():
@@ -581,18 +604,33 @@ def test_a_supplied_file_is_moved_not_copied(tmp_path):
     to end up with two of them."""
     source = their_file(tmp_path)
     destination = tmp_path / "user_data" / "models" / "model.gguf"
+    installed = destination.with_name(source.name)
 
-    assert importer.adopt(pinned(source), destination, LocalSource(source)) == destination
-    assert destination.read_bytes() == b"pretend gguf" * 512
+    assert importer.adopt(pinned(source), destination, LocalSource(source)) == installed
+    assert installed.read_bytes() == b"pretend gguf" * 512
     assert not source.exists()
+
+
+def test_a_supplied_file_keeps_the_name_it_arrived_with(tmp_path):
+    """It goes into the folder the manifest names, not under the file name the
+    manifest names. A models folder that renamed somebody's file to the pinned
+    build's name would claim to hold something it does not."""
+    source = their_file(tmp_path, name="MyMerge-Q5_K_M.gguf")
+    destination = tmp_path / "user_data" / "models" / "Gemma4-26B-Q6_K_P.gguf"
+
+    installed = importer.adopt(pinned(source), destination, LocalSource(source))
+
+    assert installed.name == "MyMerge-Q5_K_M.gguf"
+    assert installed.parent == destination.parent
+    assert not destination.exists(), "nothing was written under the pinned name"
 
 
 def test_keeping_the_source_copies_instead(tmp_path):
     source = their_file(tmp_path)
     destination = tmp_path / "user_data" / "models" / "model.gguf"
 
-    importer.adopt(pinned(source), destination, LocalSource(source, move=False))
-    assert source.exists() and destination.read_bytes() == source.read_bytes()
+    installed = importer.adopt(pinned(source), destination, LocalSource(source, move=False))
+    assert source.exists() and installed.read_bytes() == source.read_bytes()
 
 
 def test_adopting_clears_the_abandoned_download_it_replaces(tmp_path):
@@ -644,13 +682,14 @@ def test_a_cross_drive_move_copies_then_removes_the_original(tmp_path, monkeypat
     model was downloaded to C: and the install root is on D:."""
     source = their_file(tmp_path)
     destination = tmp_path / "user_data" / "models" / "model.gguf"
-    monkeypatch.setattr(importer.os, "replace", _refusing_replace(destination))
+    installed = destination.with_name(source.name)
+    monkeypatch.setattr(importer.os, "replace", _refusing_replace(installed))
     seen = []
 
     importer.adopt(pinned(source), destination, LocalSource(source), lambda done, total: seen.append(done))
-    assert destination.read_bytes() == b"pretend gguf" * 512
+    assert installed.read_bytes() == b"pretend gguf" * 512
     assert not source.exists()
-    assert seen and seen[-1] == destination.stat().st_size   # the copy reported progress
+    assert seen and seen[-1] == installed.stat().st_size   # the copy reported progress
 
 
 def _refusing_replace(destination):
@@ -670,7 +709,7 @@ def test_a_cross_drive_move_checks_for_room_first(tmp_path, monkeypatch):
     source = their_file(tmp_path)
     destination = tmp_path / "user_data" / "models" / "model.gguf"
     destination.parent.mkdir(parents=True)
-    monkeypatch.setattr(importer.os, "replace", _refusing_replace(destination))
+    monkeypatch.setattr(importer.os, "replace", _refusing_replace(destination.with_name(source.name)))
     monkeypatch.setattr(importer.shutil, "disk_usage", lambda _path: _Usage(64))
 
     with pytest.raises(OSError, match="free"):
@@ -1259,3 +1298,315 @@ def test_the_state_records_which_runtime_is_unpacked(tmp_path, monkeypatch):
     assert installer.runtime_component_ids(cpu()) == (CPU_RUNTIME,)
     assert installer.runtime_component_ids(gpu()) == ("llama-runtime-cuda12",
                                                       "llama-runtime-cuda12-cudart")
+
+
+# ── running a model setup did not download ───────────────────────────────────
+
+def test_choosing_a_model_records_it_and_changes_nothing_else(tmp_path):
+    """The narrow half of setup: which weights, and nothing about the machine
+    they run on. No download, no runtime change, no device change."""
+    paths = _installed_state(tmp_path)
+    before = json.loads(paths.state_file.read_text(encoding="utf-8"))
+    other = tmp_path / "models" / "Gemma-3-27B-Q6_K_P.gguf"
+    other.write_bytes(b"other weights")
+
+    state = model_choice.choose(paths, other)
+
+    assert state["model"] == "models/Gemma-3-27B-Q6_K_P.gguf"
+    assert state["quantization"] == "Q6_K_P"
+    untouched = ("runtime", "runtime_id", "mode", "gpu_index", "gpu_device", "gpu_device_name",
+                 "context_size", "gpu_layers")
+    assert {key: state[key] for key in untouched} == {key: before[key] for key in untouched}
+
+
+def test_a_model_outside_the_install_root_is_recorded_and_found_where_it_is(tmp_path):
+    """16-27 GiB is not moved into the install root to satisfy a rule about
+    tidiness. It stays where it was chosen, and is still refused as a managed
+    path, which is what keeps the runtime check meaning something."""
+    paths = _installed_state(tmp_path / "install")
+    outside = tmp_path / "elsewhere" / "Llama-3.1-8B-Q5_K_M.gguf"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"weights")
+
+    state = model_choice.choose(paths, outside)
+
+    assert Path(state["model"]) == outside.resolve()
+    assert paths.locate(state["model"]) == outside.resolve()
+    assert state["quantization"] == "Q5_K_M"
+    with pytest.raises(ValueError):
+        paths.contained(state["model"])
+
+
+def test_a_projector_can_be_given_with_the_model_and_taken_away_again(tmp_path):
+    """Optional in both directions: supplying one turns image input on, and
+    leaving it out turns it off rather than keeping the last model's."""
+    paths = _installed_state(tmp_path)
+    model = tmp_path / "models" / "other.gguf"
+    model.write_bytes(b"weights")
+    projector = tmp_path / "models" / "other-mmproj-f16.gguf"
+    projector.write_bytes(b"projector")
+
+    assert model_choice.choose(paths, model, projector)["mmproj"] == "models/other-mmproj-f16.gguf"
+    assert model_choice.choose(paths, model)["mmproj"] == ""
+
+
+def test_a_file_that_is_not_there_is_refused_before_anything_is_written(tmp_path):
+    paths = _installed_state(tmp_path)
+    before = paths.state_file.read_text(encoding="utf-8")
+    model = tmp_path / "models" / "other.gguf"
+    model.write_bytes(b"weights")
+
+    with pytest.raises(RuntimeError, match="no model file"):
+        model_choice.choose(paths, tmp_path / "missing.gguf")
+    with pytest.raises(RuntimeError, match="no vision projector"):
+        model_choice.choose(paths, model, tmp_path / "missing-mmproj.gguf")
+    assert paths.state_file.read_text(encoding="utf-8") == before
+
+
+def test_choosing_a_model_needs_a_runtime_to_run_it_with(tmp_path):
+    """This is not a way around setup: without llama.cpp on disk there is
+    nothing to hand the weights to."""
+    paths = AppPaths(tmp_path)
+    paths.create_managed_dirs()
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"weights")
+
+    with pytest.raises(RuntimeError, match="no llama.cpp runtime"):
+        model_choice.choose(paths, model)
+
+
+@pytest.mark.parametrize("stem,expected", [
+    ("Gemma-3-27B-it-Q6_K_P", "Q6_K_P"),
+    ("mistral-7b-instruct-v0.2.Q4_K_M", "Q4_K_M"),
+    ("Llama-3.1-8B-IQ3_XXS", "IQ3_XXS"),
+    ("qwen2.5-7b-instruct-q8_0", "Q8_0"),
+    ("some-merge-bf16", "BF16"),
+    ("a-finetune-nobody-labelled", "a-finetune-nobody-labelled"),
+])
+def test_a_model_is_named_by_its_quantization_whenever_the_file_name_says_one(stem, expected):
+    """"Model: Q6_K_P" is what the status bar has always said, and a file
+    chosen by hand should read the same way rather than as a long stem."""
+    assert model_choice.describe(Path(f"/models/{stem}.gguf")) == expected
+
+
+def test_a_projector_beside_the_model_is_suggested_and_only_suggested(tmp_path):
+    """A model and its projector come from the same repository and land in the
+    same folder. That is a suggestion for a box, not a pairing to assume."""
+    folder = tmp_path / "gguf"
+    folder.mkdir()
+    model = folder / "Gemma-3-27B-Q6_K_P.gguf"
+    model.write_bytes(b"weights")
+
+    assert model_choice.projector_beside(model) is None
+    projector = folder / "mmproj-Gemma-3-27B-f16.gguf"
+    projector.write_bytes(b"projector")
+    assert model_choice.projector_beside(model) == projector
+
+
+def test_what_is_recorded_now_is_what_the_dialog_opens_on(tmp_path):
+    paths = _installed_state(tmp_path)
+
+    current = model_choice.recorded(paths)
+
+    assert current.model == (tmp_path / "models" / "model.gguf").resolve()
+    assert current.sees and current.mmproj == (tmp_path / "models" / "mmproj.gguf").resolve()
+    assert model_choice.recorded(AppPaths(tmp_path / "never-set-up")) is None
+
+
+def test_a_device_switch_keeps_a_hand_picked_model_and_its_absent_projector(tmp_path, monkeypatch):
+    """Changing what runs the model must not quietly put the downloaded one
+    back, and must not invent a projector the chosen model never had."""
+    monkeypatch.setattr(installer, "list_llama_devices", lambda *_a, **_k: ("CUDA0", "RTX 4090"))
+    monkeypatch.setattr(installer, "download", lambda *a, **k: pytest.fail("downloaded"))
+    paths = _installed_state(tmp_path / "install")
+    outside = tmp_path / "elsewhere" / "Chosen-Q4_K_M.gguf"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"weights")
+    model_choice.choose(paths, outside)
+
+    state = installer.switch_device(paths, mixed())
+
+    assert Path(state["model"]) == outside.resolve()
+    assert state["mmproj"] == "" and state["quantization"] == "Q4_K_M"
+    assert state["mode"] == "mixed"
+
+
+# ── a model with no projector is a model that cannot be shown a picture ──────
+
+def _runnable(tmp_path, *, projector=True):
+    """An install whose files are all present, ready for InferenceService."""
+    paths = AppPaths(tmp_path)
+    paths.create_managed_dirs()
+    for relative in ("runtime/llama-server.exe", "models/m.gguf", "models/p.gguf"):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"stand-in")
+    paths.state_file.write_text(json.dumps({
+        "runtime": "runtime/llama-server.exe", "model": "models/m.gguf",
+        "mmproj": "models/p.gguf" if projector else "", "gpu_index": 0,
+        "gpu_device": "CUDA0", "context_size": 16384, "gpu_layers": "all",
+        "quantization": "Q4_K_M"}), encoding="utf-8")
+    return paths
+
+
+def test_the_server_is_started_without_mmproj_when_there_is_no_projector(tmp_path, monkeypatch):
+    """--mmproj is left off the command rather than passed something empty,
+    which llama-server would refuse to start on."""
+    from prompt_master.inference.llama_process import LlamaProcess
+
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, command, env=None, **_kwargs):
+            captured["command"] = command
+
+        def poll(self): return None
+
+    monkeypatch.setattr("prompt_master.inference.llama_process.subprocess.Popen", FakePopen)
+    LlamaProcess().start(tmp_path / "llama-server.exe", tmp_path / "m.gguf", None,
+                         0, "CUDA0", 16384, tmp_path / "log.txt")
+
+    command = captured["command"]
+    assert "--mmproj" not in command
+    assert command[command.index("--model") + 1] == str(tmp_path / "m.gguf")
+
+
+def test_text_still_runs_on_a_model_that_has_no_projector(tmp_path, monkeypatch):
+    from prompt_master.inference.service import InferenceService
+
+    started = []
+    service = InferenceService(_runnable(tmp_path, projector=False))
+    monkeypatch.setattr(service.process, "start", lambda *args, **kwargs: started.append(args))
+    monkeypatch.setattr(service.process, "wait_ready", lambda timeout: None)
+
+    service.client()
+
+    assert started[0][2] is None, "no projector was handed to the server"
+    assert not service.vision_ready()
+
+
+def test_an_image_request_without_a_projector_says_which_menu_fixes_it(tmp_path):
+    """Never a silent downgrade to text — the prompt this app would write with
+    the still off the wire describes a scene nobody chose."""
+    from prompt_master.inference.service import InferenceService
+
+    with pytest.raises(RuntimeError, match="no vision projector"):
+        InferenceService(_runnable(tmp_path, projector=False)).client(needs_vision=True)
+
+
+def test_a_projector_that_was_recorded_and_then_deleted_is_still_an_error(tmp_path):
+    """Absent by choice and absent by accident are different things: one is a
+    model that answers text, the other is a broken install."""
+    from prompt_master.inference.service import InferenceService
+
+    paths = _runnable(tmp_path)
+    (tmp_path / "models" / "p.gguf").unlink()
+
+    with pytest.raises(RuntimeError, match="vision projector is missing"):
+        InferenceService(paths).client()
+
+
+# ── a supplied file keeps its own name ───────────────────────────────────────
+
+def test_fetch_records_the_supplied_file_under_the_name_it_arrived_with(tmp_path, monkeypatch):
+    """End to end, with the real adopt: what setup writes into the state file
+    is the path the model actually went to. Nothing renames a file somebody
+    handed over, and nothing needs it renamed."""
+    components = installer.load_components()
+
+    def fake_download(component, target, progress=None, notice=None):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.suffix == ".zip":
+            with zipfile.ZipFile(target, "w") as bundle:
+                bundle.writestr("llama-server.exe", b"exe")
+        else:
+            target.write_bytes(b"downloaded")
+        return target
+
+    monkeypatch.setattr(installer, "download", fake_download)
+    mine = tmp_path / "downloads" / "MyMerge-Q5_K_M.gguf"
+    mine.parent.mkdir(parents=True)
+    mine.write_bytes(b"pretend gguf")
+    paths = AppPaths(tmp_path / "install")
+
+    installed = installer.fetch(paths, gpu(name="NVIDIA GeForce RTX 5090", total=32607), "Q6_K_P",
+                                sources={"model-Q6_K_P": LocalSource(mine, checked=True)})
+
+    assert installed.model == "models/MyMerge-Q5_K_M.gguf"
+    assert (paths.root / installed.model).is_file()
+    assert not (paths.root / components["model-Q6_K_P"].destination).exists()
+    assert not mine.exists(), "it was moved, not copied"
+    # What was downloaded still lands on the pinned name, which is what the
+    # resume and the download cache are keyed on.
+    assert installed.mmproj == components["mmproj"].destination
+
+
+def test_a_model_with_any_name_at_all_is_what_the_server_is_pointed_at(tmp_path, monkeypatch):
+    """Nothing downstream parses a model's name: the recorded path is handed to
+    llama-server as it stands, spaces, brackets and all."""
+    from prompt_master.inference.service import InferenceService
+
+    odd = "Some Merge (v2) [uncensored].Q5_K_M.gguf"
+    paths = AppPaths(tmp_path)
+    paths.create_managed_dirs()
+    for relative in ("runtime/llama-server.exe", f"models/{odd}"):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"stand-in")
+    paths.state_file.write_text(json.dumps({
+        "runtime": "runtime/llama-server.exe", "model": f"models/{odd}", "mmproj": "",
+        "gpu_index": 0, "gpu_device": "CUDA0", "context_size": 16384, "gpu_layers": "all",
+    }), encoding="utf-8")
+
+    started = []
+    service = InferenceService(paths)
+    monkeypatch.setattr(service.process, "start", lambda *args, **kwargs: started.append(args))
+    monkeypatch.setattr(service.process, "wait_ready", lambda timeout: None)
+    service.client()
+
+    assert started[0][1] == tmp_path / "models" / odd
+
+
+def test_a_projector_that_is_not_named_like_the_pinned_one_is_still_found(tmp_path):
+    """A model supplied by hand carries whatever naming its publisher chose.
+    Insisting on the pinned projector's name would mean only the pinned pair is
+    ever offered."""
+    component = installer.load_components()["mmproj"]
+    folder = tmp_path / "gguf"
+    folder.mkdir()
+    model = folder / "MyMerge-Q5_K_M.gguf"
+    model.write_bytes(b"weights")
+
+    assert setup_cli._projector_beside(component, model) is None
+    theirs = folder / "MyMerge-mmproj-f16.gguf"
+    theirs.write_bytes(b"a stand-in for the projector")
+    assert setup_cli._projector_beside(component, model) == theirs
+
+
+def test_a_projector_beside_an_unpinned_model_can_be_taken_anyway(monkeypatch, tmp_path):
+    """The same question the model itself gets, for the same reason: the
+    projector beside an unpinned model is the one that model needs, and it will
+    not match a hash pinned to a different build."""
+    source = their_file(tmp_path, name="MyMerge-Q5_K_M.gguf")
+    projector = source.parent / "MyMerge-mmproj-f16.gguf"
+    projector.write_bytes(b"a stand-in for the projector")
+    monkeypatch.setattr(setup_cli, "accept_file",
+                        lambda component, path: ("that is not the pinned projector", None))
+    # Use a local model / the path / use it anyway / take the projector / anyway.
+    answers(monkeypatch, "Y", str(source), "Y", "Y", "Y")
+
+    quant, sources = setup_cli.ask_local_model("Q6_K_P", setup_cli.Steps(4))
+
+    assert quant == "Q6_K_P" and set(sources) == {"model-Q6_K_P", "mmproj"}
+    assert sources["mmproj"].path == projector
+
+
+def test_declining_that_question_leaves_the_projector_to_download(monkeypatch, tmp_path):
+    source = their_file(tmp_path, name="MyMerge-Q5_K_M.gguf")
+    (source.parent / "MyMerge-mmproj-f16.gguf").write_bytes(b"a stand-in for the projector")
+    monkeypatch.setattr(setup_cli, "accept_file",
+                        lambda component, path: ("that is not the pinned projector", None))
+    answers(monkeypatch, "Y", str(source), "Y", "Y", "N")
+
+    _quant, sources = setup_cli.ask_local_model("Q6_K_P", setup_cli.Steps(4))
+    assert set(sources) == {"model-Q6_K_P"}

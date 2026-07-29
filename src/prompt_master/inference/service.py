@@ -25,18 +25,49 @@ class InferenceService:
         self.process = LlamaProcess()
         self.signature: tuple | None = None
 
+    def vision_ready(self) -> bool:
+        """Whether the model this install runs can be shown a picture.
+
+        Asked before an image is attached rather than after it has been sent,
+        so "this model has no projector" is something the window can say while
+        there is still a choice to make about it.
+        """
+        try:
+            return self.projector() is not None
+        except (OSError, ValueError):
+            return False
+
+    def projector(self) -> Path | None:
+        """The configured vision projector, or ``None`` when there is none.
+
+        Optional because a model chosen by hand may not have one: the pinned
+        model always ships beside its projector, and an arbitrary GGUF does
+        not. Recorded-but-absent stays an error — that is a broken install
+        rather than a choice — and it is ``client`` that raises it.
+        """
+        recorded = str(read_json(self.paths.state_file).get("mmproj") or "")
+        if not recorded:
+            return None
+        found = self.paths.locate(recorded)
+        return found if found.is_file() else None
+
     def client(self, needs_vision: bool = False) -> LlamaClient:
         state = read_json(self.paths.state_file)
-        required = ("runtime", "model", "mmproj", "gpu_index")
+        required = ("runtime", "model", "gpu_index")
         missing = [key for key in required if key not in state]
         if missing:
             raise RuntimeError("Setup is incomplete (missing " + ", ".join(missing) + "). Run `python app.py --setup`, or open Models and Hardware setup.")
-        runtime, model, mmproj = (self.paths.contained(state[key]) for key in required[:3])
+        # The runtime is contained and the weights are only located: one of
+        # these is a program this application starts, and the other is a file it
+        # reads. See AppPaths.locate.
+        runtime, model = self.paths.contained(state["runtime"]), self.paths.locate(state["model"])
+        recorded = str(state.get("mmproj") or "")
+        mmproj = self.paths.locate(recorded) if recorded else None
         for label, path in (("llama-server", runtime), ("model", model), ("vision projector", mmproj)):
-            if not path.is_file():
+            if path is not None and not path.is_file():
                 raise RuntimeError(f"Configured {label} is missing: {path}")
-        if needs_vision and not mmproj.is_file():
-            raise RuntimeError("Image generation requires the configured vision projector; text-only fallback is disabled.")
+        if needs_vision and mmproj is None:
+            raise RuntimeError("This request carries an image, and the model running has no vision projector. Choose one under Settings → Which model runs, or send the request without the image; text-only fallback is disabled.")
         signature = (runtime, model, mmproj, int(state["gpu_index"]), state.get("gpu_device", "CUDA0"), int(state.get("context_size", 8192)), str(state.get("gpu_layers", "all")))
         # "No layers offloaded" is what both system-RAM modes record, and it is
         # the physical fact the load time follows from, so it is what is read

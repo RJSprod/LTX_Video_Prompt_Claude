@@ -14,11 +14,13 @@ from prompt_master.prompt_engine import speech
 from prompt_master.prompt_engine import options as opt
 from prompt_master.prompt_engine.adapter import PromptEngine, VisionUnavailable
 from prompt_master.core.paths import AppPaths
+from prompt_master.inference import model_choice
 from prompt_master.inference.device_detection import describe, detect_cpu, detect_devices, vram_shortfall_mb
 from prompt_master.inference.service import InferenceService
 from prompt_master.provisioning import installer
 from prompt_master.ui import touch
 from prompt_master.ui.chat_page import ChatPage
+from prompt_master.ui.model_chooser import ModelDialog
 from prompt_master.ui.setup_wizard import SetupWizard
 
 # The two things this application does, and the order they appear in the mode
@@ -220,6 +222,26 @@ class MainWindow(QMainWindow):
         try: installer.switch_device(self.paths,device,on_status=status,on_progress=progress)
         finally: dialog.close()
 
+    def choose_model(self):
+        """Run a different GGUF, with or without a vision projector.
+
+        The other half of "what runs the model": that menu changes the hardware
+        and keeps the weights, this one keeps the hardware and changes the
+        weights. Neither downloads anything, and both end the same way — the
+        server is unloaded, and the next generation starts the one it needs.
+        """
+        if self.busy():
+            QMessageBox.information(self,"Still generating","Wait for the current generation to finish, or press Stop, before changing the model."); return
+        dialog=ModelDialog(self.paths,self)
+        if not dialog.exec(): return
+        try: state=model_choice.choose(self.paths,dialog.model_path(),dialog.mmproj_path())
+        except (RuntimeError,OSError,ValueError) as exc:
+            QMessageBox.critical(self,"Could not change the model",str(exc)); return
+        self.service.stop()
+        note=(f"Now running {dialog.model_path().name} — it loads on your next generation."
+              + ("" if state.get("mmproj") else " No vision projector: images cannot be sent to it."))
+        self.refresh_status(note); self.chat.set_status(note)
+
     def unload_model(self):
         """Give the memory back now, rather than when the application closes."""
         if self.busy():
@@ -250,6 +272,7 @@ class MainWindow(QMainWindow):
         # Filled in when it is opened rather than now: listing devices runs
         # nvidia-smi, which is not something to do on the way to a window.
         self.device_menu=settings_menu.addMenu("What runs the model"); self.device_menu.aboutToShow.connect(self.populate_devices)
+        settings_menu.addAction("Which model runs…").triggered.connect(self.choose_model)
         settings_menu.addAction("Unload the model from memory").triggered.connect(self.unload_model)
         settings_menu.addSeparator(); settings_menu.addAction("Models and Hardware…").triggered.connect(self.open_setup)
         view_menu=self.menuBar().addMenu("View"); sizes=view_menu.addMenu("Display size"); self.size_actions=QActionGroup(self); self.size_actions.setExclusive(True)
@@ -524,6 +547,14 @@ class MainWindow(QMainWindow):
         except Exception as exc: QMessageBox.critical(self,"Image error",str(exc)); return
         if request.video_mode == "i2v" and request.image_data_url is None:
             QMessageBox.warning(self,"Image required","Image to video needs an attached image. Attach one, or switch to text to video."); return
+        # Asked before the thread starts rather than left to the server: a model
+        # chosen by hand may have no projector, and "the still cannot go on the
+        # wire" is worth saying while the image is still attached. Only on an
+        # install that finished — an unconfigured one has a better answer of its
+        # own, and it is service.client that gives it.
+        if (request.image_data_url is not None and request.video_mode == "i2v"
+                and self.paths.configured and not self.service.vision_ready()):
+            QMessageBox.critical(self,"No vision projector","The model running has no vision projector, so the attached image cannot be sent to it.\n\nChoose one under Settings → Which model runs, remove the image, or switch to text to video."); return
         try: self.negative.setPlainText(self.engine.base_negative(request))
         except VisionUnavailable as exc: QMessageBox.critical(self,"Vision unavailable",str(exc)); return
         self.positive.clear(); self.generate_button.setEnabled(False); self.cancel_button.setEnabled(True)
@@ -550,7 +581,11 @@ class MainWindow(QMainWindow):
         device=state.get('gpu_device_name',state.get('gpu_name','not configured'))
         mode=state.get('mode',GPU_MODE)
         if mode != GPU_MODE: device=f"{device} ({mode})"
-        self.status.setText(f"Device: {device} · Model: {state.get('quantization','not configured')} · Server: {'running' if self.service.process.running else 'stopped'} · Generation: idle"
+        # Whether images can be sent is now a property of the model that was
+        # chosen rather than of every install, so the bar says which it is.
+        model=state.get('quantization','not configured')
+        if state.get('runtime') and not self.service.vision_ready(): model=f"{model}, no vision"
+        self.status.setText(f"Device: {device} · Model: {model} · Server: {'running' if self.service.process.running else 'stopped'} · Generation: idle"
                             + (f" · {note}" if note else ""))
     def open_setup(self):
         self.service.stop(); wizard=SetupWizard(self.paths,self)

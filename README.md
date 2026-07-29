@@ -73,9 +73,24 @@ python app.py --setup --model-file D:\models\Gemma4-...-Q6_K_P.gguf
 or answer the fourth question and paste the path. Either way it is checked
 against the same pinned SHA-256 as a download, then **moved** into the
 installation directory rather than copied, so you are not left with two copies
-of a 21 GiB file. `--keep-source` copies instead. If the vision projector sits
-beside it — it usually does, both being files from the same repository — setup
-offers to take that too, and anything not supplied is still downloaded normally.
+of a 21 GiB file. `--keep-source` copies instead.
+
+**It keeps its own file name.** A supplied file goes into the folder the
+manifest names, not under the file name the manifest names: a models folder that
+renamed `MyMerge-Q5_K_M.gguf` to the pinned build's name would claim to hold
+something it does not, and would leave you looking for a file that no longer
+exists under any name you chose. Nothing downstream needs a particular name —
+what was installed is recorded in the state file as the path it actually went
+to, and that is the only thing that ever reads it. What is *downloaded* still
+lands on the pinned name, which is what the resume and the download cache are
+keyed on.
+
+If the vision projector sits beside it — it usually does, both being files from
+the same repository — setup offers to take that too. It is found by the pinned
+name first and then by any name a projector goes by, so the projector beside a
+model you supplied is offered even though its naming is its publisher's. Setup
+asks before taking one that does not match the pinned hash, the same way it asks
+about the model. Anything not supplied is still downloaded normally.
 
 A file that is not the pinned build is named rather than just rejected: "that is
 the `Q4_K_M` build" is an answer, and setup offers to install it as what it is.
@@ -255,9 +270,44 @@ what it will do and what it costs before it does anything:
 A device cannot be changed while a generation or a reply is running. It says so
 rather than interrupting one; wait for it, or press Stop.
 
-Model quality stays in **Models and Hardware**, because changing it means
-downloading a different 16–27 GiB file and that belongs in the wizard that
-shows the size and the progress.
+Downloading a different quantization stays in **Models and Hardware**, because
+that means fetching another 16–27 GiB file and belongs in the wizard that shows
+the size and the progress.
+
+### Running a model you already have
+
+**Settings → Which model runs** is the other half of that menu: that one changes
+the hardware and keeps the weights, this one keeps the hardware and changes the
+weights. Give it the path to any `.gguf` on the machine and that is what runs
+from your next generation.
+
+It is deliberately the small half of setup. Nothing is downloaded, verified,
+copied or moved — the file is read where it is, so a model on another drive
+stays on that drive — and the llama.cpp runtime, the device and the context size
+are all left exactly as they were. A file the release manifest does not pin
+cannot be checked against a hash it has no entry for, so this does not pretend
+to: it is the escape hatch for running something else, and the pinned download
+remains what setup installs.
+
+**The vision projector is optional, and asked for separately.** The pinned model
+ships beside its `mmproj` file; an arbitrary GGUF may have none. So there is a
+second box for the projector's path, with **None** beside it:
+
+- **give one** and images work as they always have — image-to-video prompts,
+  and pictures attached in a chat. When a file that looks like a projector is
+  sitting beside the model you picked, which is where it usually is, it is
+  offered into the box as a suggestion you can empty. It is never paired
+  automatically: nothing in a file name proves a projector was made for the
+  model beside it;
+- **leave it empty** and the model still runs, answering text. `--mmproj` is
+  left off the command line rather than passed something empty, and anything
+  carrying an image is refused with a sentence saying why — before the
+  generation starts, while the image is still attached to remove. The status bar
+  reads `Model: Q6_K_P, no vision` so it is not a surprise later, and the chat
+  says the same when you attach a picture.
+
+Like a device change, the model cannot be changed mid-generation, and the server
+is unloaded so the next generation loads the one you chose.
 
 **Settings → Unload the model from memory** hands the VRAM or system RAM back
 now instead of when the application closes — for giving a card to something
@@ -367,6 +417,14 @@ the character's own file, so each character keeps how it is talked to. A seed of
 `-1` draws a fresh one per reply, which is what makes a regenerate come back
 different.
 
+Changing one of them is what saves it: the panel writes itself back to the
+character a moment after the control stops moving, so holding a stepper down is
+one write rather than forty, and letting go of it shows the change already
+saved. **Save** at the bottom of the panel does it now and says which character
+it went to — the button is not the only way to save, it is the way to be told
+that it saved. The line above it says which state the panel is in, and a write
+that fails says so there rather than going quiet.
+
 The conversation is trimmed from the front to fit the context window
 `llama-server` was started with. The character survives a long chat; the
 beginning of the chat does not.
@@ -414,9 +472,10 @@ What changed, and only this:
 | GPU support | RTX 3090 / 5090 only, others refused | Any NVIDIA card; 3090 and 5090 keep their exact pinned runtime and quantization |
 | Running without a card | Not possible | The processor and system RAM are an option in both front ends, on the pinned CPU build of `llama.cpp` |
 | Running with a card too small for the model | Not possible | Mixed mode: same CUDA install, weights in system RAM, nothing resident on the card, which keeps the work `llama.cpp` can give it |
-| Where the model comes from | Downloaded, always | Downloaded, or installed from a `.gguf` you already have — against the same pinned SHA-256 |
+| Where the model comes from | Downloaded, always | Downloaded, or installed from a `.gguf` you already have — against the same pinned SHA-256, and keeping its own file name |
 | Window | One column of mouse-sized controls | Two panes, fingertip-sized targets, drag-to-scroll, five display sizes from Smaller to Larger |
 | Changing device | Re-run setup | That, or Settings → What runs the model, which swaps the llama.cpp build and keeps the model that is installed |
+| Changing model | Re-run setup, downloading another pinned quantization | That, or Settings → Which model runs — any `.gguf` on the machine, read where it is, with its vision projector optional |
 | Freeing the memory | Close the application | That, or Settings → Unload the model from memory |
 | What the window does | Writes prompts | That, or — on Settings → Mode — a chat with characters you write or import, on the same model |
 | Motion | One way of writing it | Default is that way exactly; **Inertia** and **Flow** are opt-in |

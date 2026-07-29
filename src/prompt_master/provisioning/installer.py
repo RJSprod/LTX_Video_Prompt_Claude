@@ -168,6 +168,10 @@ def fetch(paths: AppPaths, gpu: GpuInfo, quantization: str, *,
             on_status(f"Downloading {key}…")
             artifact = download(component, target, report,
                                 lambda text, k=key: on_status(f"{k}: {text}"))
+        # What was installed, never what was asked for: a file supplied from
+        # disk keeps its own name, so ``adopt`` can hand back a path in the same
+        # folder under a different one. The state file records this, and it is
+        # the only thing that ever reads a model's name.
         if key.startswith("llama-runtime-"):
             runtime_archives.append(artifact)
         elif key.startswith("model-"):
@@ -325,12 +329,16 @@ def switch_device(paths: AppPaths, gpu: GpuInfo, *,
     from prompt_master.core.config import read_json
 
     state = read_json(paths.state_file)
-    missing = [key for key in ("model", "mmproj", "quantization") if not state.get(key)]
+    missing = [key for key in ("model", "quantization") if not state.get(key)]
     if missing:
         raise RuntimeError("This install has no recorded model to keep (missing "
                            + ", ".join(missing) + "). Run setup instead.")
-    for label, relative in (("model", state["model"]), ("vision projector", state["mmproj"])):
-        if not paths.contained(relative).is_file():
+    # The projector is optional — a model chosen by hand may have none — so an
+    # empty one is carried through as empty rather than refused. What is not
+    # optional is that a recorded file exists: switching device must not turn a
+    # working install into one that points at nothing.
+    for label, relative in (("model", state["model"]), ("vision projector", state.get("mmproj"))):
+        if relative and not paths.locate(relative).is_file():
             raise RuntimeError(f"The configured {label} is missing: {relative}")
 
     runtime_dir = paths.root / "runtime"
@@ -356,7 +364,7 @@ def switch_device(paths: AppPaths, gpu: GpuInfo, *,
     executable = _find_server(runtime_dir)
     on_status("Recording the new device…")
     installed = Installed(executable.relative_to(paths.root).as_posix(),
-                          state["model"], state["mmproj"])
+                          state["model"], state.get("mmproj") or "")
     new_state = write_state(paths, gpu, state["quantization"], installed,
                             context_size=int(state.get("context_size") or DEFAULT_CONTEXT_SIZE),
                             gpu_layers=_carried_layers(state, gpu))
