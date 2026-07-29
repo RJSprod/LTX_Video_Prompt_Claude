@@ -54,6 +54,7 @@ from prompt_master.chat.characters import (Character, CharacterStore, Persona, l
                                            save_persona)
 from prompt_master.chat.history import ASSISTANT, USER, ChatStore, Conversation, Message
 from prompt_master.core.config import atomic_write_json, read_json
+from prompt_master.core.library import CONVERSATION, ModelLibrary
 from prompt_master.core.models import RANDOM_SEED, draw_seed
 from prompt_master.imaging.preprocess import image_data_url
 from prompt_master.ui import touch
@@ -81,11 +82,12 @@ class ChatWorker(QObject):
     failed = Signal(str)
     finished = Signal()
 
-    def __init__(self, service, messages, needs_vision, temperature, top_p, max_tokens, seed):
+    def __init__(self, service, messages, needs_vision, temperature, top_p, max_tokens, seed,
+                 entry=None):
         super().__init__()
         self.service, self.messages, self.needs_vision = service, messages, needs_vision
         self.temperature, self.top_p = temperature, top_p
-        self.max_tokens, self.seed = max_tokens, seed
+        self.max_tokens, self.seed, self.entry = max_tokens, seed, entry
         self.cancelled = threading.Event()
 
     @Slot()
@@ -95,7 +97,7 @@ class ChatWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            client = self.service.client(self.needs_vision)
+            client = self.service.client(self.needs_vision, self.entry)
             text = client.stream_chat(self.messages, self.max_tokens, self.seed,
                                       self.chunk.emit, self.cancelled,
                                       temperature=self.temperature, top_p=self.top_p)
@@ -367,6 +369,7 @@ class ChatPage(QWidget):
         self.service_provider = service_provider
         self.characters = CharacterStore.from_paths(paths)
         self.chats = ChatStore.from_paths(paths)
+        self.library = ModelLibrary(paths)
         self.persona: Persona = load_persona(paths)
         self.character: Character | None = None
         self.conversation: Conversation | None = None
@@ -923,6 +926,15 @@ class ChatPage(QWidget):
     # ── sending ──────────────────────────────────────────────────────────────
 
     def attach_image(self) -> None:
+        # Refused before the file dialog rather than after the model is loaded:
+        # a model chosen without a projector cannot be sent a picture at all.
+        entry = self.library.entry_for(CONVERSATION)
+        if entry is not None and not entry.has_vision:
+            QMessageBox.information(
+                self, "No vision projector",
+                f"{entry.name} has no vision projector, so it cannot be sent pictures. "
+                "Choose one for it in Settings → Model for conversation mode, or send text only.")
+            return
         filename, _ = QFileDialog.getOpenFileName(self, "Attach an image", "",
                                                   "Images (*.png *.jpg *.jpeg *.webp)")
         if not filename:
@@ -1027,7 +1039,8 @@ class ChatPage(QWidget):
         seed = self.seed.value()
         worker = ChatWorker(self.service_provider(), messages, prompt.has_image(history),
                             self.temperature.value(), self.top_p.value(), reply_tokens,
-                            draw_seed() if seed == RANDOM_SEED else seed)
+                            draw_seed() if seed == RANDOM_SEED else seed,
+                            self.library.entry_for(CONVERSATION))
         self._streaming_index = -1 if into_input else index
         self._streaming_prefix = prefix
         self._into_input = into_input
@@ -1166,6 +1179,7 @@ class ChatPage(QWidget):
         self.paths = paths
         self.characters = CharacterStore.from_paths(paths)
         self.chats = ChatStore.from_paths(paths)
+        self.library = ModelLibrary(paths)
         self.persona = load_persona(paths)
         self.character, self.conversation = None, None
         self.reload_characters()

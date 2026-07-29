@@ -263,6 +263,48 @@ shows the size and the progress.
 now instead of when the application closes — for giving a card to something
 else without quitting. The next generation starts the server again by itself.
 
+### Using a model of your own
+
+**Settings → Model for prompt mode** and **Model for conversation mode** each
+list every `.gguf` in the models folder, with the one that mode uses ticked. The
+two modes are independent: a model that writes prompts well and a model that
+holds a conversation well are rarely the same model, so each mode keeps its own
+choice, and a mode that has never been given one follows the model setup
+installed.
+
+**Choose a model file…** takes a `.gguf` from anywhere on the machine. It is
+**moved** into the models folder — the point of pointing at a 21 GiB file you
+already have is not to end up with two of them — unless *Keep the original file
+where it is* is ticked, which copies instead. On the same drive a move is
+instant; across drives it copies and then deletes, so an interruption never
+leaves you with neither. The file **keeps its own name**: that name is how it is
+listed, and nothing is renamed to match a manifest.
+
+The same dialog chooses what the model sees with. **Vision projector** offers
+every projector already in the models folder, any other `.gguf` there, a file
+from disk, or **None**. A projector belongs to the model rather than to the mode,
+so a model carries it into whichever mode uses it, and *None* is a choice that
+sticks rather than a gap to be filled in later.
+
+A model with no projector cannot be sent images. Image-to-video is refused
+before anything loads, and the chat's Attach button says so rather than failing
+at the request; `--mmproj` is left off the server entirely. Text prompts and text
+chat work normally, which is what a great many models are for.
+
+**Switching is free until you generate.** The model is part of what the
+inference service compares before it hands out a client, so choosing another one
+writes a preference and nothing else; the next generation in that mode finds the
+running server is the wrong one, unloads it and loads the new one. Alternating
+between two modes with two different models therefore reloads each time — worth
+knowing before setting two.
+
+Two things a model of your own does not get, and cannot: it is **not verified**,
+because this build pins no SHA-256 for a file it has never heard of, and it is
+not validated by a test generation the way setup's model is. The pinned install
+is untouched by all of this — it stays recorded in `setup-state.json`, it is
+what every mode falls back to, and deleting `data/models.json` returns
+everything to it.
+
 ## Conversation mode
 
 The second thing the drop-down offers: a chat with a character, on the model
@@ -418,6 +460,7 @@ What changed, and only this:
 | Window | One column of mouse-sized controls | Two panes, fingertip-sized targets, drag-to-scroll, five display sizes from Smaller to Larger |
 | Changing device | Re-run setup | That, or Settings → What runs the model, which swaps the llama.cpp build and keeps the model that is installed |
 | Freeing the memory | Close the application | That, or Settings → Unload the model from memory |
+| Which model | The one setup installed, pinned and verified | That, or any `.gguf` of your own, moved into the models folder under its own name — one per mode, with its own vision projector or none |
 | What the window does | Writes prompts | That, or — on Settings → Mode — a chat with characters you write or import, on the same model |
 | Motion | One way of writing it | Default is that way exactly; **Inertia** and **Flow** are opt-in |
 | Seed | A number | A number, or `-1` for a fresh one each generation |
@@ -453,25 +496,25 @@ the mode drop-down set either way is the same prompt.
 ## Tests
 
 ```
-python -m pytest tests/        # 701 passed
+python -m pytest tests/        # 720 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
 - `test_prompt_engine.py` (44) — the adapter seam, the motion presets, speech
   expansion and the UI option sources
-- `test_touch_ui.py` (59) — target sizes, drag-to-scroll, the sliders and the
-  five display sizes, the menu-bar mode switch and the View toggles, the
-  runtime device menu and unloading, the transcript's layout and its sticky
-  bottom, and conversation mode driven end to end against a scripted server,
-  measured on a real window built offscreen
+- `test_touch_ui.py` (66) — target sizes, drag-to-scroll, the sliders and the
+  five display sizes, the menu-bar mode switch and the View toggles, the runtime
+  device menu, the per-mode model menu and unloading, the transcript's layout
+  and its sticky bottom, and conversation mode driven end to end against a
+  scripted server, measured on a real window built offscreen
 - `test_chat.py` (36) — the character format and its three imports, chat
   history and branching, and what a chat turn puts on the wire
 - `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
   download resume and retry
-- `test_install_flow.py` (113) — install-root discovery, GPU sizing, the CPU
+- `test_install_flow.py` (125) — install-root discovery, GPU sizing, the CPU
   and mixed devices, manifest resolution, console setup, supplying a model from
-  disk, changing device without re-downloading the model, and the installer's
-  interpreter and environment checks
+  disk, changing device without re-downloading the model, the per-mode model
+  library, and the installer's interpreter and environment checks
 
 Output-level parity against an upstream checkout is checked separately:
 
@@ -501,6 +544,7 @@ src/prompt_master/
   chat/history.py          Messages, their versions, branching, saved chats
   chat/prompt.py           What one chat turn puts on the wire
   chat/yamlish.py          The YAML subset a character file is written in
+  core/library.py          The models on disk, and which one each mode uses
   ui/                      Main window, chat page, character editor, setup wizard
   ui/touch.py              Fingertip sizing and drag-to-scroll, in one place
 installer_files/           Created by the installer (gitignored)

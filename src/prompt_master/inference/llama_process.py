@@ -8,7 +8,11 @@ import httpx
 class LlamaProcess:
     def __init__(self): self.process: subprocess.Popen | None = None; self.port = 0; self.api_key = ""; self._log = None
 
-    def start(self, executable: Path, model: Path, mmproj: Path, gpu_index: int, device: str, context_size: int, log_path: Path, gpu_layers: str = "all") -> None:
+    def start(self, executable: Path, model: Path, mmproj: Path | None, gpu_index: int, device: str, context_size: int, log_path: Path, gpu_layers: str = "all") -> None:
+        # mmproj is None for a model that has no vision projector — one of the
+        # user's own, chosen without one. --mmproj is then left off entirely
+        # rather than pointed at nothing, and the caller is what refuses the
+        # image requests such a server cannot answer.
         # gpu_layers is llama.cpp's --n-gpu-layers. It stays "all" for every card
         # that fits its quantization, which is what the 3090 and 5090 pinned
         # builds always used; a smaller card can record a layer count at setup
@@ -19,7 +23,7 @@ class LlamaProcess:
         # CUDA_VISIBLE_DEVICES is then emptied rather than set to an index, so a
         # card that happens to be in the machine is not picked up behind it.
         self.stop(); self.port = self._free_port(); self.api_key = secrets.token_urlsafe(32)
-        command = [str(executable),"--model",str(model),"--mmproj",str(mmproj),"--alias","prompt-master","--host","127.0.0.1","--port",str(self.port),"--api-key",self.api_key,"--no-webui","--device",device,"--split-mode","none","--main-gpu","0","--n-gpu-layers",str(gpu_layers),"--ctx-size",str(context_size),"--parallel","1","--reasoning","off","--reasoning-budget","0","--timeout","600"]
+        command = [str(executable),"--model",str(model),*(("--mmproj",str(mmproj)) if mmproj is not None else ()),"--alias","prompt-master","--host","127.0.0.1","--port",str(self.port),"--api-key",self.api_key,"--no-webui","--device",device,"--split-mode","none","--main-gpu","0","--n-gpu-layers",str(gpu_layers),"--ctx-size",str(context_size),"--parallel","1","--reasoning","off","--reasoning-budget","0","--timeout","600"]
         env = os.environ.copy(); env["CUDA_VISIBLE_DEVICES"] = "" if device.casefold() == "none" else str(gpu_index)
         log_path.parent.mkdir(parents=True, exist_ok=True); self._log = log_path.open("a", encoding="utf-8")
         self.process = subprocess.Popen(command, env=env, stdout=self._log, stderr=subprocess.STDOUT, creationflags=getattr(subprocess,"CREATE_NEW_PROCESS_GROUP",0)|getattr(subprocess,"CREATE_NO_WINDOW",0))

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from prompt_master.core.library import CONVERSATION, PROMPT, ModelLibrary
 from prompt_master.core.models import CPU_INDEX, GpuInfo
 from prompt_master.core.paths import DEFAULT_SUBDIR, ROOT_ENV, AppPaths
 from prompt_master.inference.device_detection import (CPU_DEVICE, CPU_RUNTIME, NO_OFFLOAD,
@@ -1259,3 +1260,157 @@ def test_the_state_records_which_runtime_is_unpacked(tmp_path, monkeypatch):
     assert installer.runtime_component_ids(cpu()) == (CPU_RUNTIME,)
     assert installer.runtime_component_ids(gpu()) == ("llama-runtime-cuda12",
                                                       "llama-runtime-cuda12-cudart")
+
+
+# ── models of your own ───────────────────────────────────────────────────────
+
+def _model_state(tmp_path, model="models/Gemma-Q6.gguf", mmproj="models/mmproj-f16.gguf"):
+    """An install whose setup model is on disk, as provisioning left it."""
+    paths = AppPaths(tmp_path)
+    paths.create_managed_dirs()
+    for relative in (model, mmproj):
+        if relative:
+            target = tmp_path / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"weights")
+    paths.state_file.write_text(json.dumps({
+        "runtime": "runtime/llama-server.exe", "model": model, "mmproj": mmproj,
+        "mode": "gpu", "gpu_index": 0, "quantization": "Q6_K_P", "gpu_layers": "all",
+    }), encoding="utf-8")
+    return paths
+
+
+def test_a_mode_with_no_model_of_its_own_uses_the_installed_one(tmp_path):
+    library = ModelLibrary(_model_state(tmp_path))
+
+    for mode in (PROMPT, CONVERSATION):
+        entry = library.entry_for(mode)
+        assert entry.model == "models/Gemma-Q6.gguf"
+        assert entry.mmproj == "models/mmproj-f16.gguf" and entry.has_vision
+        assert entry.name == "Gemma-Q6.gguf"
+        assert library.assigned(mode) == ""      # nothing was chosen; it is inherited
+
+
+def test_each_mode_keeps_its_own_model(tmp_path):
+    paths = _model_state(tmp_path)
+    (tmp_path / "models" / "Chat-Q4.gguf").write_bytes(b"other")
+    library = ModelLibrary(paths)
+
+    library.assign(CONVERSATION, "models/Chat-Q4.gguf")
+
+    assert library.entry_for(CONVERSATION).name == "Chat-Q4.gguf"
+    assert library.entry_for(PROMPT).name == "Gemma-Q6.gguf"
+    # A model nobody has given a projector to has none, rather than borrowing one.
+    assert not library.entry_for(CONVERSATION).has_vision
+    library.assign(CONVERSATION, None)
+    assert library.entry_for(CONVERSATION).name == "Gemma-Q6.gguf"
+
+
+def test_a_projector_belongs_to_the_model_not_the_mode(tmp_path):
+    paths = _model_state(tmp_path)
+    (tmp_path / "models" / "Chat-Q4.gguf").write_bytes(b"other")
+    library = ModelLibrary(paths)
+
+    library.remember_projector("models/Chat-Q4.gguf", "models/mmproj-f16.gguf")
+    library.assign(PROMPT, "models/Chat-Q4.gguf")
+    library.assign(CONVERSATION, "models/Chat-Q4.gguf")
+
+    for mode in (PROMPT, CONVERSATION):
+        assert library.entry_for(mode).mmproj == "models/mmproj-f16.gguf"
+    # And "none" is a choice that sticks, rather than falling back to a default.
+    library.remember_projector("models/Chat-Q4.gguf", "")
+    assert not library.entry_for(PROMPT).has_vision
+
+
+def test_the_models_folder_is_listed_without_its_projectors(tmp_path):
+    paths = _model_state(tmp_path)
+    for name in ("Chat-Q4.gguf", "mmproj-other.gguf", "notes.txt"):
+        (tmp_path / "models" / name).write_bytes(b"x")
+    library = ModelLibrary(paths)
+
+    assert library.models() == ["models/Chat-Q4.gguf", "models/Gemma-Q6.gguf"]
+    assert library.projectors() == ["models/mmproj-f16.gguf", "models/mmproj-other.gguf"]
+
+
+def test_an_assignment_whose_file_is_gone_falls_back_instead_of_failing(tmp_path):
+    paths = _model_state(tmp_path)
+    (tmp_path / "models" / "Chat-Q4.gguf").write_bytes(b"other")
+    library = ModelLibrary(paths)
+    library.assign(CONVERSATION, "models/Chat-Q4.gguf")
+
+    (tmp_path / "models" / "Chat-Q4.gguf").unlink()
+
+    assert library.entry_for(CONVERSATION).name == "Gemma-Q6.gguf"
+    # The choice is remembered, so putting the file back restores it.
+    assert library.assigned(CONVERSATION) == "models/Chat-Q4.gguf"
+
+
+def test_a_model_with_no_projector_at_all_is_a_model_without_vision(tmp_path):
+    library = ModelLibrary(_model_state(tmp_path, mmproj=""))
+    entry = library.entry_for(PROMPT)
+    assert entry.mmproj == "" and not entry.has_vision
+
+
+def test_a_model_of_your_own_is_installed_under_its_own_name(tmp_path):
+    source = tmp_path / "downloads" / "My Fine-Tune.Q5_K_M.gguf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"weights")
+    models = tmp_path / "models"
+
+    installed = importer.install_unverified(source, models)
+
+    assert installed.name == "My Fine-Tune.Q5_K_M.gguf", "the name is how it is recognised"
+    assert installed.parent == models.resolve()
+    assert not source.exists(), "moved, not copied"
+
+
+def test_copying_leaves_the_original_where_it_was(tmp_path):
+    source = tmp_path / "downloads" / "model.gguf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"weights")
+
+    installed = importer.install_unverified(source, tmp_path / "models", move=False)
+
+    assert installed.is_file() and source.is_file()
+
+
+def test_a_model_already_in_the_models_folder_is_used_where_it_lies(tmp_path):
+    models = tmp_path / "models"
+    models.mkdir()
+    already = models / "model.gguf"
+    already.write_bytes(b"weights")
+
+    assert importer.install_unverified(already, models) == already
+    assert already.is_file()
+
+
+def test_the_same_file_offered_twice_is_not_installed_twice(tmp_path):
+    source = tmp_path / "downloads" / "model.gguf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"weights")
+    models = tmp_path / "models"
+
+    first = importer.install_unverified(source, models, move=False)
+    second = importer.install_unverified(source, models, move=False)
+
+    assert first == second
+    assert sorted(path.name for path in models.iterdir()) == ["model.gguf"]
+
+
+def test_a_different_file_wanting_a_taken_name_is_numbered(tmp_path):
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "model.gguf").write_bytes(b"the first one")
+    source = tmp_path / "elsewhere" / "model.gguf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"a different model entirely")
+
+    installed = importer.install_unverified(source, models, move=False)
+
+    assert installed.name == "model (2).gguf"
+    assert (models / "model.gguf").read_bytes() == b"the first one"
+
+
+def test_a_file_that_is_not_there_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="not a file"):
+        importer.install_unverified(tmp_path / "nothing.gguf", tmp_path / "models")

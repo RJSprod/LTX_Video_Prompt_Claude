@@ -13,20 +13,24 @@ from prompt_master.prompt_engine import motion
 from prompt_master.prompt_engine import speech
 from prompt_master.prompt_engine import options as opt
 from prompt_master.prompt_engine.adapter import PromptEngine, VisionUnavailable
+from prompt_master.core.library import CONVERSATION, PROMPT, ModelLibrary
 from prompt_master.core.paths import AppPaths
 from prompt_master.inference.device_detection import describe, detect_cpu, detect_devices, vram_shortfall_mb
 from prompt_master.inference.service import InferenceService
 from prompt_master.provisioning import installer
 from prompt_master.ui import touch
 from prompt_master.ui.chat_page import ChatPage
+from prompt_master.ui.model_dialog import ModelDialog
 from prompt_master.ui.setup_wizard import SetupWizard
 
 # The two things this application does, and the order they appear in the mode
-# drop-down. Prompt mode is first because it is what the app was, and what an
-# install that has no characters yet can do.
-PROMPT_MODE = "prompt"
-CONVERSATION_MODE = "conversation"
+# menu. Prompt mode is first because it is what the app was, and what an install
+# that has no characters yet can do. The names are the library's, because a mode
+# is also what a model is chosen for.
+PROMPT_MODE = PROMPT
+CONVERSATION_MODE = CONVERSATION
 MODES = ((PROMPT_MODE, "Prompt mode"), (CONVERSATION_MODE, "Conversation mode"))
+MODE_TITLES = dict(MODES)
 
 
 class GenerationWorker(QObject):
@@ -37,8 +41,8 @@ class GenerationWorker(QObject):
     failed = Signal(str)
     finished = Signal()
 
-    def __init__(self, service, engine, request):
-        super().__init__(); self.service, self.engine, self.request = service, engine, request; self.cancelled = threading.Event()
+    def __init__(self, service, engine, request, entry=None):
+        super().__init__(); self.service, self.engine, self.request = service, engine, request; self.entry = entry; self.cancelled = threading.Event()
 
     @Slot()
     def cancel(self): self.cancelled.set()
@@ -50,7 +54,7 @@ class GenerationWorker(QObject):
             self.status.emit("Starting llama-server…")
             # service.client() raises when vision is needed and the projector is
             # missing, so reaching this line means the still can go on the wire.
-            client = self.service.client(needs_vision)
+            client = self.service.client(needs_vision, self.entry)
             if self.request.speech > speech.NONE:
                 # Before the brief, not after: the extra lines have to be in the
                 # intent the engine reads, not bolted onto the shot it wrote.
@@ -109,7 +113,7 @@ class MainWindow(QMainWindow):
     """
 
     def __init__(self, paths: AppPaths | None = None):
-        super().__init__(); self.paths = paths or AppPaths.discover(); self.service = InferenceService(self.paths); self.thread = None; self.setWindowTitle("Prompt Master Standalone"); self.image_path: Path | None = None; self.engine = PromptEngine(); self.devices = None
+        super().__init__(); self.paths = paths or AppPaths.discover(); self.service = InferenceService(self.paths); self.thread = None; self.setWindowTitle("Prompt Master Standalone"); self.image_path: Path | None = None; self.engine = PromptEngine(); self.devices = None; self.library = ModelLibrary(self.paths); self.model_actions = {}
         self.pages=QStackedWidget(); self.pages.addWidget(self.prompt_page())
         # The service is handed over as a callable rather than as itself: re-running
         # setup replaces it, and the chat page must talk to the one running now.
@@ -137,12 +141,74 @@ class MainWindow(QMainWindow):
     def select_mode(self, mode: str, remember: bool = True):
         self.pages.setCurrentIndex(1 if mode == CONVERSATION_MODE else 0)
         for action in self.mode_actions.actions(): action.setChecked(action.data() == mode)
+        # The status line names the model of the page you are on, and the two
+        # pages can be on different ones.
+        if hasattr(self,"status"): self.refresh_status()
         if remember:
             settings=self.paths.data/touch.SETTINGS_FILE
             try: current=read_json(settings)
             except (OSError,ValueError): current={}
             try: atomic_write_json(settings,{**current,"mode":mode})
             except OSError: pass                      # remembering is a convenience
+
+    # ── which model ──────────────────────────────────────────────────────────
+
+    def populate_models(self, mode: str):
+        """The models folder, as a list, with this mode's own one ticked.
+
+        Each mode keeps its own choice, and a mode that has never been given one
+        follows the model setup installed — so an install that never opens this
+        menu behaves as it always did.
+        """
+        menu=self.model_menus[mode]; menu.clear()
+        entry=self.library.entry_for(mode); current=entry.model if entry else ""
+        installed=self.library.installed_model(); found=self.library.models()
+        group=QActionGroup(self); group.setExclusive(True); self.model_actions[mode]=group
+        for relative in found:
+            label=Path(relative).name + (" — installed by setup" if relative == installed else "")
+            if not self.library.projector_for(relative): label += " — no vision"
+            action=menu.addAction(label); action.setCheckable(True); action.setData(relative)
+            action.setChecked(relative == current); group.addAction(action)
+            action.triggered.connect(lambda _checked=False,chosen=mode,path=relative: self.choose_model(chosen,path))
+        if not found:
+            empty=menu.addAction("No .gguf files in the models folder"); empty.setEnabled(False)
+        menu.addSeparator(); menu.addAction("Choose a model file…").triggered.connect(lambda _checked=False,chosen=mode: self.open_model_dialog(chosen))
+
+    def choose_model(self, mode: str, relative: str):
+        entry=self.library.entry_for(mode)
+        if entry is not None and entry.model == relative: return
+        self.library.assign(mode,relative)
+        self.model_changed(mode)
+
+    def open_model_dialog(self, mode: str | None = None):
+        """Point a mode at a model of your own, moving it in if it is elsewhere."""
+        mode=mode or self.current_mode()
+        dialog=ModelDialog(self.paths,self.library,touch.metrics(touch.SCALES[self.scale_name]),mode,self)
+        if dialog.exec() and dialog.chosen is not None:
+            self.model_changed(dialog.modes[0] if dialog.modes else mode)
+
+    def model_changed(self, mode: str):
+        """Say what will happen, and let the next generation make it happen.
+
+        Nothing is unloaded here. The model is part of what the inference
+        service compares before it hands out a client, so the next generation in
+        that mode finds the running server is the wrong one and replaces it —
+        which is the whole of "unload the current and load the new one on
+        generate". Unloading now is a separate menu item, for when the memory is
+        wanted back immediately.
+        """
+        entry=self.library.entry_for(mode)
+        name=entry.name if entry else "nothing"
+        note=f"{MODE_TITLES[mode]} now uses {name} — it loads on the next generation."
+        if entry is not None and not entry.has_vision:
+            note += " It has no vision projector, so images cannot be sent to it."
+        self.refresh_status(note); self.chat.set_status(note)
+
+    def current_mode(self) -> str:
+        return CONVERSATION_MODE if self.pages.currentWidget() is self.chat else PROMPT_MODE
+
+    def model_entry(self, mode: str | None = None):
+        return self.library.entry_for(mode or self.current_mode())
 
     # ── what runs the model ──────────────────────────────────────────────────
 
@@ -250,6 +316,13 @@ class MainWindow(QMainWindow):
         # Filled in when it is opened rather than now: listing devices runs
         # nvidia-smi, which is not something to do on the way to a window.
         self.device_menu=settings_menu.addMenu("What runs the model"); self.device_menu.aboutToShow.connect(self.populate_devices)
+        # One list per mode, filled when opened: a folder of models is read from
+        # disk, and it changes whenever a model is added.
+        self.model_menus={}
+        for mode,label in MODES:
+            menu=settings_menu.addMenu(f"Model for {label.casefold()}"); self.model_menus[mode]=menu
+            menu.aboutToShow.connect(lambda chosen=mode: self.populate_models(chosen))
+        settings_menu.addAction("Choose a model file…").triggered.connect(lambda: self.open_model_dialog())
         settings_menu.addAction("Unload the model from memory").triggered.connect(self.unload_model)
         settings_menu.addSeparator(); settings_menu.addAction("Models and Hardware…").triggered.connect(self.open_setup)
         view_menu=self.menuBar().addMenu("View"); sizes=view_menu.addMenu("Display size"); self.size_actions=QActionGroup(self); self.size_actions.setExclusive(True)
@@ -524,10 +597,16 @@ class MainWindow(QMainWindow):
         except Exception as exc: QMessageBox.critical(self,"Image error",str(exc)); return
         if request.video_mode == "i2v" and request.image_data_url is None:
             QMessageBox.warning(self,"Image required","Image to video needs an attached image. Attach one, or switch to text to video."); return
+        entry=self.model_entry(PROMPT_MODE)
+        if request.video_mode == "i2v" and entry is not None and not entry.has_vision:
+            # Refused here rather than at the request: a model chosen without a
+            # projector cannot be sent a still, and finding that out after the
+            # 16-27 GiB has loaded is not an answer.
+            QMessageBox.critical(self,"No vision projector",f"{entry.name} has no vision projector, so it cannot be sent images. Choose one for it in Settings → Model for prompt mode, or switch to text to video."); return
         try: self.negative.setPlainText(self.engine.base_negative(request))
         except VisionUnavailable as exc: QMessageBox.critical(self,"Vision unavailable",str(exc)); return
         self.positive.clear(); self.generate_button.setEnabled(False); self.cancel_button.setEnabled(True)
-        self.thread=QThread(self); worker=GenerationWorker(self.service,self.engine,request); worker.moveToThread(self.thread); self._worker=worker
+        self.thread=QThread(self); worker=GenerationWorker(self.service,self.engine,request,entry); worker.moveToThread(self.thread); self._worker=worker
         self.thread.started.connect(worker.run); worker.positive_chunk.connect(self.positive.insertPlainText); worker.positive_ready.connect(self.positive.setPlainText); worker.negative_ready.connect(self.negative.setPlainText); worker.status.connect(self.status.setText); worker.failed.connect(self.generation_failed); worker.finished.connect(self.thread.quit); worker.finished.connect(worker.deleteLater); self.thread.finished.connect(self.generation_done); self.thread.start()
     def generation_failed(self, message): self.status.setText("Generation failed"); QMessageBox.critical(self,"Generation failed",message)
     def generation_done(self): self.generate_button.setEnabled(True); self.cancel_button.setEnabled(False); self.thread.deleteLater(); self.thread=None; self._worker=None
@@ -550,12 +629,17 @@ class MainWindow(QMainWindow):
         device=state.get('gpu_device_name',state.get('gpu_name','not configured'))
         mode=state.get('mode',GPU_MODE)
         if mode != GPU_MODE: device=f"{device} ({mode})"
-        self.status.setText(f"Device: {device} · Model: {state.get('quantization','not configured')} · Server: {'running' if self.service.process.running else 'stopped'} · Generation: idle"
+        # The model this page will actually use, by its own file name: with a
+        # model per mode, the quantization setup recorded is no longer the
+        # answer to "what is this about to run".
+        entry=self.model_entry()
+        model=entry.name if entry is not None else state.get('quantization','not configured')
+        self.status.setText(f"Device: {device} · Model: {model} · Server: {'running' if self.service.process.running else 'stopped'} · Generation: idle"
                             + (f" · {note}" if note else ""))
     def open_setup(self):
         self.service.stop(); wizard=SetupWizard(self.paths,self)
         if wizard.exec() and wizard.completed:
-            self.paths=wizard.paths; self.service=InferenceService(self.paths); self.chat.rebind(self.paths); self.refresh_status()
+            self.paths=wizard.paths; self.service=InferenceService(self.paths); self.library=ModelLibrary(self.paths); self.chat.rebind(self.paths); self.refresh_status()
     def closeEvent(self,event):
         if self.thread and self.thread.isRunning(): self.thread.quit(); self.thread.wait(3000)
         self.chat.shutdown(); self.service.stop(); event.accept()

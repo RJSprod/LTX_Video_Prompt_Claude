@@ -513,9 +513,11 @@ class _ScriptedService:
     def __init__(self, replies):
         self.scripted = _ScriptedClient(replies)
         self.vision_asked = []
+        self.entries = []
 
-    def client(self, needs_vision=False):
+    def client(self, needs_vision=False, entry=None):
         self.vision_asked.append(needs_vision)
+        self.entries.append(entry)
         return self.scripted
 
 
@@ -623,7 +625,7 @@ def test_an_attached_picture_is_sent_with_the_message_and_asks_for_vision(qt, ch
 
 def test_a_generation_that_fails_does_not_leave_an_empty_reply_behind(qt, chat_window):
     class _Broken:
-        def client(self, needs_vision=False):
+        def client(self, needs_vision=False, entry=None):
             raise RuntimeError("llama-server is not running")
 
     page = chat_window.chat
@@ -1077,3 +1079,141 @@ def test_the_model_cannot_be_unloaded_mid_generation(qt, window, monkeypatch):
 
     window.unload_model()
     assert stopped == [] and told and "Stop" in told[0]
+
+
+# ── a model of your own, per mode ────────────────────────────────────────────
+
+@pytest.fixture
+def model_window(qt, tmp_path):
+    """A window with the installed model on disk and a second model beside it."""
+    from prompt_master.core.config import atomic_write_json
+    from prompt_master.ui.main_window import MainWindow
+
+    paths = AppPaths(tmp_path)
+    paths.create_managed_dirs()
+    for relative in ("models/Gemma-Q6.gguf", "models/mmproj-f16.gguf", "models/Chat-Q4.gguf"):
+        (tmp_path / relative).write_bytes(b"weights")
+    atomic_write_json(paths.state_file, {
+        "runtime": "runtime/llama-server.exe", "model": "models/Gemma-Q6.gguf",
+        "mmproj": "models/mmproj-f16.gguf", "mode": "gpu", "gpu_index": 0,
+        "quantization": "Q6_K_P", "context_size": 16384, "gpu_layers": "all",
+    })
+    made = MainWindow(paths)
+    made.resize(1400, 900)
+    yield made
+    made.close()
+
+
+def test_the_model_menu_lists_the_models_folder_and_ticks_the_one_in_use(qt, model_window):
+    from prompt_master.core.library import CONVERSATION, PROMPT
+
+    model_window.populate_models(PROMPT)
+    labels = [action.text() for action in model_window.model_actions[PROMPT].actions()]
+
+    assert any("Gemma-Q6.gguf" in label and "installed by setup" in label for label in labels)
+    # A model nobody has given a projector says so, because it cannot take images.
+    assert any("Chat-Q4.gguf" in label and "no vision" in label for label in labels)
+    ticked = [a for a in model_window.model_actions[PROMPT].actions() if a.isChecked()]
+    assert len(ticked) == 1 and ticked[0].data() == "models/Gemma-Q6.gguf"
+
+    model_window.populate_models(CONVERSATION)
+    assert len(model_window.model_actions[CONVERSATION].actions()) == 2
+
+
+def test_each_mode_can_be_pointed_at_a_different_model(qt, model_window):
+    from prompt_master.core.library import CONVERSATION, PROMPT
+
+    model_window.choose_model(CONVERSATION, "models/Chat-Q4.gguf")
+
+    assert model_window.library.entry_for(CONVERSATION).name == "Chat-Q4.gguf"
+    assert model_window.library.entry_for(PROMPT).name == "Gemma-Q6.gguf"
+    assert "Chat-Q4.gguf" in model_window.status.text()
+    assert "loads on the next generation" in model_window.status.text()
+    assert "no vision projector" in model_window.status.text()
+
+
+def test_the_status_line_names_the_model_of_the_page_you_are_on(qt, model_window):
+    from prompt_master.core.library import CONVERSATION
+    from prompt_master.ui.main_window import CONVERSATION_MODE, PROMPT_MODE
+
+    model_window.choose_model(CONVERSATION, "models/Chat-Q4.gguf")
+
+    model_window.select_mode(PROMPT_MODE)
+    assert "Gemma-Q6.gguf" in model_window.status.text()
+    model_window.select_mode(CONVERSATION_MODE)
+    assert "Chat-Q4.gguf" in model_window.status.text()
+
+
+def test_the_chosen_model_is_what_the_reply_is_generated_with(qt, model_window, monkeypatch):
+    """The whole point of the setting: the worker asks the service for that
+    model, and the service is what swaps the running server."""
+    from prompt_master.core.library import CONVERSATION
+    from prompt_master.ui.main_window import CONVERSATION_MODE
+
+    model_window.select_mode(CONVERSATION_MODE)
+    page = model_window.chat
+    from prompt_master.chat.characters import Character
+    page.characters.save(Character(name="Ada", context="A runner.", greeting="Hi."))
+    page.reload_characters(select="Ada")
+    model_window.choose_model(CONVERSATION, "models/Chat-Q4.gguf")
+
+    service = _ScriptedService(["Hello."])
+    page.service_provider = lambda: service
+    page.input.setPlainText("hello")
+    page.send()
+    _finish(qt, page)
+
+    assert service.entries and service.entries[0].model == "models/Chat-Q4.gguf"
+
+
+def test_a_model_without_a_projector_refuses_images_before_anything_loads(qt, model_window):
+    from prompt_master.core.library import CONVERSATION, PROMPT
+
+    model_window.choose_model(PROMPT, "models/Chat-Q4.gguf")
+    entry = model_window.model_entry(PROMPT)
+    assert not entry.has_vision
+
+    model_window.choose_model(CONVERSATION, "models/Chat-Q4.gguf")
+    assert not model_window.chat.library.entry_for(CONVERSATION).has_vision
+
+
+def test_llama_server_is_started_without_mmproj_when_there_is_none(tmp_path, monkeypatch):
+    """A model chosen without a projector must not be handed --mmproj pointing
+    at nothing; the flag is left off entirely."""
+    from prompt_master.inference.llama_process import LlamaProcess
+
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, command, env=None, **_kwargs):
+            captured["command"] = command
+
+        def poll(self): return None
+
+    monkeypatch.setattr("subprocess.Popen", FakePopen)
+    process = LlamaProcess()
+    process.start(tmp_path / "llama-server.exe", tmp_path / "model.gguf", None,
+                  0, "CUDA0", 16384, tmp_path / "log.txt")
+
+    assert "--mmproj" not in captured["command"]
+    assert "--model" in captured["command"]
+
+
+def test_the_service_refuses_an_image_request_a_model_cannot_answer(tmp_path):
+    from prompt_master.core.config import atomic_write_json
+    from prompt_master.core.library import ModelEntry
+    from prompt_master.inference.service import InferenceService
+
+    paths = AppPaths(tmp_path)
+    paths.create_managed_dirs()
+    for relative in ("runtime/llama-server.exe", "models/Chat-Q4.gguf"):
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_bytes(b"x")
+    atomic_write_json(paths.state_file, {
+        "runtime": "runtime/llama-server.exe", "model": "models/Chat-Q4.gguf",
+        "mmproj": "", "gpu_index": 0, "mode": "gpu", "gpu_layers": "all",
+    })
+
+    service = InferenceService(paths)
+    with pytest.raises(RuntimeError, match="no vision projector"):
+        service.client(needs_vision=True, entry=ModelEntry("models/Chat-Q4.gguf", ""))

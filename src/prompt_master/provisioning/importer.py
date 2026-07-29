@@ -92,6 +92,48 @@ def adopt(component: Component, destination: Path, source: LocalSource,
     return destination
 
 
+def install_unverified(source: Path, directory: Path, *, move: bool = True,
+                       progress: Progress | None = None) -> Path:
+    """Put a model of the user's own in ``directory``, under its own name.
+
+    The counterpart to ``adopt``, for a file this build pins nothing about:
+    there is no manifest entry, no size to check and no SHA-256 to verify, so
+    the only questions left are what to call it and whether to move it. It keeps
+    its name — that name is how it will be recognised in a menu — and it is
+    moved rather than copied, because the reason to point at a 21 GiB file you
+    already have is not to end up with two of them.
+
+    A file already inside ``directory`` is used where it lies. A *different*
+    file that wants a name already taken is numbered rather than allowed to
+    overwrite it; the same file offered twice is simply itself.
+    """
+    path = source.expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"{source} is not a file")
+    directory.mkdir(parents=True, exist_ok=True)
+    directory = directory.resolve()
+    if path.parent == directory:
+        if progress: progress(1, 1)
+        return path
+    destination = _free_name(directory, path)
+    if destination.is_file():
+        if progress: progress(1, 1)
+        return destination                     # the same file, offered again
+    _install(path, destination, path.stat().st_size, move=move, progress=progress)
+    return destination
+
+
+def _free_name(directory: Path, source: Path) -> Path:
+    """``source``'s own name in ``directory``, numbered only on a real clash."""
+    candidate = directory / source.name
+    size = source.stat().st_size
+    index = 2
+    while candidate.is_file() and candidate.stat().st_size != size:
+        candidate = directory / f"{source.stem} ({index}){source.suffix}"
+        index += 1
+    return candidate
+
+
 def _install(source: Path, destination: Path, size: int, *, move: bool,
              progress: Progress | None) -> None:
     if move:
