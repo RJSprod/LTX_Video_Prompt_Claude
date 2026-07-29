@@ -6,8 +6,9 @@ from PySide6.QtGui import QActionGroup
 from PySide6.QtWidgets import (QApplication,QCheckBox,QComboBox,QFileDialog,QFrame,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QMainWindow,QMessageBox,QPlainTextEdit,QPushButton,QScrollArea,QSizePolicy,QSpinBox,QDoubleSpinBox,QSplitter,QTextEdit,QVBoxLayout,QWidget)
 import threading
 
-from prompt_master.core.models import PromptRequest
+from prompt_master.core.models import RANDOM_SEED, PromptRequest, draw_seed
 from prompt_master.imaging.preprocess import image_data_url
+from prompt_master.prompt_engine import motion
 from prompt_master.prompt_engine import options as opt
 from prompt_master.prompt_engine.adapter import PromptEngine, VisionUnavailable
 from prompt_master.core.paths import AppPaths
@@ -40,7 +41,9 @@ class GenerationWorker(QObject):
             client = self.service.client(needs_vision)
             plan = self.engine.build(self.request, vision_available=True)
             self.status.emit(f"Generating positive prompt… ({plan.frames} frames, {plan.word_budget[0]}-{plan.word_budget[1]} words)")
-            raw = client.stream_chat(plan.messages, plan.max_tokens, self.request.seed, self.positive_chunk.emit, self.cancelled)
+            temperature, top_p = self.engine.sampling(self.request)
+            raw = client.stream_chat(plan.messages, plan.max_tokens, self.request.seed, self.positive_chunk.emit,
+                                     self.cancelled, temperature=temperature, top_p=top_p)
             if self.cancelled.is_set(): self.status.emit("Generation cancelled"); return
             positive = self.engine.clean_positive(raw)
             if not positive.strip(): raise RuntimeError("The model returned an empty script.")
@@ -50,7 +53,7 @@ class GenerationWorker(QObject):
                 self.status.emit("Negative pass…")
                 auto = self.engine.run_smart_negative(positive, self._chat_stream(client))
             self.negative_ready.emit(self.engine.merge_negative(self.request, auto))
-            self.status.emit("Server: running · Generation: complete")
+            self.status.emit(f"Server: running · Generation: complete · Seed: {self.request.seed}")
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
@@ -133,8 +136,11 @@ class MainWindow(QMainWindow):
         self.seconds=QDoubleSpinBox(); self.seconds.setRange(1,60); self.seconds.setSingleStep(0.5); self.seconds.setValue(d["seconds"]); self.seconds.setSuffix(" s")
         self.fps=QSpinBox(); self.fps.setRange(8,60); self.fps.setValue(d["fps"])
         self.dimensions=self.combo([("704x1216","704 × 1216 (portrait)"),("1216x704","1216 × 704 (landscape)"),("768x768","768 × 768 (square)"),("1920x1080","1920 × 1080"),("1080x1920","1080 × 1920")],f"{d['output_width']}x{d['output_height']}")
-        self.seed=QSpinBox(); self.seed.setRange(0,2**31-1); self.seed.setValue(d["seed"])
+        self.seed=QSpinBox(); self.seed.setRange(RANDOM_SEED,2**31-1); self.seed.setValue(d["seed"])
+        # Qt shows the special text in place of the minimum, which is what -1 is.
+        self.seed.setSpecialValueText("Random each time (-1)")
         self.style=self.grouped_combo(opt.STYLES_GROUPED,d["style"])
+        self.motion=self.combo(motion.OPTIONS,motion.DEFAULT)
         self.camera=self.combo(opt.CAMERAS,d["camera"])
         self.transition=self.combo(opt.TRANSITIONS,d["transition"])
         self.pov=self.combo(opt.POV,d["pov"])
@@ -153,8 +159,9 @@ class MainWindow(QMainWindow):
             ("Shot", [("Video mode",self.mode),("Duration",touch.stepper(self.seconds)),
                       ("FPS",touch.stepper(self.fps)),("Dimensions",self.dimensions),
                       ("Seed",touch.stepper(self.seed))]),
-            ("Look", [("Style",self.style),("Camera",self.camera),("Transition",self.transition),
-                      ("First person",self.pov),("Wardrobe",self.wardrobe),(None,self.undress)]),
+            ("Look", [("Style",self.style),("Motion",self.motion),("Camera",self.camera),
+                      ("Transition",self.transition),("First person",self.pov),
+                      ("Wardrobe",self.wardrobe),(None,self.undress)]),
             ("Voice and music", [("Accent",self.accent),("Accent strength",self.accent_strength),
                                  ("Dialogue / talk",touch.stepper(self.dialogue)),("Music",self.music),
                                  (None,self.music_bg)]),
@@ -304,6 +311,7 @@ class MainWindow(QMainWindow):
             seconds=self.seconds.value(),
             fps=self.fps.value(),
             style=self.chosen(self.style,"off"),
+            motion=self.chosen(self.motion,motion.DEFAULT),
             camera=self.chosen(self.camera,"off"),
             transition=self.chosen(self.transition,"off"),
             pov=self.chosen(self.pov,"off"),
@@ -317,7 +325,9 @@ class MainWindow(QMainWindow):
             lexicon=self.lexicon.toPlainText(),
             fmt=self.chosen(self.output_format,"flowing"),
             negative_extra=self.negative_extra.toPlainText(),
-            seed=self.seed.value(),
+            # -1 means "a different one every time": resolved here, so the
+            # casting upstream seeds and the sampler both get the same number.
+            seed=self.seed.value() if self.seed.value() != RANDOM_SEED else draw_seed(),
             smart_negative=self.smart.isChecked(),
             output_width=width,
             output_height=height,

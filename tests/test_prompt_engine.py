@@ -15,7 +15,8 @@ import io
 import pytest
 from PIL import Image
 
-from prompt_master.core.models import PromptRequest
+from prompt_master.core.models import RANDOM_SEED, PromptRequest, draw_seed
+from prompt_master.prompt_engine import motion
 from prompt_master.prompt_engine import options as opt
 from prompt_master.prompt_engine.adapter import PromptEngine, VisionUnavailable
 from prompt_master.prompt_engine.upstream import brain
@@ -241,6 +242,110 @@ def test_every_default_is_a_real_engine_key():
         assert getattr(request, field) in opt.values(options), field
 
 
+# ── motion presets ───────────────────────────────────────────────────────────
+#
+# Three settings, and the first of them has to be indistinguishable from the
+# application that had no such setting.
+
+def motion_request(key, **overrides):
+    return PromptRequest(intent="a runner crosses a bridge at dawn", video_mode="t2v",
+                         motion=key, **overrides)
+
+
+def test_default_motion_changes_nothing_at_all():
+    """Not "changes little": the default build must be the upstream build, in
+    the system prompt, the negative and the sampling alike."""
+    engine = PromptEngine()
+    default = engine.build(motion_request(motion.DEFAULT))
+    assert default.system == brain.build_system(
+        mode="t2v", pov="off", accent="off", accent_strength="natural", dialogue=20,
+        wardrobe="auto", undress=False, seed=7, intent="a runner crosses a bridge at dawn",
+        camera="off", transition="off", music="off", music_bg=False, lexicon="",
+        fmt="flowing", fps=24, seconds=12.0, style="off", style_hint="", has_image=False)
+    assert default.base_negative == brain.build_negative(
+        pov="off", dialogue=20, undress=False, fmt="flowing", transition="off",
+        intent="a runner crosses a bridge at dawn", extra="", camera="off",
+        style="off", mode="t2v", auto="")
+    # backend.chat_stream's own numbers.
+    assert engine.sampling(motion_request(motion.DEFAULT)) == (0.85, 0.95)
+
+
+@pytest.mark.parametrize("key", [key for key in motion.PRESETS if key != motion.DEFAULT])
+def test_a_preset_is_appended_after_upstream_never_woven_into_it(key):
+    """The whole of the difference has to be removable by removing the preset,
+    which is only true if upstream's prompt is still there, unedited, at the
+    front of it."""
+    engine = PromptEngine()
+    default = engine.build(motion_request(motion.DEFAULT)).system
+    built = engine.build(motion_request(key)).system
+
+    assert built.startswith(default)
+    assert built.removeprefix(default) == f"\n\n{motion.PRESETS[key].directive}"
+
+
+def test_the_two_presets_pull_in_opposite_directions():
+    """Inertia is abrupt and Flow is continuous; a preset that asked for both
+    would be a preset that asks for nothing."""
+    inertia, flow = motion.PRESETS["inertia"], motion.PRESETS["flow"]
+    assert "abrupt" in inertia.directive.casefold() and "no slow" in inertia.directive.casefold()
+    assert "continuity" in flow.directive.casefold() and "no snap cuts" in flow.directive.casefold()
+    # Hotter for jolts, cooler for continuity, and neither one is the default.
+    assert inertia.temperature > 0.85 > flow.temperature
+    assert len({preset.temperature for preset in motion.PRESETS.values()}) == 3
+
+
+def test_preset_negative_terms_go_through_upstreams_dedupe():
+    """They are supplied as extra terms — the same input the user types into —
+    so a term upstream already banks is not banked twice."""
+    built = PromptEngine().build(motion_request("flow"))
+    assert "jerky motion" in built.base_negative
+    # "strobing" is in the preset's terms and in upstream's own bank. Asking
+    # for it twice must not weight it twice.
+    assert "strobing" in motion.PRESETS["flow"].negative
+    assert built.base_negative.count("strobing") == 1
+
+
+def test_a_preset_does_not_displace_the_users_own_terms():
+    built = PromptEngine().build(motion_request("inertia", negative_extra="my own term"))
+    assert "my own term" in built.base_negative and "floaty movement" in built.base_negative
+
+
+def test_an_unknown_preset_falls_back_to_upstream_behaviour():
+    """A state file written by another version must not break generation."""
+    engine = PromptEngine()
+    assert motion.preset("chartreuse").key == motion.DEFAULT
+    assert engine.build(motion_request("chartreuse")).system == engine.build(motion_request(motion.DEFAULT)).system
+    assert engine.sampling(motion_request(None)) == (0.85, 0.95)
+
+
+def test_every_preset_is_offered_with_its_name_first():
+    """The drop-down carries the key and shows the label; the name the setting
+    is known by has to lead it."""
+    assert [key for key, _ in motion.OPTIONS] == list(motion.PRESETS)
+    for key, label in motion.OPTIONS:
+        assert label.split(" —")[0].casefold() in (key, "default")
+
+
+# ── random seed ──────────────────────────────────────────────────────────────
+
+def test_a_drawn_seed_is_one_upstream_and_llama_cpp_both_accept():
+    """Upstream seeds its casting with this integer and llama.cpp seeds its
+    sampler with it; a negative one is meaningful to neither."""
+    drawn = {draw_seed() for _ in range(50)}
+    assert all(0 <= seed < 2 ** 31 for seed in drawn)
+    assert len(drawn) > 40, "draw_seed keeps returning the same number"
+    assert RANDOM_SEED == -1
+
+
+def test_the_seed_reaches_upstreams_casting_not_only_the_sampler():
+    """It picks the cast and the wardrobe as well as seeding llama.cpp, which
+    is why a drawn seed has to be fixed before the brief is built rather than
+    at the point the request goes on the wire."""
+    built = PromptEngine().build(motion_request(motion.DEFAULT, seed=4242))
+    unseeded = PromptEngine().build(motion_request(motion.DEFAULT, seed=99))
+    assert built.system != unseeded.system      # the seed reached upstream's casting
+
+
 def test_every_control_value_builds_a_brief():
     """Sweep each control across its whole range — no key may crash the engine."""
     engine = PromptEngine()
@@ -250,6 +355,7 @@ def test_every_control_value_builds_a_brief():
                           ("music", ["auto"] + list(MUSIC_KEYS)), ("fmt", FORMATS),
                           ("accent_strength", list(STRENGTHS)),
                           ("pov", ["off", "male", "female"]),
+                          ("motion", list(motion.PRESETS)),
                           ("wardrobe", ["auto", "off", "her", "him"])]:
         for value in values:
             built = engine.build(PromptRequest(**{**base, field: value}))

@@ -196,6 +196,36 @@ def test_the_controls_still_carry_upstream_keys_into_the_request(qt, window):
     assert request.lexicon == "Ada = a runner" and request.negative_extra == "logo"
 
 
+def test_a_seed_of_minus_one_draws_a_new_one_for_every_generation(qt, window):
+    """The dial stays on -1 — the next run should be random too — while each
+    request carries a real number, because upstream seeds its casting with it."""
+    from prompt_master.core.models import RANDOM_SEED
+
+    window.intent.setPlainText("A runner on a bridge")
+    assert window.seed.minimum() == RANDOM_SEED
+    assert window.seed.specialValueText()                 # shown in place of -1
+
+    window.seed.setValue(RANDOM_SEED)
+    drawn = {window.request().seed for _ in range(12)}
+    assert window.seed.value() == RANDOM_SEED
+    assert all(seed >= 0 for seed in drawn)
+    assert len(drawn) > 8, "the same seed keeps coming back"
+
+    window.seed.setValue(1234)
+    assert {window.request().seed for _ in range(3)} == {1234}
+
+
+def test_the_motion_preset_is_offered_and_carried(qt, window):
+    from prompt_master.prompt_engine import motion
+
+    window.intent.setPlainText("A runner on a bridge")
+    assert [window.motion.itemData(i) for i in range(window.motion.count())] == list(motion.PRESETS)
+    assert window.request().motion == motion.DEFAULT       # opens on upstream behaviour
+
+    window.select(window.motion, "flow")
+    assert window.request().motion == "flow"
+
+
 def test_attaching_an_image_switches_the_mode_and_names_the_file(qt, window, tmp_path):
     from PIL import Image
 
