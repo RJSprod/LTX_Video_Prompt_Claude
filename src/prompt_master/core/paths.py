@@ -72,6 +72,14 @@ class AppPaths:
 
     @property
     def data(self) -> Path: return self.root / "data"
+    # Conversation mode's two stores, kept beside the model rather than under
+    # ``data`` because they are the user's own writing: characters are files
+    # meant to be copied in and out — the folder name matches the one
+    # oobabooga uses — and a chat is a document, not application state.
+    @property
+    def characters(self) -> Path: return self.root / "characters"
+    @property
+    def chats(self) -> Path: return self.root / "chats"
     @property
     def logs(self) -> Path: return self.root / "logs"
     @property
@@ -85,7 +93,7 @@ class AppPaths:
         return self.state_file.is_file()
 
     def create_managed_dirs(self) -> None:
-        for path in (self.data, self.logs, self.cache / "downloads", self.cache / "temp-images", self.root / "models", self.root / "runtime"):
+        for path in (self.data, self.logs, self.cache / "downloads", self.cache / "temp-images", self.root / "models", self.root / "runtime", self.characters, self.chats):
             path.mkdir(parents=True, exist_ok=True)
 
     def contained(self, relative: str | Path) -> Path:

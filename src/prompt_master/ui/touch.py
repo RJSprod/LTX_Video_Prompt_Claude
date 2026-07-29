@@ -7,7 +7,9 @@ That is the number the platform guidelines converge on for a fingertip, and it
 is what the metrics below are derived from rather than chosen around: a combo
 box, its drop-down arrow, the rows of its popup, a spin box's steppers, a
 checkbox's indicator and a scroll bar's handle are all sized from it, because a
-control is only as touchable as its smallest part.
+control is only as touchable as its smallest part. The display size multiplies
+that number, and the two settings below 1.0 — see ``COMPACT`` — are the one
+place it is allowed under the floor, by asking for it.
 
 *Scrolling.* A touch screen scrolls by dragging the content, not by finding a
 scroll bar. ``flickable`` grabs the touch gesture for a widget's viewport, which
@@ -28,19 +30,30 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QAbstractSpinBox,
-                               QComboBox, QHBoxLayout, QPushButton, QScroller,
+                               QComboBox, QHBoxLayout, QLabel, QPushButton, QScroller,
                                QScrollerProperties, QSlider, QStyle,
-                               QStyledItemDelegate, QWidget)
+                               QStyledItemDelegate, QVBoxLayout, QWidget)
 
 from prompt_master.core.config import atomic_write_json, read_json
 
 # The fingertip. Everything else is a multiple of it.
 TARGET = 48
 
-# What the View menu offers. A 10" tablet held at arm's length and a 27" panel
-# on a desk want different numbers, and no single default is right for both.
-SCALES: dict[str, float] = {"Comfortable": 1.0, "Large": 1.15, "Larger": 1.35}
+# What the View menu offers, smallest first. A 10" tablet held at arm's length
+# and a 27" panel on a desk want different numbers, and no single default is
+# right for both.
+SCALES: dict[str, float] = {"Smaller": 0.72, "Small": 0.85, "Comfortable": 1.0,
+                            "Large": 1.15, "Larger": 1.35}
 DEFAULT_SCALE = "Comfortable"
+
+# The two sizes below Comfortable, which deliberately go under the fingertip
+# floor the rest of this module is built around: 41 logical pixels at Small and
+# 35 at Smaller, against the 48 a fingertip wants. They exist because the
+# prompt-mode window has a great many controls and a large monitor with a mouse
+# on it is a real way to use this application — but they are a choice made
+# explicitly, never a default, and a finger will start to miss things at
+# Smaller. Everything scales together, so nothing overlaps; it only gets small.
+COMPACT = ("Smaller", "Small")
 
 SETTINGS_FILE = "ui.json"
 
@@ -60,6 +73,7 @@ def metrics(scale: float) -> dict[str, int]:
         "gap": round(12 * scale),
         "indicator": round(unit * 0.62),   # checkbox box
         "stepper": round(unit * 0.9),      # spin box up/down
+        "bubble": round(unit * 0.38),      # corner of a chat bubble
         "bar": round(unit * 0.42),         # scroll bar: wide enough to drag
         "grip": round(unit * 1.3),         # shortest a scroll handle may get
     }
@@ -105,6 +119,15 @@ QComboBox QAbstractItemView::item {{ min-height: {m['target']}px; }}
 QPushButton#stepper {{
     min-width: {m['stepper']}px; max-width: {m['stepper']}px;
     min-height: {m['target']}px; padding: 0; font-size: {m['heading']}px; font-weight: 700;
+}}
+
+/* The buttons that belong to a message — its ⋯ and its version pager. Square
+   and target-sized rather than the wide ones the rest of the window uses: they
+   sit against a bubble, and a full-width button beside a short message is the
+   loudest thing in the transcript. */
+QPushButton#bubbleAction {{
+    min-width: {m['stepper']}px; max-width: {m['stepper']}px;
+    min-height: {m['target']}px; padding: 0; font-size: {m['label']}px;
 }}
 
 QCheckBox {{ min-height: {m['target']}px; spacing: {m['gap']}px; }}
@@ -154,6 +177,28 @@ QScrollBar::handle:horizontal {{ min-width: {m['grip']}px; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 
+/* Chat bubbles. The two sides are told apart by the edge they sit on and by
+   weight, never by hue: the one colour in this window is the primary action,
+   and a transcript that competes with it makes that button harder to find
+   rather than easier. Grey at two alphas reads on a light window and a dark
+   one alike, and the corner nearest the speaker is squared off — the tail,
+   without drawing one. */
+QFrame#bubbleYou, QFrame#bubbleThem {{
+    border-radius: {m['bubble']}px;
+    border: 1px solid rgba(128, 128, 128, 0.30);
+}}
+QFrame#bubbleYou {{
+    background: rgba(128, 128, 128, 0.26);
+    border-bottom-right-radius: {round(m['bubble'] / 4)}px;
+}}
+QFrame#bubbleThem {{
+    background: rgba(128, 128, 128, 0.11);
+    border-bottom-left-radius: {round(m['bubble'] / 4)}px;
+}}
+/* The label inside a bubble draws no background of its own, or it paints a
+   rectangle over the rounded corners it sits in. */
+QFrame#bubbleYou QLabel, QFrame#bubbleThem QLabel {{ background: transparent; }}
+
 QSplitter::handle {{ background: rgba(128, 128, 128, 0.35); }}
 QSplitter::handle:horizontal {{ width: {m['pad']}px; }}
 QSplitter::handle:vertical {{ height: {m['pad']}px; }}
@@ -190,6 +235,24 @@ def flickable(widget: QAbstractScrollArea) -> QAbstractScrollArea:
         widget.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         widget.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
     return widget
+
+
+def labelled(caption: str, widget: QWidget) -> QWidget:
+    """A control with its caption above it rather than beside it.
+
+    Above, because that leaves the control the whole width of its column, and
+    the width of a control is half of what makes it hittable.
+    """
+    holder = QWidget()
+    column = QVBoxLayout(holder)
+    column.setContentsMargins(0, 0, 0, 0)
+    column.setSpacing(2)
+    label = QLabel(caption)
+    label.setObjectName("fieldLabel")
+    label.setBuddy(widget)
+    column.addWidget(label)
+    column.addWidget(widget)
+    return holder
 
 
 def stepper(box: QAbstractSpinBox) -> QWidget:

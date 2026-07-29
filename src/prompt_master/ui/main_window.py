@@ -3,9 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QActionGroup
-from PySide6.QtWidgets import (QApplication,QCheckBox,QComboBox,QFileDialog,QFrame,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QMainWindow,QMessageBox,QPlainTextEdit,QPushButton,QScrollArea,QSizePolicy,QSlider,QSpinBox,QDoubleSpinBox,QSplitter,QTextEdit,QVBoxLayout,QWidget)
+from PySide6.QtWidgets import (QApplication,QCheckBox,QComboBox,QFileDialog,QFrame,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QMainWindow,QMessageBox,QPlainTextEdit,QProgressDialog,QPushButton,QScrollArea,QSizePolicy,QSlider,QSpinBox,QDoubleSpinBox,QSplitter,QStackedWidget,QTextEdit,QVBoxLayout,QWidget)
 import threading
 
+from prompt_master.core.config import atomic_write_json, read_json
 from prompt_master.core.models import RANDOM_SEED, PromptRequest, draw_seed
 from prompt_master.imaging.preprocess import image_data_url
 from prompt_master.prompt_engine import motion
@@ -13,9 +14,19 @@ from prompt_master.prompt_engine import speech
 from prompt_master.prompt_engine import options as opt
 from prompt_master.prompt_engine.adapter import PromptEngine, VisionUnavailable
 from prompt_master.core.paths import AppPaths
+from prompt_master.inference.device_detection import describe, detect_cpu, detect_devices, vram_shortfall_mb
 from prompt_master.inference.service import InferenceService
+from prompt_master.provisioning import installer
 from prompt_master.ui import touch
+from prompt_master.ui.chat_page import ChatPage
 from prompt_master.ui.setup_wizard import SetupWizard
+
+# The two things this application does, and the order they appear in the mode
+# drop-down. Prompt mode is first because it is what the app was, and what an
+# install that has no characters yet can do.
+PROMPT_MODE = "prompt"
+CONVERSATION_MODE = "conversation"
+MODES = ((PROMPT_MODE, "Prompt mode"), (CONVERSATION_MODE, "Conversation mode"))
 
 
 class GenerationWorker(QObject):
@@ -89,27 +100,169 @@ class MainWindow(QMainWindow):
     Sizes come from ``ui.touch``: every target is at least a fingertip tall, and
     the scale that multiplies them is a menu item, since a tablet held at arm's
     length and a desk monitor do not agree on how big "big enough" is.
+
+    The window holds two of these pages, chosen by the drop-down along the top:
+    prompt mode, described above, and conversation mode. They share the window,
+    the display size and the one llama-server the application runs, and nothing
+    else — a chat cannot reach the prompt engine, which is what keeps the engine
+    the byte-for-byte copy of upstream that ``PARITY_REPORT.md`` says it is.
     """
 
     def __init__(self, paths: AppPaths | None = None):
-        super().__init__(); self.paths = paths or AppPaths.discover(); self.service = InferenceService(self.paths); self.thread = None; self.setWindowTitle("Prompt Master Standalone"); self.image_path: Path | None = None; self.engine = PromptEngine()
+        super().__init__(); self.paths = paths or AppPaths.discover(); self.service = InferenceService(self.paths); self.thread = None; self.setWindowTitle("Prompt Master Standalone"); self.image_path: Path | None = None; self.engine = PromptEngine(); self.devices = None
+        self.pages=QStackedWidget(); self.pages.addWidget(self.prompt_page())
+        # The service is handed over as a callable rather than as itself: re-running
+        # setup replaces it, and the chat page must talk to the one running now.
+        self.chat=ChatPage(self.paths, lambda: self.service, self); self.pages.addWidget(self.chat)
+        # After the pages, because the View menu switches parts of one of them on
+        # and off and reads their current state to check its own boxes.
         self.build_menus()
-        splitter=QSplitter(Qt.Orientation.Horizontal); splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self.compose_pane()); splitter.addWidget(self.output_pane())
-        splitter.setStretchFactor(0,4); splitter.setStretchFactor(1,5)
-        central=QWidget(); page=QVBoxLayout(central); page.addWidget(splitter,1); page.addLayout(self.action_bar())
+        central=QWidget(); page=QVBoxLayout(central); page.addWidget(self.pages,1)
         self.setCentralWidget(central)
         self.apply_scale(touch.load_scale(self.paths), remember=False)
+        self.select_mode(self.remembered_mode(), remember=False)
         self.fill_screen(); self.refresh_status()
 
     # ── layout ───────────────────────────────────────────────────────────────
 
+    def prompt_page(self) -> QWidget:
+        """Everything prompt mode is: the two panes, and the bar under them."""
+        splitter=QSplitter(Qt.Orientation.Horizontal); splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self.compose_pane()); splitter.addWidget(self.output_pane())
+        splitter.setStretchFactor(0,4); splitter.setStretchFactor(1,5)
+        page=QWidget(); column=QVBoxLayout(page); column.setContentsMargins(0,0,0,0)
+        column.addWidget(splitter,1); column.addLayout(self.action_bar())
+        return page
+
+    def select_mode(self, mode: str, remember: bool = True):
+        self.pages.setCurrentIndex(1 if mode == CONVERSATION_MODE else 0)
+        for action in self.mode_actions.actions(): action.setChecked(action.data() == mode)
+        if remember:
+            settings=self.paths.data/touch.SETTINGS_FILE
+            try: current=read_json(settings)
+            except (OSError,ValueError): current={}
+            try: atomic_write_json(settings,{**current,"mode":mode})
+            except OSError: pass                      # remembering is a convenience
+
+    # ── what runs the model ──────────────────────────────────────────────────
+
+    def populate_devices(self, rescan: bool = False):
+        """The same devices setup offers, on a menu, with the current one ticked.
+
+        Rebuilt every time the menu opens so the tick follows the state file,
+        and scanned once per session unless the rescan item asks again — a card
+        does not appear in a machine while the application is running, but a
+        driver that was asleep during the first scan can wake up.
+        """
+        if self.devices is None or rescan:
+            try: self.devices=detect_devices()
+            except Exception: self.devices=[detect_cpu()]
+        state=self.setup_state(); self.device_menu.clear(); self.device_actions=QActionGroup(self); self.device_actions.setExclusive(True)
+        for device in self.devices:
+            action=self.device_menu.addAction(describe(device)); action.setCheckable(True); action.setData(device)
+            action.setChecked(self.running_device(device,state)); self.device_actions.addAction(action)
+            action.triggered.connect(lambda _checked=False,chosen=device: self.choose_device(chosen))
+        self.device_menu.addSeparator(); self.device_menu.addAction("Rescan for devices").triggered.connect(lambda: self.populate_devices(True))
+
+    def setup_state(self) -> dict:
+        try: return read_json(self.paths.state_file)
+        except (OSError,ValueError): return {}
+
+    @staticmethod
+    def running_device(device, state) -> bool:
+        """Whether this is the device the state file already names."""
+        from prompt_master.core.models import GPU_MODE
+        return (state.get("mode",GPU_MODE) == device.mode
+                and str(state.get("gpu_index")) == str(device.physical_index))
+
+    def choose_device(self, device):
+        """Change what runs the model, keeping the model that is installed."""
+        state=self.setup_state()
+        if self.running_device(device,state): return
+        if self.busy():
+            QMessageBox.information(self,"Still generating","Wait for the current generation to finish, or press Stop, before changing what runs the model.")
+            self.populate_devices(); return
+        if QMessageBox.question(self,"Change what runs the model",self.switch_warning(device,state)) != QMessageBox.StandardButton.Yes:
+            self.populate_devices(); return
+        try: self.switch_device(device)
+        except Exception as exc:
+            QMessageBox.critical(self,"Could not change device",str(exc)); self.populate_devices(); return
+        # Unloaded rather than restarted: the next generation starts the server
+        # it needs, and reading 16-27 GiB back in is not something to do because
+        # a menu was used.
+        self.service.stop()
+        note=f"Now running on {device.name} — the model loads again on your next generation."
+        self.refresh_status(note); self.chat.set_status(note)
+
+    def switch_warning(self, device, state) -> str:
+        lines=[describe(device),"",
+               "The model is unloaded now and loads again on your next generation. It is 16-27 GiB, so that takes a little while."]
+        if not installer.runtime_ready(self.paths,device):
+            verb="unpacked from the download cache" if installer.runtime_downloaded(self.paths,device) else "downloaded"
+            lines.append(f"The llama.cpp build this device needs is not in place yet and will be {verb} first. The model and the projector stay where they are and are not downloaded again.")
+        quantization=state.get("quantization")
+        if quantization:
+            try: shortfall=vram_shortfall_mb(device,quantization)
+            except ValueError: shortfall=0
+            if shortfall: lines.append(f"Warning: the installed {quantization} model wants roughly {shortfall} MiB more VRAM than this card reports. It will still run, but llama.cpp will spill layers into system RAM and generation will be slow — mixed mode is the other answer to that.")
+        lines.append(""); lines.append("Change it?")
+        return "\n".join(lines)
+
+    def switch_device(self, device):
+        """Run the switch behind a progress dialog. Raises what it is given."""
+        dialog=QProgressDialog("Preparing…","",0,100,self); dialog.setWindowTitle("Changing what runs the model")
+        # No cancel: the only slow step is a download that resumes anyway, and a
+        # half-applied switch is worse than waiting for a short one.
+        dialog.setCancelButton(None); dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setMinimumDuration(0); dialog.setAutoClose(False); dialog.setValue(0)
+        def status(text): dialog.setLabelText(text); QApplication.processEvents()
+        def progress(fraction): dialog.setValue(int(max(0.0,min(1.0,fraction))*100)); QApplication.processEvents()
+        try: installer.switch_device(self.paths,device,on_status=status,on_progress=progress)
+        finally: dialog.close()
+
+    def unload_model(self):
+        """Give the memory back now, rather than when the application closes."""
+        if self.busy():
+            QMessageBox.information(self,"Still generating","Wait for the current generation to finish, or press Stop, before unloading the model."); return
+        was_running=self.service.process.running
+        self.service.stop()
+        note=("Model unloaded — it loads again on your next generation." if was_running
+              else "No model was loaded.")
+        self.refresh_status(note); self.chat.set_status(note)
+
+    def busy(self) -> bool:
+        """Whether either page is mid-generation."""
+        return bool(self.thread and self.thread.isRunning()) or self.chat.busy()
+
+    def remembered_mode(self) -> str:
+        try: mode=read_json(self.paths.data/touch.SETTINGS_FILE).get("mode")
+        except (OSError,ValueError): return PROMPT_MODE
+        return mode if mode in (PROMPT_MODE,CONVERSATION_MODE) else PROMPT_MODE
+
     def build_menus(self):
-        settings_menu=self.menuBar().addMenu("Settings"); settings_menu.addAction("Models and Hardware…").triggered.connect(self.open_setup)
+        """Settings chooses what the window is doing; View, how much of it shows."""
+        settings_menu=self.menuBar().addMenu("Settings")
+        modes=settings_menu.addMenu("Mode"); self.mode_actions=QActionGroup(self); self.mode_actions.setExclusive(True)
+        for value,label in MODES:
+            action=modes.addAction(label); action.setCheckable(True); action.setData(value); self.mode_actions.addAction(action)
+            action.triggered.connect(lambda _checked=False,chosen=value: self.select_mode(chosen))
+        settings_menu.addSeparator()
+        # Filled in when it is opened rather than now: listing devices runs
+        # nvidia-smi, which is not something to do on the way to a window.
+        self.device_menu=settings_menu.addMenu("What runs the model"); self.device_menu.aboutToShow.connect(self.populate_devices)
+        settings_menu.addAction("Unload the model from memory").triggered.connect(self.unload_model)
+        settings_menu.addSeparator(); settings_menu.addAction("Models and Hardware…").triggered.connect(self.open_setup)
         view_menu=self.menuBar().addMenu("View"); sizes=view_menu.addMenu("Display size"); self.size_actions=QActionGroup(self); self.size_actions.setExclusive(True)
         for name in touch.SCALES:
             action=sizes.addAction(name); action.setCheckable(True); action.setData(name); self.size_actions.addAction(action)
             action.triggered.connect(lambda _checked=False,chosen=name: self.apply_scale(chosen))
+        # The rows of conversation mode that are worth the screen only while
+        # they are being used. Ticked from what the chat page last remembered.
+        conversation=view_menu.addMenu("Conversation"); self.bar_actions={}
+        for key,label in ChatPage.BARS:
+            action=conversation.addAction(label); action.setCheckable(True); action.setChecked(self.chat.bar_visible(key)); action.setData(key)
+            action.toggled.connect(lambda shown,chosen=key: self.chat.show_bar(chosen,shown))
+            self.bar_actions[key]=action
 
     def compose_pane(self) -> QWidget:
         """Intent and image stay put; the settings under them scroll."""
@@ -218,11 +371,7 @@ class MainWindow(QMainWindow):
     def field(caption, widget) -> QWidget:
         """Caption above its control, not beside it: the control gets the whole
         column width, which is what makes it wide enough to hit."""
-        if caption is None: return widget
-        holder=QWidget(); column=QVBoxLayout(holder); column.setContentsMargins(0,0,0,0); column.setSpacing(2)
-        label=QLabel(caption); label.setObjectName("fieldLabel"); label.setBuddy(widget)
-        column.addWidget(label); column.addWidget(widget)
-        return holder
+        return widget if caption is None else touch.labelled(caption,widget)
 
     def output_pane(self) -> QWidget:
         """The finished prompts. QTextEdit rather than QPlainTextEdit for these
@@ -275,6 +424,9 @@ class MainWindow(QMainWindow):
         for edit in (self.positive,self.negative): edit.setMinimumHeight(m["target"]*3)
         self.generate_button.setMinimumWidth(m["target"]*4)
         for box in self.findChildren(QComboBox): box.setMaxVisibleItems(8)
+        # Conversation mode is sized by the same choice; it holds the numbers
+        # itself because a bubble's picture and avatar are measured from them.
+        if hasattr(self,"chat"): self.chat.apply_metrics(m)
         if remember: touch.save_scale(self.paths,name)
 
     def fill_screen(self):
@@ -389,21 +541,21 @@ class MainWindow(QMainWindow):
         filename,_=QFileDialog.getSaveFileName(self,"Save prompts","prompts.txt","Text (*.txt)")
         if filename: Path(filename).write_text(f"POSITIVE\n{self.positive.toPlainText()}\n\nNEGATIVE\n{self.negative.toPlainText()}\n",encoding="utf-8")
     def clear(self): self.intent.clear(); self.positive.clear(); self.negative.clear(); self.remove_image()
-    def refresh_status(self):
-        from prompt_master.core.config import read_json
+    def refresh_status(self, note: str = ""):
         from prompt_master.core.models import GPU_MODE
-        state=read_json(self.paths.data/"setup-state.json")
+        state=self.setup_state()
         # The mode is named unless the card simply holds the model, which is
         # what a device name on its own has always meant. An install predating
         # the setting records none, and reads as that same default.
         device=state.get('gpu_device_name',state.get('gpu_name','not configured'))
         mode=state.get('mode',GPU_MODE)
         if mode != GPU_MODE: device=f"{device} ({mode})"
-        self.status.setText(f"Device: {device} · Model: {state.get('quantization','not configured')} · Server: {'running' if self.service.process.running else 'stopped'} · Generation: idle")
+        self.status.setText(f"Device: {device} · Model: {state.get('quantization','not configured')} · Server: {'running' if self.service.process.running else 'stopped'} · Generation: idle"
+                            + (f" · {note}" if note else ""))
     def open_setup(self):
         self.service.stop(); wizard=SetupWizard(self.paths,self)
         if wizard.exec() and wizard.completed:
-            self.paths=wizard.paths; self.service=InferenceService(self.paths); self.refresh_status()
+            self.paths=wizard.paths; self.service=InferenceService(self.paths); self.chat.rebind(self.paths); self.refresh_status()
     def closeEvent(self,event):
         if self.thread and self.thread.isRunning(): self.thread.quit(); self.thread.wait(3000)
-        self.service.stop(); event.accept()
+        self.chat.shutdown(); self.service.stop(); event.accept()

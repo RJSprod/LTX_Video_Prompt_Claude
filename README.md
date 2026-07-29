@@ -126,6 +126,20 @@ with a card in mixed mode — with `--gpu`, or the first card without it.
 
 ## Using it
 
+**Settings → Mode** chooses what the application is doing:
+
+| Mode | What it is |
+| --- | --- |
+| **Prompt mode** | Everything below — an intent in, an LTX-Video 2.3 positive and negative prompt out. This is what the packaged build does, unchanged. |
+| **Conversation mode** | A chat with a character you wrote, on the same local model. See [Conversation mode](#conversation-mode). |
+
+The two share the window, the display size and the one `llama-server` the
+application runs, and nothing else: a conversation cannot reach the prompt
+engine, which is what keeps the engine byte-identical to upstream. The mode is
+remembered, so the application reopens on the one you were using.
+
+### Prompt mode
+
 Type what you want in **Intent**, set whichever controls matter, and press
 **Generate**. The positive prompt streams in as the model writes it; the
 negative prompt is assembled from the engine's gated banks and, if **Smart
@@ -203,11 +217,159 @@ status, Clear, Cancel and Generate never scrolls at all.
   drop-down row is at least 48 logical pixels tall, and spin boxes get a full
   height `−` and `+` either side of the value — hold either one to run it up —
   in place of Qt's two stacked arrows, which are half that.
-- **View → Display size** switches between Comfortable, Large and Larger. It
-  restyles the window live, applies to the setup wizard too, and is remembered.
+- **View → Display size** switches between Smaller, Small, Comfortable, Large
+  and Larger. It restyles the window live, applies to the setup wizard too, and
+  is remembered.
+
+  Comfortable and up keep every target at a fingertip or more. **Small** and
+  **Smaller** deliberately go under that floor — 41 and 35 logical pixels
+  against the 48 a fingertip wants — because prompt mode has a great many
+  controls and a large monitor with a mouse on it is a real way to use this.
+  Everything scales together, so nothing overlaps or clips; it only gets small,
+  and a finger will start to miss things at Smaller. Neither is ever a default.
 
 The window opens on most of the screen rather than at a fixed size, and the
 divider between the two panes can be dragged to give either one more room.
+
+### Changing what runs the model, and giving the memory back
+
+**Settings → What runs the model** lists the same devices setup offers — every
+CUDA card twice, once holding the model and once in mixed mode, and your
+processor — with the one in use ticked. See
+[the three ways to run it](#the-three-ways-to-run-it). Picking another one says
+what it will do and what it costs before it does anything:
+
+- **the model is not downloaded again.** It is 16–27 GiB already on disk and it
+  is the same file whichever device runs it. Only the llama.cpp build changes,
+  and only when the new device needs a different one — a card and the same card
+  in mixed mode share theirs, so that switch touches nothing on disk. When a
+  build *is* needed it is fetched against the same pinned SHA-256 setup uses,
+  or unpacked from the download cache if it has been fetched before;
+- **the model is unloaded now and loads again on your next generation**, which
+  takes a little while at that size. Nothing reloads until you ask for
+  something;
+- if the installed quantization wants more VRAM than the card you picked
+  reports, it says so and by how much — the same warning setup gives, with the
+  same answer: mixed mode.
+
+A device cannot be changed while a generation or a reply is running. It says so
+rather than interrupting one; wait for it, or press Stop.
+
+Model quality stays in **Models and Hardware**, because changing it means
+downloading a different 16–27 GiB file and that belongs in the wizard that
+shows the size and the progress.
+
+**Settings → Unload the model from memory** hands the VRAM or system RAM back
+now instead of when the application closes — for giving a card to something
+else without quitting. The next generation starts the server again by itself.
+
+## Conversation mode
+
+The second thing the drop-down offers: a chat with a character, on the model
+already installed. It is [oobabooga](https://github.com/oobabooga/textgen)'s
+chat tab and character editor, in the same file format, laid out for a finger.
+
+### Characters
+
+**Characters…** opens the editor: the list of characters down one side, and the
+four fields that make one down the other.
+
+| Field | What it is |
+| --- | --- |
+| **Name** | What the character is called, and the name on their replies. |
+| **Picture** | Optional. Shown beside every reply, and in the character list. |
+| **Context** | Who they are — personality, background, how they speak. This is what the model is told before the first line. |
+| **Greeting** | The first thing they say. Every new chat opens on it. |
+
+`{{char}}` and `{{user}}` in either text box are replaced with the character's
+name and yours; `<BOT>` and `<USER>` work too, because characters written for
+other front ends use them.
+
+Characters are YAML files in `user_data/characters/`, with the picture beside
+each one as `<name>.png` — oobabooga's own layout, so a folder copied from a
+text-generation-webui install works here as it stands, and one written here
+works there. **Import…** takes the three shapes a character comes in:
+
+- a `.yaml` character;
+- a `.json` character, TavernAI's fields included;
+- a `.png` **character card** — the JSON embedded in the image, as TavernAI and
+  SillyTavern write it. The card is also the character's picture.
+
+Cards carry fields this editor has no box for — personality, scenario, example
+dialogue. They are folded into the context under headings rather than dropped.
+
+### Yourself
+
+**You…** is optional, and empty by default: characters reply to an unnamed
+"you", which is what a chat with no persona has always been. Fill in a name and
+a description and both go into the system prompt, so the character knows what to
+call you and can use what you told it. It is one persona for every character,
+stored in `data/persona.json`.
+
+### The chat
+
+Type, and press **Send** or Ctrl+Enter. The reply streams in as it is written,
+and **Stop** ends it early, keeping what had arrived.
+
+The transcript is bubbles on their own sides — yours to the right, theirs to
+the left with their picture beside the first reply of each run — and no names
+over anything, because the side a message is on is what says who said it. A
+bubble is as wide as its words and no wider, up to about three-quarters of the
+transcript.
+
+**It follows the newest message until you leave it.** Scroll up to read
+something and it stops chasing what arrives; scroll back to the bottom and it
+starts again. Sending a message, opening a chat and starting one all count as
+going back to the end.
+
+**View → Conversation** hides any of the three rows around the transcript —
+the *Talking to* bar, the *Chat* bar and the quick actions — one at a time and
+independently. On a small screen a chat that has been set up is mostly
+transcript, and the two drop-downs only matter while they are being changed.
+What you hide is remembered.
+
+Under the transcript are the four things done between messages — **Regenerate**,
+**Continue**, **Impersonate** (the model writes your next message into the box
+for you to edit), and **Remove last**, which takes back the last exchange and
+puts your message back where you typed it.
+
+**Tap a message** to reveal a **⋯** on it — the touch equivalent of a
+long-press, and where the rest of what can be done to that message lives.
+Tapping it again puts it away, dragging still scrolls, and dragging across
+words still selects them:
+
+| Action | What it does |
+| --- | --- |
+| **Edit** | Rewrite anything either of you said, in place. |
+| **Regenerate** | Write that reply again — see below. |
+| **Continue** | Carry the last reply on from where it stopped. |
+| **Send again from here** | Answer one of your messages again, dropping what followed. |
+| **Branch from here** | Copy the chat up to that message into a new one. The chat it came from is untouched. |
+| **Delete message** / **Delete from here** | One message, or that message and everything after it. |
+| **Copy** | The message text, to the clipboard. |
+
+**Regenerating keeps the reply it replaced.** A regenerated message grows a
+`◀ 2/3 ▶` pager — the one thing shown without a tap, because it is what says an
+earlier attempt is still there — and paging back to it is how a regenerate that
+came back worse is undone. **Delete this version** drops just the one showing.
+
+**Past chats** are the drop-down at the top: every conversation with that
+character, newest first, named after the first thing you said in it and
+renameable. Each is a JSON file under `user_data/chats/<character>/`.
+
+**Attach…** sends a picture with your message — the same preprocessing prompt
+mode uses, and the same vision projector. Older pictures drop out of the
+context as the conversation grows, and the messages that carried them say so.
+
+**Settings** folds out a panel of temperature, top-p, reply length, seed and a
+custom system message that replaces the built one entirely. They are saved in
+the character's own file, so each character keeps how it is talked to. A seed of
+`-1` draws a fresh one per reply, which is what makes a regenerate come back
+different.
+
+The conversation is trimmed from the front to fit the context window
+`llama-server` was started with. The character survives a long chat; the
+beginning of the chat does not.
 
 ## Requirements
 
@@ -253,7 +415,10 @@ What changed, and only this:
 | Running without a card | Not possible | The processor and system RAM are an option in both front ends, on the pinned CPU build of `llama.cpp` |
 | Running with a card too small for the model | Not possible | Mixed mode: same CUDA install, weights in system RAM, nothing resident on the card, which keeps the work `llama.cpp` can give it |
 | Where the model comes from | Downloaded, always | Downloaded, or installed from a `.gguf` you already have — against the same pinned SHA-256 |
-| Window | One column of mouse-sized controls | Two panes, fingertip-sized targets, drag-to-scroll, a display-size setting |
+| Window | One column of mouse-sized controls | Two panes, fingertip-sized targets, drag-to-scroll, five display sizes from Smaller to Larger |
+| Changing device | Re-run setup | That, or Settings → What runs the model, which swaps the llama.cpp build and keeps the model that is installed |
+| Freeing the memory | Close the application | That, or Settings → Unload the model from memory |
+| What the window does | Writes prompts | That, or — on Settings → Mode — a chat with characters you write or import, on the same model |
 | Motion | One way of writing it | Default is that way exactly; **Inertia** and **Flow** are opt-in |
 | Seed | A number | A number, or `-1` for a fresh one each generation |
 | Speech | Whatever the intent quotes | That, or up to 10× more written in the same voice — opt-in |
@@ -279,22 +444,34 @@ nothing else — the file is checked against the same pinned hash a download is,
 and lands at the same path, so everything downstream of setup cannot tell the
 two apart.
 
+Conversation mode adds no fifth change, because it is not on the path a prompt
+takes. It imports nothing from `prompt_engine`, writes its own system message
+from the character and the persona, and reaches the model through the same
+`InferenceService` and `LlamaClient` prompt mode uses. A prompt generated with
+the mode drop-down set either way is the same prompt.
+
 ## Tests
 
 ```
-python -m pytest tests/        # 588 passed
+python -m pytest tests/        # 701 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
 - `test_prompt_engine.py` (44) — the adapter seam, the motion presets, speech
   expansion and the UI option sources
-- `test_touch_ui.py` (16) — target sizes, drag-to-scroll, the sliders and the
-  display size, measured on a real window built offscreen
+- `test_touch_ui.py` (59) — target sizes, drag-to-scroll, the sliders and the
+  five display sizes, the menu-bar mode switch and the View toggles, the
+  runtime device menu and unloading, the transcript's layout and its sticky
+  bottom, and conversation mode driven end to end against a scripted server,
+  measured on a real window built offscreen
+- `test_chat.py` (36) — the character format and its three imports, chat
+  history and branching, and what a chat turn puts on the wire
 - `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
   download resume and retry
-- `test_install_flow.py` (107) — install-root discovery, GPU sizing, the CPU
+- `test_install_flow.py` (113) — install-root discovery, GPU sizing, the CPU
   and mixed devices, manifest resolution, console setup, supplying a model from
-  disk, and the installer's interpreter and environment checks
+  disk, changing device without re-downloading the model, and the installer's
+  interpreter and environment checks
 
 Output-level parity against an upstream checkout is checked separately:
 
@@ -319,8 +496,15 @@ src/prompt_master/
   provisioning/installer.py  Download, verify, extract, validate — one pipeline
   provisioning/importer.py   Installing a model you already have, instead
   inference/               llama-server process, streaming client, GPU detection
-  ui/                      Main window and the Qt setup wizard
+  chat/                    Conversation mode, below the window
+  chat/characters.py       Characters in oobabooga's format, and the persona
+  chat/history.py          Messages, their versions, branching, saved chats
+  chat/prompt.py           What one chat turn puts on the wire
+  chat/yamlish.py          The YAML subset a character file is written in
+  ui/                      Main window, chat page, character editor, setup wizard
   ui/touch.py              Fingertip sizing and drag-to-scroll, in one place
 installer_files/           Created by the installer (gitignored)
 user_data/                 Default install root (gitignored)
+  characters/              Characters and their pictures — oobabooga's layout
+  chats/                   Saved conversations, filed by character
 ```
