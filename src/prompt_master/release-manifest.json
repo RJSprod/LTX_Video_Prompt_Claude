@@ -33,6 +33,14 @@
       "version": "b9637-cuda-13.3"
     },
     {
+      "component_id": "llama-runtime-cpu",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9637/llama-b9637-bin-win-cpu-x64.zip",
+      "destination": "cache/downloads/llama-b9637-bin-win-cpu-x64.zip",
+      "size": null,
+      "sha256": "f7783c2b8c007f95e710ac40f26a24861a80b603b0b739fc54d7c926a4716c1e",
+      "version": "b9637-cpu"
+    },
+    {
       "component_id": "model-Q4_K_M",
       "url": "https://huggingface.co/HauhauCS/Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced/resolve/96c11c22b1128c3c8c655b21557b409f307c557f/Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf?download=true",
       "destination": "models/Gemma4-26B-A4B-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf",

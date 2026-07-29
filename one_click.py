@@ -13,7 +13,8 @@ always safe:
    only if the machine has none;
 2. builds an isolated environment under ``installer_files/env`` and installs the
    five runtime dependencies into it;
-3. runs the setup questions — install directory, GPU, model quantization — and
+3. runs the setup questions — install directory, what runs the model (a CUDA
+   GPU, a CUDA GPU in mixed mode, or the processor), model quantization — and
    downloads the pinned llama.cpp runtime and Gemma weights;
 4. launches the application.
 

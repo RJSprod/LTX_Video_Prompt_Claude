@@ -27,7 +27,8 @@ from prompt_master.core.config import atomic_write_json
 from prompt_master.core.models import GpuInfo, PromptRequest
 from prompt_master.core.paths import AppPaths
 from prompt_master.imaging.preprocess import image_data_url
-from prompt_master.inference.device_detection import list_llama_devices, runtime_component_id
+from prompt_master.inference.device_detection import (CPU_DEVICE, NO_OFFLOAD,
+    list_llama_devices, runtime_component_id)
 from prompt_master.provisioning.downloader import download
 from prompt_master.provisioning.extractor import extract_zips_atomic
 from prompt_master.provisioning.importer import LocalSource, adopt
@@ -58,18 +59,23 @@ def load_components() -> dict[str, Component]:
 
 
 def component_ids(gpu: GpuInfo, quantization: str) -> tuple[str, ...]:
-    """The four artifacts one install needs, in download order.
+    """The artifacts one install needs, in download order.
 
-    The llama.cpp program archive and its CUDA runtime DLLs are separate
-    releases upstream and are pinned separately here; they are combined into a
-    single runtime directory during installation.
+    Four for a GPU: the llama.cpp program archive and its CUDA runtime DLLs are
+    separate releases upstream and are pinned separately here, and they are
+    combined into a single runtime directory during installation. Three for the
+    processor, whose archive carries everything it needs and has no CUDA DLLs to
+    be paired with.
     """
     runtime = runtime_component_id(gpu)
-    return (runtime, f"{runtime}-cudart", f"model-{quantization}", "mmproj")
+    model = (f"model-{quantization}", "mmproj")
+    if gpu.is_cpu:
+        return (runtime, *model)
+    return (runtime, f"{runtime}-cudart", *model)
 
 
 def resolve(gpu: GpuInfo, quantization: str) -> list[Component]:
-    """Look the four components up, failing before any network access."""
+    """Look each component up, failing before any network access."""
     components = load_components()
     ids = component_ids(gpu, quantization)
     missing = [key for key in ids if key not in components]
@@ -188,12 +194,26 @@ def _find_server(runtime_dir: Path) -> Path:
 def write_state(paths: AppPaths, gpu: GpuInfo, quantization: str, installed: Installed, *,
                 context_size: int = DEFAULT_CONTEXT_SIZE,
                 gpu_layers: str = FULL_OFFLOAD) -> dict:
-    """Record the validated-so-far install, atomically, via a pending file."""
-    device, device_name = list_llama_devices(paths.contained(installed.runtime), gpu.physical_index)
+    """Record the validated-so-far install, atomically, via a pending file.
+
+    ``gpu_layers`` is the caller's only in GPU mode. The other two modes are
+    defined by there being no resident layers at all, so recording a count
+    beside them would be fiction and it is replaced here.
+    """
+    if gpu.is_cpu:
+        # Nothing to ask llama.cpp about either: --device none is the whole
+        # answer, and there is no CUDA device for the probe to name.
+        device, device_name, gpu_layers = CPU_DEVICE, gpu.name, NO_OFFLOAD
+    else:
+        device, device_name = list_llama_devices(paths.contained(installed.runtime),
+                                                 gpu.physical_index)
+        if gpu.is_mixed:
+            gpu_layers = NO_OFFLOAD
     state = {
         "runtime": installed.runtime,
         "model": installed.model,
         "mmproj": installed.mmproj,
+        "mode": gpu.mode,
         "gpu_index": gpu.physical_index,
         "gpu_uuid": gpu.uuid,
         "gpu_name": gpu.name,

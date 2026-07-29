@@ -6,15 +6,24 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout
     QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWizard, QWizardPage)
 
 from prompt_master.core.paths import AppPaths
-from prompt_master.inference.device_detection import (QUANTIZATIONS, detect_gpus,
+from prompt_master.inference.device_detection import (QUANTIZATIONS, detect_cpu, detect_devices,
     recommended_quantization, vram_shortfall_mb)
 from prompt_master.provisioning import importer, installer, verifier
+
+# Said on the model page when the model will be kept in system RAM. A
+# disclaimer, not a warning: neither mode is sized against a memory figure, so
+# there is no threshold here to be under and nothing to caution about.
+CPU_NOTE = ("This install runs on the processor and system RAM. No NVIDIA GPU or driver is "
+            "used, and none is required.")
+MIXED_NOTE = ("This install loads the model into system RAM and uses {name} for the work "
+              "llama.cpp can hand it — prompt processing and image encoding — so only a small "
+              "amount of VRAM is held.")
 
 
 class SetupWizard(QWizard):
     """Provision and validate a complete local runtime; no state is saved early.
 
-    The questions asked here — directory, GPU, quantization, and whether the
+    The questions asked here — directory, device, quantization, and whether the
     model is already on this machine — are the same ones the console installer
     asks, and both hand off to ``provisioning.installer`` for everything after
     the last answer, so the two front ends cannot provision differently.
@@ -32,7 +41,7 @@ class SetupWizard(QWizard):
         row=QHBoxLayout(); self.location=QLineEdit(str(self.paths.root)); choose=QPushButton("Browse…"); choose.clicked.connect(self._browse); row.addWidget(self.location); row.addWidget(choose); layout.addLayout(row); self.addPage(page)
 
     def _hardware_page(self):
-        page=QWizardPage(); page.setTitle("GPU selection"); layout=QVBoxLayout(page)
+        page=QWizardPage(); page.setTitle("What should run the model"); layout=QVBoxLayout(page)
         self.hardware_status=QLabel("Open this page to scan with nvidia-smi."); self.hardware_status.setWordWrap(True)
         self.gpu=QComboBox(); layout.addWidget(self.hardware_status); layout.addWidget(self.gpu); self.addPage(page)
 
@@ -64,25 +73,53 @@ class SetupWizard(QWizard):
 
     def _page_changed(self,index):
         if index == 1:
+            # The processor is always in the list and always last, so a machine
+            # with no NVIDIA driver still has something to select. A scan that
+            # fails outright leaves it as the only entry rather than an empty
+            # page, which is exactly what such a machine would have chosen.
             self.gpu.clear()
-            try: self.gpus=detect_gpus()
-            except Exception as exc: self.gpus=[]; self.hardware_status.setText(f"GPU scan failed: {exc}"); return
-            for gpu in self.gpus: self.gpu.addItem(f"{gpu.name} — {gpu.memory_total_mb} MiB — {gpu.uuid}",gpu)
-            self.hardware_status.setText(
-                f"Found {len(self.gpus)} CUDA GPU(s)." if self.gpus
-                else "No CUDA GPU found. This application requires an NVIDIA GPU.")
+            try: self.gpus=detect_devices()
+            except Exception as exc: self.gpus=[detect_cpu()]; self.hardware_status.setText(f"GPU scan failed: {exc}\nThe processor is still available.")
+            else: self.hardware_status.setText(self._hardware_summary())
+            for gpu in self.gpus: self.gpu.addItem(self._device_label(gpu),gpu)
         elif index == 2 and self.gpu.currentData():
             self.quant.setCurrentText(recommended_quantization(self.gpu.currentData())); self._describe_quant()
+
+    def _hardware_summary(self):
+        cards=[gpu for gpu in self.gpus if not (gpu.is_cpu or gpu.is_mixed)]
+        if cards: return (f"Found {len(cards)} CUDA GPU(s), each offered two ways: holding the model in "
+                          "its own memory, or in mixed mode, where the model is loaded into system RAM "
+                          "and the card is used for the work llama.cpp can hand it. The processor is "
+                          "offered too.")
+        return "No CUDA GPU found. This install will run on the processor and system RAM."
+
+    @staticmethod
+    def _device_label(device):
+        if device.is_cpu: return f"{device.name} — {device.memory_total_mb} MiB of system RAM — no GPU used"
+        if device.is_mixed: return f"{device.name} — mixed: model in system RAM, card used for processing"
+        return f"{device.name} — {device.memory_total_mb} MiB — {device.uuid}"
 
     def _describe_quant(self,*_):
         """Recommendation, download size and the VRAM warning, together.
 
         The warning is shown rather than enforced: a card below the threshold
         still installs and runs, it just spills layers to system RAM, and that
-        trade is the user's to make."""
+        trade is the user's to make — and mixed mode is the other answer to it.
+        With the weights in system RAM there is no threshold to be below, so
+        what is shown there is a disclaimer and not a warning."""
         gpu=self.gpu.currentData()
         if gpu is None: return
         quant=self.quant.currentText()
+        if gpu.weights_in_system_ram:
+            # The weights are not in VRAM, so there is nothing to measure a
+            # shortfall against: the download is the only thing that differs
+            # between the three here.
+            note=CPU_NOTE if gpu.is_cpu else MIXED_NOTE.format(name=gpu.name)
+            where="" if gpu.is_cpu else " in mixed mode"
+            self.recommendation.setText("\n".join([
+                f"Recommended for {gpu.name}{where}: {recommended_quantization(gpu)}",
+                f"Download: {installer.format_download_size(gpu,quant)}.", note]))
+            return
         lines=[f"Recommended for {gpu.name} ({gpu.memory_total_mb} MiB): {recommended_quantization(gpu)}",
                f"Download: {installer.format_download_size(gpu,quant)}."]
         shortfall=vram_shortfall_mb(gpu,quant)
@@ -96,7 +133,7 @@ class SetupWizard(QWizard):
             except OSError as exc: QMessageBox.critical(self,"Invalid directory",str(exc)); return False
             self.paths=AppPaths(root); self.paths.create_managed_dirs()
         elif self.currentId() == 1 and not self.gpu.currentData():
-            QMessageBox.critical(self,"No GPU selected","Select an NVIDIA GPU. nvidia-smi reported none."); return False
+            QMessageBox.critical(self,"Nothing selected","Select a CUDA GPU, or the processor."); return False
         elif self.currentId() == 2:
             try: self.sources=self._vet_model_file()
             except Exception as exc: QMessageBox.critical(self,"Model file",str(exc)); return False

@@ -36,9 +36,29 @@ Re-running it is always safe — every step it has already done is skipped.
 | Question | What it decides |
 | --- | --- |
 | **Installation directory** | Where the runtime, model, projector, cache and logs live. The model alone is 16–27 GiB, so this can be a different drive from the checkout. |
-| **Which GPU** | Which card runs the model, and which pinned `llama.cpp` build gets downloaded — CUDA 12 or CUDA 13, chosen by compute capability. Skipped if you only have one. |
-| **Model quality** | `Q4_K_M`, `Q6_K_P` or `Q8_K_P`. The default is sized from your VRAM, and each option shows its download size and whether it fits. |
+| **What runs the model** | Every CUDA card on the machine — twice, once each way (see below) — and your processor. A card decides which pinned `llama.cpp` build gets downloaded, CUDA 12 or CUDA 13 by compute capability; the processor gets the CPU build. |
+| **Model quality** | `Q4_K_M`, `Q6_K_P` or `Q8_K_P`. On a card holding the model the default is sized from your VRAM and each option shows its download size and whether it fits; when the model goes to system RAM the default is `Q4_K_M` and each option shows its download size. |
 | **A model you already have** | Optional. Point setup at a `.gguf` already on disk and it is installed from there instead of downloaded — see below. Answer no and everything downloads as before. |
+
+### The three ways to run it
+
+Every card is offered twice, and the processor once:
+
+| Choice | Where the model sits | What the card does | VRAM held |
+| --- | --- | --- | --- |
+| **A card** | In its VRAM | Everything | The whole model, 16–27 GiB |
+| **The same card, mixed** | System RAM | The work `llama.cpp` can hand it — large-batch matrix multiplies during prompt processing, and the vision projector | A small working set, roughly 1–2 GiB |
+| **Your processor** | System RAM | Nothing; no NVIDIA driver is needed | None |
+
+Mixed mode is the answer to a card that cannot hold its quantization: nothing
+is resident on it (`--n-gpu-layers 0`), but it is still the device `llama.cpp`
+is pointed at, so it keeps taking the work it can. Token-by-token generation
+runs on the processor in both system-RAM modes — what the card adds is prompt
+processing and image encoding.
+
+The choice is not permanent. `python app.py --setup` re-asks it, and only the
+runtime is re-downloaded if the answer moves between a card and the processor —
+the model and projector are already on disk.
 
 ### Using a model you already have
 
@@ -83,7 +103,7 @@ there is nothing to activate first.
 | Command | Effect |
 | --- | --- |
 | `python app.py` | Open the application |
-| `python app.py --setup` | Re-run the questions — change GPU, model or directory |
+| `python app.py --setup` | Re-run the questions — change device, model or directory |
 | `python app.py --version` | Print the version |
 | `cmd_windows.bat` | Open a shell with the environment active, for `pytest` |
 | `update_windows.bat` | Reinstall dependencies after pulling a new version |
@@ -92,13 +112,17 @@ For an unattended reinstall, every question has a flag:
 
 ```
 python app.py --setup --dir D:\PromptMaster --gpu 0 --quant Q6_K_P --yes
+python app.py --setup --gpu 0 --mixed --quant Q4_K_M --yes
+python app.py --setup --cpu --quant Q4_K_M --yes
 ```
 
 `--model-file` and `--mmproj-file` install those from disk instead of
 downloading them; a file that is not the pinned artifact stops an unattended run
 rather than becoming an install that claims to be something it is not.
 `--gpu-layers` is there too, for a card that cannot hold its quantization
-entirely in VRAM.
+entirely in VRAM. `--cpu` answers the device question with the processor
+instead of a card, and does not need `nvidia-smi` to do it; `--mixed` answers it
+with a card in mixed mode — with `--gpu`, or the first card without it.
 
 ## Using it
 
@@ -188,10 +212,13 @@ divider between the two panes can be dragged to give either one more room.
 ## Requirements
 
 - Windows x64
-- An NVIDIA GPU with a current driver. The 3090 and 5090 are the pinned
-  configurations; any other CUDA card is sized from its own VRAM and compute
-  capability. There is no CPU path — inference runs on the GPU through
-  `llama.cpp`.
+- An NVIDIA GPU with a current driver, or an x64 processor. The 3090 and 5090
+  are the pinned configurations; any other CUDA card is sized from its own VRAM
+  and compute capability. A card that cannot hold the model can run in mixed
+  mode instead, keeping the weights in system RAM and doing the processing it
+  can. Setup also offers your processor on its own, which installs the CPU
+  build of `llama.cpp` — no NVIDIA card or driver is used, and none is
+  required. See [the three ways to run it](#the-three-ways-to-run-it).
 - Roughly 20–30 GiB of disk for the model, plus ~1 GiB for the environment.
 - Python 3.12 or 3.13 is used if present, and installed privately if not. A
   newer Python on the machine is skipped rather than used: the pinned
@@ -223,6 +250,8 @@ What changed, and only this:
 | Setup questions | Qt wizard only | Console at install, Qt wizard still in Settings — both share one pipeline |
 | Install root | Beside the frozen `.exe` | `install.json` beside `app.py`, so models can live on another drive |
 | GPU support | RTX 3090 / 5090 only, others refused | Any NVIDIA card; 3090 and 5090 keep their exact pinned runtime and quantization |
+| Running without a card | Not possible | The processor and system RAM are an option in both front ends, on the pinned CPU build of `llama.cpp` |
+| Running with a card too small for the model | Not possible | Mixed mode: same CUDA install, weights in system RAM, nothing resident on the card, which keeps the work `llama.cpp` can give it |
 | Where the model comes from | Downloaded, always | Downloaded, or installed from a `.gguf` you already have — against the same pinned SHA-256 |
 | Window | One column of mouse-sized controls | Two panes, fingertip-sized targets, drag-to-scroll, a display-size setting |
 | Motion | One way of writing it | Default is that way exactly; **Inertia** and **Flow** are opt-in |
@@ -233,7 +262,12 @@ Four behavioural changes, all bounded, and the two that can reach a prompt are
 both opt-in and both open on the old behaviour. The GPU widening is pinned so
 that it cannot affect the two supported cards: `device_detection.PINNED` maps
 them to their original runtime and quantization before any heuristic runs, and
-`tests/test_install_flow.py` asserts that. The motion presets are additive —
+`tests/test_install_flow.py` asserts that. The CPU and mixed options are the
+same kind of widening — answers the setup questions now offer, reached only by
+choosing them, and leaving what a card downloads and how it is launched exactly
+as it was: CPU mode resolves to its own pinned `llama.cpp` archive, and mixed
+mode changes one number in the command that starts the same CUDA runtime. The
+motion presets are additive —
 Default appends nothing, adds no terms and samples at upstream's own
 temperatures, so an untouched control is an untouched prompt, and
 `prompt_engine/motion.py` holds the whole of the difference the other two make.
@@ -258,9 +292,9 @@ python -m pytest tests/        # 588 passed
   display size, measured on a real window built offscreen
 - `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
   download resume and retry
-- `test_install_flow.py` (79) — install-root discovery, GPU sizing, manifest
-  resolution, console setup, supplying a model from disk, and the installer's
-  interpreter and environment checks
+- `test_install_flow.py` (107) — install-root discovery, GPU sizing, the CPU
+  and mixed devices, manifest resolution, console setup, supplying a model from
+  disk, and the installer's interpreter and environment checks
 
 Output-level parity against an upstream checkout is checked separately:
 

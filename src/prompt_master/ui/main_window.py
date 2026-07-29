@@ -391,8 +391,15 @@ class MainWindow(QMainWindow):
     def clear(self): self.intent.clear(); self.positive.clear(); self.negative.clear(); self.remove_image()
     def refresh_status(self):
         from prompt_master.core.config import read_json
+        from prompt_master.core.models import GPU_MODE
         state=read_json(self.paths.data/"setup-state.json")
-        self.status.setText(f"GPU: {state.get('gpu_device_name',state.get('gpu_name','not configured'))} · Model: {state.get('quantization','not configured')} · Server: {'running' if self.service.process.running else 'stopped'} · Generation: idle")
+        # The mode is named unless the card simply holds the model, which is
+        # what a device name on its own has always meant. An install predating
+        # the setting records none, and reads as that same default.
+        device=state.get('gpu_device_name',state.get('gpu_name','not configured'))
+        mode=state.get('mode',GPU_MODE)
+        if mode != GPU_MODE: device=f"{device} ({mode})"
+        self.status.setText(f"Device: {device} · Model: {state.get('quantization','not configured')} · Server: {'running' if self.service.process.running else 'stopped'} · Generation: idle")
     def open_setup(self):
         self.service.stop(); wizard=SetupWizard(self.paths,self)
         if wizard.exec() and wizard.completed:
