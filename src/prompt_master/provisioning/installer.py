@@ -27,7 +27,7 @@ from prompt_master.core.config import atomic_write_json
 from prompt_master.core.models import GpuInfo, PromptRequest
 from prompt_master.core.paths import AppPaths
 from prompt_master.imaging.preprocess import image_data_url
-from prompt_master.inference.device_detection import (CPU_DEVICE, CPU_GPU_LAYERS,
+from prompt_master.inference.device_detection import (CPU_DEVICE, NO_OFFLOAD,
     list_llama_devices, runtime_component_id)
 from prompt_master.provisioning.downloader import download
 from prompt_master.provisioning.extractor import extract_zips_atomic
@@ -194,19 +194,26 @@ def _find_server(runtime_dir: Path) -> Path:
 def write_state(paths: AppPaths, gpu: GpuInfo, quantization: str, installed: Installed, *,
                 context_size: int = DEFAULT_CONTEXT_SIZE,
                 gpu_layers: str = FULL_OFFLOAD) -> dict:
-    """Record the validated-so-far install, atomically, via a pending file."""
+    """Record the validated-so-far install, atomically, via a pending file.
+
+    ``gpu_layers`` is the caller's only in GPU mode. The other two modes are
+    defined by there being no resident layers at all, so recording a count
+    beside them would be fiction and it is replaced here.
+    """
     if gpu.is_cpu:
-        # There is nothing to ask llama.cpp about: --device none is the whole
-        # answer. An offload count recorded beside it would be fiction, so the
-        # caller's ``gpu_layers`` is replaced rather than honoured here.
-        device, device_name, gpu_layers = CPU_DEVICE, gpu.name, CPU_GPU_LAYERS
+        # Nothing to ask llama.cpp about either: --device none is the whole
+        # answer, and there is no CUDA device for the probe to name.
+        device, device_name, gpu_layers = CPU_DEVICE, gpu.name, NO_OFFLOAD
     else:
         device, device_name = list_llama_devices(paths.contained(installed.runtime),
                                                  gpu.physical_index)
+        if gpu.is_mixed:
+            gpu_layers = NO_OFFLOAD
     state = {
         "runtime": installed.runtime,
         "model": installed.model,
         "mmproj": installed.mmproj,
+        "mode": gpu.mode,
         "gpu_index": gpu.physical_index,
         "gpu_uuid": gpu.uuid,
         "gpu_name": gpu.name,

@@ -12,6 +12,7 @@ reinstall possible:
 
     python app.py --setup --dir D:/PromptMaster --gpu 0 --quant Q6_K_P --yes
     python app.py --setup --cpu --quant Q4_K_M --yes
+    python app.py --setup --gpu 0 --mixed --quant Q4_K_M --yes
     python app.py --setup --model-file D:/models/Gemma4-...-Q6_K_P.gguf --yes
 """
 
@@ -20,13 +21,14 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import textwrap
 import time
 from pathlib import Path
 
 from prompt_master.core.models import GpuInfo
 from prompt_master.core.paths import AppPaths
 from prompt_master.inference.device_detection import (QUANTIZATIONS, detect_cpu, detect_devices,
-    recommended_quantization, runtime_component_id, vram_shortfall_mb)
+    mixed_device, recommended_quantization, runtime_component_id, vram_shortfall_mb)
 from prompt_master.provisioning import importer, installer, verifier
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -149,41 +151,54 @@ def device_label(device: GpuInfo) -> str:
     """One line describing a device in the menu."""
     if device.is_cpu:
         return f"{device.name} — {device.memory_total_mb} MiB of system RAM — no GPU used"
+    if device.is_mixed:
+        return f"{device.name} — mixed: model in system RAM, card used for processing"
     return f"{device.name} — {device.memory_total_mb} MiB — driver {device.driver_version}"
 
 
-def ask_device(preselected: int | None = None, cpu: bool = False,
+def ask_device(preselected: int | None = None, cpu: bool = False, mixed: bool = False,
                steps: Steps | None = None) -> GpuInfo:
-    """Which device runs the model: a CUDA GPU, or the processor.
+    """What runs the model: a CUDA GPU, the same GPU in mixed mode, or the CPU.
 
-    The processor is always the last option, so a machine with no NVIDIA driver
-    has one answer rather than none, and a machine with a card can still choose
-    to keep it free. A detected GPU stays the default — a run that took the
-    first option before this question learned about the CPU still takes it.
+    Every card is offered both ways and the processor is always last, so a
+    machine with no NVIDIA driver has one answer rather than none, and a machine
+    whose card cannot hold the weights has two. A card's own entry stays first —
+    a run that took the first option before this question learned about the
+    other modes still takes it.
     """
     if cpu:
         device = detect_cpu()
         print(f"Using the processor: {device.name} ({device.memory_total_mb} MiB of system RAM)")
         return device
-    if preselected is None and steps is not None:
+    if preselected is None and not mixed and steps is not None:
         steps.ask("what should run the model?")
     devices = detect_devices()
-    gpus = [device for device in devices if not device.is_cpu]
+    cards = [device for device in devices if not (device.is_cpu or device.is_mixed)]
+    if mixed and not cards:
+        raise SystemExit(
+            "Mixed mode keeps the model in system RAM and hands the work to a CUDA GPU;\n"
+            "nvidia-smi reported none. Pass --cpu to run without a card at all.")
+    if preselected is None and mixed:
+        # --mixed on its own is still an answer: the first card, mixed.
+        preselected = cards[0].physical_index
     if preselected is not None:
-        for gpu in gpus:
-            if gpu.physical_index == preselected:
-                print(f"Using GPU {preselected}: {gpu.name}")
-                return gpu
-        detected = ", ".join(f"{gpu.physical_index}={gpu.name}" for gpu in gpus) or "no CUDA GPU"
+        for card in cards:
+            if card.physical_index == preselected:
+                chosen = mixed_device(card) if mixed else card
+                print(f"Using GPU {preselected}: {card.name}"
+                      + (" — mixed mode" if mixed else ""))
+                return chosen
+        detected = ", ".join(f"{card.physical_index}={card.name}" for card in cards) or "no CUDA GPU"
         raise SystemExit(f"No GPU with index {preselected}. Detected: {detected}\n"
                          "Pass --cpu to run on the processor and system RAM instead.")
-    if not gpus:
+    if not cards:
         device = devices[0]
         print("No CUDA GPU was detected, so this install will run on the processor:")
         print(f"  {device.name} ({device.memory_total_mb} MiB of system RAM)")
         return device
-    print(f"Found {len(gpus)} CUDA GPU(s). The processor is offered too, for a machine")
-    print("whose card should stay free or whose driver is not installed.\n")
+    print(f"Found {len(cards)} CUDA GPU(s), each offered two ways: holding the model in its")
+    print("own memory, or in mixed mode, where the model is loaded into system RAM and the")
+    print("card is used for the work llama.cpp can hand it. The processor is offered too.\n")
     return devices[choose("What should run the model?", [device_label(d) for d in devices])]
 
 
@@ -277,6 +292,26 @@ def _projector_beside(component, model_path: Path) -> Path | None:
     return candidate if candidate.is_file() and candidate.stat().st_size == component.size else None
 
 
+def system_ram_note(device: GpuInfo) -> list[str]:
+    """What a device that keeps the model in system RAM is, in console lines.
+
+    A disclaimer rather than a warning: neither mode is sized against a memory
+    figure, so there is no threshold here to be under and nothing to caution
+    about — only a description of where the model sits and what runs it.
+
+    Wrapped here rather than written pre-wrapped because a card's name goes into
+    the middle of it, and they run from "NVIDIA L4" to well past forty characters.
+    """
+    if device.is_cpu:
+        text = ("This install runs on the processor and system RAM. No NVIDIA GPU or driver "
+                "is used, and none is required.")
+    else:
+        text = (f"This install loads the model into system RAM and uses {device.name} for "
+                "the work llama.cpp can hand it — prompt processing and image encoding — so "
+                "only a small amount of VRAM is held.")
+    return textwrap.wrap(text, 78)
+
+
 def ask_quantization(gpu: GpuInfo, preselected: str | None = None, steps: Steps | None = None) -> str:
     if preselected is not None:
         if preselected not in QUANTIZATIONS:
@@ -286,17 +321,21 @@ def ask_quantization(gpu: GpuInfo, preselected: str | None = None, steps: Steps 
     if steps is not None:
         steps.ask("which model quality?")
     recommended = recommended_quantization(gpu)
-    if gpu.is_cpu:
+    if gpu.weights_in_system_ram:
         # Sized against nothing, so measured against nothing: the download is
         # what differs between these three here, and all three are offered.
-        print(f"{gpu.name} — {gpu.memory_total_mb} MiB of system RAM.\n")
+        if gpu.is_cpu:
+            print(f"{gpu.name} — {gpu.memory_total_mb} MiB of system RAM.\n")
+        else:
+            print(f"{gpu.name} — mixed mode: the model is loaded into system RAM.\n")
         labels = [f"{quant} — {installer.format_download_size(gpu, quant)} to download"
                   for quant in QUANTIZATIONS]
         quant = QUANTIZATIONS[choose("Which quantization?", labels,
                                      list(QUANTIZATIONS).index(recommended))]
-        print("\nThis install runs on the processor and system RAM. No NVIDIA GPU or driver is")
-        print("used, and none is required. You can change the quantization at any time with")
-        print("`python app.py --setup`.")
+        print()
+        for line in system_ram_note(gpu):
+            print(line)
+        print("You can change the quantization at any time with `python app.py --setup`.")
         return quant
     labels = []
     for quant in QUANTIZATIONS:
@@ -322,12 +361,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu", type=int, help="Physical GPU index, as reported by nvidia-smi")
     parser.add_argument("--cpu", action="store_true",
                         help="Run on the processor and system RAM instead of a GPU")
+    parser.add_argument("--mixed", action="store_true",
+                        help="Mixed mode: load the model into system RAM and use the GPU for "
+                             "processing. Applies to --gpu, or to the first card if it is omitted")
     parser.add_argument("--quant", choices=list(QUANTIZATIONS), help="GGUF quantization to download")
     parser.add_argument("--context-size", type=int, default=installer.DEFAULT_CONTEXT_SIZE,
                         help=f"llama.cpp context size (default {installer.DEFAULT_CONTEXT_SIZE})")
     parser.add_argument("--gpu-layers", default=installer.FULL_OFFLOAD,
                         help="llama.cpp --n-gpu-layers; lower it to spill layers to system RAM on a "
-                             "small card. Not used with --cpu, which offloads nothing by definition")
+                             "small card. Not used with --cpu or --mixed, which offload nothing by "
+                             "definition")
     parser.add_argument("--model-file", help="Install this .gguf instead of downloading the model")
     parser.add_argument("--mmproj-file", help="Install this .gguf instead of downloading the vision projector")
     parser.add_argument("--keep-source", action="store_true",
@@ -361,12 +404,15 @@ def run(argv: list[str] | None = None) -> int:
     options = parse_args(argv)
     if options.cpu and options.gpu is not None:
         raise SystemExit("--cpu and --gpu name different devices. Pass one of them.")
+    if options.cpu and options.mixed:
+        raise SystemExit("--mixed hands work to a GPU and --cpu uses none. Pass one of them.")
     banner("Prompt Master — model and hardware setup")
 
     # The local-file question is skipped when a file was named on the command
     # line, and when --yes says nobody is watching.
     asks_local = not (options.model_file or options.yes)
-    answered = (options.directory is not None, options.gpu is not None or options.cpu,
+    answered = (options.directory is not None,
+                options.gpu is not None or options.cpu or options.mixed,
                 options.quant is not None)
     steps = Steps(sum(not given for given in answered) + asks_local)
 
@@ -376,7 +422,7 @@ def run(argv: list[str] | None = None) -> int:
         paths = ask_directory(AppPaths.discover().root, steps)
     paths.create_managed_dirs()
 
-    gpu = ask_device(options.gpu, options.cpu, steps)
+    gpu = ask_device(options.gpu, options.cpu, options.mixed, steps)
     quant = ask_quantization(gpu, options.quant, steps)
     if asks_local:
         quant, sources = ask_local_model(quant, steps, move=not options.keep_source)
@@ -384,7 +430,9 @@ def run(argv: list[str] | None = None) -> int:
         sources = supplied_files(options, quant)
 
     banner("Downloading and verifying")
-    print(f"Device     : {gpu.name}" + ("" if gpu.is_cpu else f" (index {gpu.physical_index})"))
+    detail = "" if gpu.is_cpu else f" (index {gpu.physical_index})"
+    if gpu.is_mixed: detail += " — mixed mode, model in system RAM"
+    print(f"Device     : {gpu.name}{detail}")
     print(f"Runtime    : {runtime_component_id(gpu)}")
     print(f"Model      : {quant}")
     print(f"Directory  : {paths.root}")

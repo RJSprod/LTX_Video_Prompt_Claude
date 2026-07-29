@@ -72,16 +72,24 @@ class PromptRequest:
 # one cannot collide with a real GPU.
 CPU_INDEX = -1
 
+# What a chosen device does with the model. Recorded in the setup state, so an
+# installed app can say which of the three it is running.
+GPU_MODE = "gpu"        # the weights are in VRAM and the card does everything
+MIXED_MODE = "mixed"    # the weights are in system RAM; the card is given the
+                        # work llama.cpp can hand it, and holds little else
+CPU_MODE = "cpu"        # no card is involved at all
+
 
 @dataclass(frozen=True, slots=True)
 class GpuInfo:
-    """One device the model can be installed for: a CUDA GPU, or the processor.
+    """One device the model can be installed for, and what it will do with it.
 
     Setup describes hardware with a single type so the processor travels the
     same path a card does — the same manifest lookup, the same download, the
-    same state file. ``is_cpu`` is what tells the two apart, and for the
-    processor ``memory_total_mb``/``memory_free_mb`` are system RAM rather than
-    VRAM.
+    same state file. Three choices are expressible: a card in ``GPU_MODE``, the
+    same card in ``MIXED_MODE``, and the processor. For the processor
+    ``memory_total_mb``/``memory_free_mb`` are system RAM rather than VRAM; for
+    a card they are always its VRAM, in either mode.
     """
 
     physical_index: int
@@ -95,11 +103,39 @@ class GpuInfo:
     # runtime choice then falls back to the model number. Always None for the
     # processor, which has no CUDA compute capability at all.
     compute_capability: float | None = None
+    # Set when this card was chosen for mixed mode. It is a choice about the
+    # same hardware rather than different hardware, which is why it lives here
+    # beside it: a card is offered twice, once each way. Never set for the
+    # processor, which has no card to hand anything to.
+    mixed: bool = False
 
     @property
     def is_cpu(self) -> bool:
         """True for the processor rather than a CUDA card."""
         return self.physical_index == CPU_INDEX
+
+    @property
+    def is_mixed(self) -> bool:
+        """True for a card that will leave the weights in system RAM."""
+        return self.mixed and not self.is_cpu
+
+    @property
+    def weights_in_system_ram(self) -> bool:
+        """True when the model is loaded into system RAM rather than VRAM.
+
+        The axis mixed mode and CPU mode share, and what every "how much memory
+        does this need" decision turns on: neither is sized against VRAM, so
+        neither has a VRAM shortfall to report, and both take longer to load
+        than filling a card does.
+        """
+        return self.is_cpu or self.is_mixed
+
+    @property
+    def mode(self) -> str:
+        """``GPU_MODE``, ``MIXED_MODE`` or ``CPU_MODE``."""
+        if self.is_cpu:
+            return CPU_MODE
+        return MIXED_MODE if self.mixed else GPU_MODE
 
     @property
     def supported(self) -> bool:
@@ -111,6 +147,7 @@ class GpuInfo:
         now sized from its own VRAM and compute capability instead of being
         rejected, and a machine with no NVIDIA card at all can install the
         CPU runtime instead. A card too small for a full offload is warned about
-        at setup, not blocked.
+        at setup, not blocked — and mixed mode is the answer to that warning
+        rather than a smaller quantization.
         """
         return True

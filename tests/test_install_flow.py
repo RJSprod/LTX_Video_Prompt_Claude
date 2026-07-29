@@ -19,8 +19,8 @@ import pytest
 
 from prompt_master.core.models import CPU_INDEX, GpuInfo
 from prompt_master.core.paths import DEFAULT_SUBDIR, ROOT_ENV, AppPaths
-from prompt_master.inference.device_detection import (CPU_DEFAULT_QUANT, CPU_DEVICE,
-    CPU_GPU_LAYERS, CPU_RUNTIME, PINNED, QUANTIZATIONS, recommended_quantization,
+from prompt_master.inference.device_detection import (CPU_DEVICE, CPU_RUNTIME, NO_OFFLOAD,
+    PINNED, QUANTIZATIONS, SYSTEM_RAM_DEFAULT_QUANT, mixed_device, recommended_quantization,
     runtime_component_id, vram_shortfall_mb)
 from prompt_master.provisioning import importer, installer, verifier
 from prompt_master.provisioning.importer import LocalSource, SourceMismatch
@@ -162,8 +162,8 @@ def test_the_cpu_default_is_the_lightest_build_not_the_largest_that_fits():
     """A card takes the biggest quantization its VRAM holds. Every byte of the
     weights crosses the memory bus on a processor, so the default there is the
     smallest pinned build — and it does not move with how much RAM is fitted."""
-    assert recommended_quantization(cpu(total=65413)) == CPU_DEFAULT_QUANT
-    assert recommended_quantization(cpu(total=262144)) == CPU_DEFAULT_QUANT
+    assert recommended_quantization(cpu(total=65413)) == SYSTEM_RAM_DEFAULT_QUANT
+    assert recommended_quantization(cpu(total=262144)) == SYSTEM_RAM_DEFAULT_QUANT
     assert recommended_quantization(gpu(total=262144)) == "Q8_K_P"
 
 
@@ -179,7 +179,7 @@ def test_cpu_state_records_no_offload_and_asks_llama_nothing(tmp_path, monkeypat
                                   gpu_layers=installer.FULL_OFFLOAD)
 
     assert state["gpu_device"] == CPU_DEVICE == "none"
-    assert state["gpu_layers"] == CPU_GPU_LAYERS == "0"
+    assert state["gpu_layers"] == NO_OFFLOAD == "0"
     assert state["gpu_index"] == CPU_INDEX
     assert state["gpu_device_name"] == cpu().name
     assert json.loads((tmp_path / "data" / "setup-state.json").read_text(encoding="utf-8")) == state
@@ -202,7 +202,7 @@ def test_a_cpu_install_hides_every_card_from_llama_server(tmp_path, monkeypatch)
     monkeypatch.setattr("prompt_master.inference.llama_process.subprocess.Popen", FakePopen)
     LlamaProcess().start(tmp_path / "llama-server.exe", tmp_path / "m.gguf", tmp_path / "p.gguf",
                          CPU_INDEX, CPU_DEVICE, 16384, tmp_path / "log.txt",
-                         gpu_layers=CPU_GPU_LAYERS)
+                         gpu_layers=NO_OFFLOAD)
 
     command = captured["command"]
     assert command[command.index("--device") + 1] == "none"
@@ -224,7 +224,7 @@ def test_a_cpu_install_is_given_longer_to_load_before_it_is_called_dead(tmp_path
         target.write_bytes(b"stand-in")
     state = {"runtime": "runtime/llama-server.exe", "model": "models/m.gguf",
              "mmproj": "models/p.gguf", "gpu_index": CPU_INDEX, "gpu_device": CPU_DEVICE,
-             "context_size": 16384, "gpu_layers": CPU_GPU_LAYERS}
+             "context_size": 16384, "gpu_layers": NO_OFFLOAD}
     paths.state_file.write_text(json.dumps(state), encoding="utf-8")
 
     inference = service_module.InferenceService(paths)
@@ -233,10 +233,127 @@ def test_a_cpu_install_is_given_longer_to_load_before_it_is_called_dead(tmp_path
     inference.client()
     assert waited == [service_module.CPU_READY_TIMEOUT]
 
+    paths.state_file.write_text(json.dumps({**state, "gpu_index": 0, "gpu_device": "CUDA0",
+                                            "gpu_layers": installer.FULL_OFFLOAD}), encoding="utf-8")
+    inference.client()
+    assert waited[-1] == service_module.GPU_READY_TIMEOUT
+
+    # Mixed mode is a CUDA device with nothing resident on it, and loads out of
+    # system RAM exactly as the CPU install above does.
     paths.state_file.write_text(json.dumps({**state, "gpu_index": 0, "gpu_device": "CUDA0"}),
                                 encoding="utf-8")
     inference.client()
-    assert waited[-1] == service_module.GPU_READY_TIMEOUT
+    assert waited[-1] == service_module.CPU_READY_TIMEOUT
+
+
+# ── mixed: the card does the work, system RAM holds the model ────────────────
+
+def mixed(name="NVIDIA GeForce RTX 4090", total=24564, index=0):
+    return mixed_device(gpu(name=name, total=total, index=index))
+
+
+def test_mixed_is_the_same_card_asked_to_do_something_else():
+    card = gpu()
+    assert not card.is_mixed and mixed_device(card).is_mixed
+    # Same hardware: everything nvidia-smi reported survives the choice.
+    assert dataclasses.replace(mixed_device(card), mixed=False) == card
+    assert card.mode == "gpu" and mixed_device(card).mode == "mixed" and cpu().mode == "cpu"
+
+
+def test_mixed_needs_a_card_to_hand_work_to():
+    with pytest.raises(ValueError, match="CUDA GPU"):
+        mixed_device(cpu())
+
+
+def test_mixed_installs_the_cards_own_cuda_runtime_not_the_cpu_one():
+    """The card is still doing the compute, so the CUDA build is still what has
+    to be downloaded — cudart and all. Only where the weights sit changes."""
+    assert runtime_component_id(mixed(name="NVIDIA GeForce RTX 3090")) == "llama-runtime-cuda12"
+    assert runtime_component_id(mixed(name="NVIDIA GeForce RTX 5090")) == "llama-runtime-cuda13"
+    ids = installer.component_ids(mixed(name="NVIDIA GeForce RTX 3090"), "Q4_K_M")
+    assert ids == ("llama-runtime-cuda12", "llama-runtime-cuda12-cudart", "model-Q4_K_M", "mmproj")
+    assert len(installer.resolve(mixed(), "Q4_K_M")) == 4
+
+
+def test_mixed_is_sized_like_system_ram_not_like_a_card():
+    """A 6 GiB card cannot hold any of the three, which in GPU mode is a warning
+    on every option. In mixed mode it is not a fact about anything: the weights
+    are not going there."""
+    small = mixed(total=6144)
+    assert small.weights_in_system_ram and cpu().weights_in_system_ram
+    assert not gpu().weights_in_system_ram
+    assert all(vram_shortfall_mb(small, quant) == 0 for quant in QUANTIZATIONS)
+    assert vram_shortfall_mb(gpu(total=6144), "Q4_K_M") > 0        # the same card, held to VRAM
+    assert recommended_quantization(small) == SYSTEM_RAM_DEFAULT_QUANT
+    # Even a pinned card, which in GPU mode takes its pinned quantization.
+    assert recommended_quantization(mixed(name="NVIDIA GeForce RTX 5090")) == SYSTEM_RAM_DEFAULT_QUANT
+    assert recommended_quantization(gpu(name="NVIDIA GeForce RTX 5090", total=32607)) == "Q6_K_P"
+
+
+def test_mixed_state_keeps_the_cuda_device_and_offloads_no_layers(tmp_path, monkeypatch):
+    """The CUDA device probe still runs — there is a real device to name, and
+    llama-server is still pointed at it. What changes is that nothing is
+    resident on it, so a layer count from the command line is replaced."""
+    monkeypatch.setattr(installer, "list_llama_devices", lambda *_a, **_k: ("CUDA0", "RTX 4090"))
+    installed = installer.Installed("runtime/llama-server.exe", "models/m.gguf", "models/p.gguf")
+
+    state = installer.write_state(AppPaths(tmp_path), mixed(index=1), "Q4_K_M", installed,
+                                  gpu_layers=installer.FULL_OFFLOAD)
+
+    assert state["mode"] == "mixed"
+    assert state["gpu_device"] == "CUDA0"
+    assert state["gpu_layers"] == NO_OFFLOAD == "0"
+    assert state["gpu_index"] == 1
+
+
+def test_gpu_mode_still_records_what_it_always_did(tmp_path, monkeypatch):
+    """The mode is new state beside the old, not a change to it: a plain card
+    keeps its device, its index and the caller's layer count."""
+    monkeypatch.setattr(installer, "list_llama_devices", lambda *_a, **_k: ("CUDA0", "RTX 4090"))
+    installed = installer.Installed("runtime/llama-server.exe", "models/m.gguf", "models/p.gguf")
+
+    state = installer.write_state(AppPaths(tmp_path), gpu(index=1), "Q4_K_M", installed)
+
+    assert state["mode"] == "gpu"
+    assert state["gpu_device"] == "CUDA0" and state["gpu_index"] == 1
+    assert state["gpu_layers"] == installer.FULL_OFFLOAD == "all"
+
+
+def test_a_mixed_install_points_llama_server_at_the_card_with_nothing_on_it(tmp_path, monkeypatch):
+    """The command is the whole mechanism: the card is named on --device, so
+    llama.cpp keeps handing it the work it can take, and --n-gpu-layers 0 keeps
+    the weights in system RAM. Unlike CPU mode, the card stays visible."""
+    from prompt_master.inference.llama_process import LlamaProcess
+
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, command, env=None, **_kwargs):
+            captured["command"], captured["env"] = command, env
+
+        def poll(self): return None
+
+    monkeypatch.setattr("prompt_master.inference.llama_process.subprocess.Popen", FakePopen)
+    LlamaProcess().start(tmp_path / "llama-server.exe", tmp_path / "m.gguf", tmp_path / "p.gguf",
+                         1, "CUDA0", 16384, tmp_path / "log.txt", gpu_layers=NO_OFFLOAD)
+
+    command = captured["command"]
+    assert command[command.index("--device") + 1] == "CUDA0"
+    assert command[command.index("--n-gpu-layers") + 1] == "0"
+    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+
+
+def test_every_card_is_offered_both_ways_with_its_own_entry_first(monkeypatch):
+    """The order is what a machine that never wanted this depends on: option A
+    is the first card holding the model, exactly as before."""
+    from prompt_master.inference import device_detection
+
+    monkeypatch.setattr(device_detection, "detect_gpus", lambda _timeout=15: [gpu(index=0), gpu(index=1)])
+    monkeypatch.setattr(device_detection, "detect_cpu", cpu)
+
+    offered = device_detection.detect_devices()
+    assert [(device.physical_index, device.mode) for device in offered] == [
+        (0, "gpu"), (0, "mixed"), (1, "gpu"), (1, "mixed"), (CPU_INDEX, "cpu")]
 
 
 def test_missing_component_set_fails_before_any_download():
@@ -328,7 +445,10 @@ def test_setup_flags_cover_every_question():
     assert options.cpu is False
 
     cpu_run = setup_cli.parse_args(["--dir", "D:/PM", "--cpu", "--quant", "Q4_K_M", "--yes"])
-    assert cpu_run.cpu and cpu_run.gpu is None
+    assert cpu_run.cpu and cpu_run.gpu is None and cpu_run.mixed is False
+
+    mixed_run = setup_cli.parse_args(["--dir", "D:/PM", "--gpu", "0", "--mixed", "--yes"])
+    assert mixed_run.mixed and mixed_run.gpu == 0
 
 
 def test_preselected_gpu_index_must_exist(monkeypatch):
@@ -361,18 +481,45 @@ def test_choose_accepts_letters_and_numbers(monkeypatch):
 
 
 def test_a_single_gpu_is_still_the_default_answer(monkeypatch, capsys):
-    """One card no longer means one option — the processor is offered beside it
-    — but the card stays first, so pressing Enter installs what it always did."""
-    monkeypatch.setattr(setup_cli, "detect_devices", lambda: [gpu(index=2), cpu()])
+    """One card no longer means one option — it is offered twice and the
+    processor beside it — but the card holding the model stays first, so
+    pressing Enter installs what it always did."""
+    monkeypatch.setattr(setup_cli, "detect_devices",
+                        lambda: [gpu(index=2), mixed(index=2), cpu()])
     # What pressing Enter does: ask() returns the default it was offered.
     monkeypatch.setattr(setup_cli, "ask", lambda _prompt, default="": default)
 
     device = setup_cli.ask_device(None)
 
-    assert device.physical_index == 2
+    assert device.physical_index == 2 and device.mode == "gpu"
     listed = capsys.readouterr().out
-    assert "A) NVIDIA GeForce RTX 4090" in listed and "(recommended)" in listed
-    assert "B) Intel(R) Core(TM) i7-13700K" in listed
+    assert "A) NVIDIA GeForce RTX 4090 — 24564 MiB" in listed and "(recommended)" in listed
+    assert "B) NVIDIA GeForce RTX 4090 — mixed" in listed
+    assert "C) Intel(R) Core(TM) i7-13700K" in listed
+
+
+def test_the_mixed_flag_applies_to_the_named_card_or_the_first_one(monkeypatch, capsys):
+    monkeypatch.setattr(setup_cli, "detect_devices",
+                        lambda: [gpu(index=0), mixed(index=0), gpu(index=1), mixed(index=1), cpu()])
+
+    assert setup_cli.ask_device(1, mixed=True).physical_index == 1
+    assert setup_cli.ask_device(1, mixed=True).is_mixed
+    # Without --gpu it is still an answer rather than a question: the first card.
+    monkeypatch.setattr(setup_cli, "ask", lambda *_a, **_k: pytest.fail("should not ask"))
+    chosen = setup_cli.ask_device(None, mixed=True)
+    assert chosen.physical_index == 0 and chosen.is_mixed
+    assert "mixed mode" in capsys.readouterr().out
+
+
+def test_mixed_needs_a_card_and_says_so(monkeypatch):
+    monkeypatch.setattr(setup_cli, "detect_devices", lambda: [cpu()])
+    with pytest.raises(SystemExit, match="--cpu to run without a card"):
+        setup_cli.ask_device(None, mixed=True)
+
+
+def test_mixed_and_cpu_together_are_refused():
+    with pytest.raises(SystemExit, match="--mixed hands work to a GPU"):
+        setup_cli.run(["--cpu", "--mixed"])
 
 
 def test_no_gpu_selects_the_cpu_instead_of_exiting(monkeypatch, capsys):
@@ -671,29 +818,54 @@ def test_the_wizard_vets_a_supplied_model_the_same_way(monkeypatch, tmp_path):
     assert wizard._vet_model_file() is None                   # refused, and the page holds
 
 
-def test_the_wizard_offers_the_processor_beside_any_card(monkeypatch, tmp_path):
-    """Settings → Models and Hardware is where an installed app goes back to
-    change its mind, so the option has to be on that page too."""
+def open_wizard(monkeypatch, tmp_path, devices):
+    """The wizard on its hardware page, with the scan answered by ``devices``."""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     widgets = pytest.importorskip("PySide6.QtWidgets")
     from prompt_master.ui import setup_wizard as wizard_module
 
-    monkeypatch.setattr(wizard_module, "detect_devices", lambda: [gpu(), cpu()])
+    monkeypatch.setattr(wizard_module, "detect_devices", lambda: list(devices))
     widgets.QApplication.instance() or widgets.QApplication([])
     wizard = wizard_module.SetupWizard(AppPaths(tmp_path / "user_data"))
-
     wizard._page_changed(1)
-    assert [wizard.gpu.itemData(row).is_cpu for row in range(wizard.gpu.count())] == [False, True]
-    assert "Intel(R) Core(TM) i7-13700K" in wizard.gpu.itemText(1)
+    return wizard
+
+
+def test_the_wizard_offers_every_mode_a_card_has(monkeypatch, tmp_path):
+    """Settings → Models and Hardware is where an installed app goes back to
+    change its mind, so all three have to be on that page too."""
+    wizard = open_wizard(monkeypatch, tmp_path, [gpu(), mixed(), cpu()])
+
+    assert [wizard.gpu.itemData(row).mode for row in range(wizard.gpu.count())] == [
+        "gpu", "mixed", "cpu"]
+    assert "mixed" in wizard.gpu.itemText(1)
+    assert "Intel(R) Core(TM) i7-13700K" in wizard.gpu.itemText(2)
     assert wizard.gpu.currentIndex() == 0                  # the card is still the default
 
-    wizard.gpu.setCurrentIndex(1)
+
+@pytest.mark.parametrize("row,expected", [(1, "system RAM and uses"), (2, "processor and system RAM")])
+def test_the_wizard_describes_a_system_ram_install_without_warning_about_it(
+        monkeypatch, tmp_path, row, expected):
+    wizard = open_wizard(monkeypatch, tmp_path, [gpu(), mixed(), cpu()])
+
+    wizard.gpu.setCurrentIndex(row)
     wizard._page_changed(2)
-    assert wizard.quant.currentText() == CPU_DEFAULT_QUANT
+
+    assert wizard.quant.currentText() == SYSTEM_RAM_DEFAULT_QUANT
     described = wizard.recommendation.text()
-    assert "processor and system RAM" in described
-    # A disclaimer, not a warning: nothing about RAM size or speed.
+    assert expected in described
+    # A disclaimer, not a warning: nothing about memory size or speed.
     assert "Warning" not in described and "slow" not in described
+
+
+def test_the_wizard_still_warns_a_card_that_cannot_hold_its_quantization(monkeypatch, tmp_path):
+    """The VRAM warning is the reason mixed mode is worth offering, so it has to
+    survive being sat next to it."""
+    wizard = open_wizard(monkeypatch, tmp_path, [gpu(total=8192), mixed(total=8192), cpu()])
+
+    wizard._page_changed(2)
+
+    assert "Warning" in wizard.recommendation.text()
 
 
 def test_the_wizard_falls_back_to_the_processor_when_the_scan_fails(monkeypatch, tmp_path):

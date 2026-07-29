@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import os
 import platform
 import re
@@ -24,18 +25,24 @@ PINNED: dict[str, tuple[str, str]] = {
 # one this processor supports when the server starts.
 CPU_RUNTIME = "llama-runtime-cpu"
 
-# llama.cpp's own token for "offload to nothing", and the layer count that goes
-# with it. Both are recorded in the setup state and passed straight through to
-# llama-server.
+# llama.cpp's own token for "offload to nothing" — what CPU mode passes to
+# --device, so no backend but the CPU one is even looked at.
 CPU_DEVICE = "none"
-CPU_GPU_LAYERS = "0"
 
-# What CPU mode installs unless the user chooses otherwise. Deliberately not
-# "the largest that fits", which is how a card is sized: on the processor every
-# byte of the weights crosses the memory bus, so the smallest pinned build is
-# the one that moves least — and it is also the shortest download. All three
-# quantizations stay selectable.
-CPU_DEFAULT_QUANT = "Q4_K_M"
+# llama.cpp's --n-gpu-layers when the weights are to stay in system RAM. It is
+# what CPU mode and mixed mode both record. In mixed mode the card is still
+# named on --device, so llama.cpp keeps using it for the work it can take off
+# the CPU — large-batch matrix multiplies during prompt processing, and the
+# vision projector — copying what it needs across as it goes. That is the whole
+# of the difference: same CUDA runtime, same install, no layers resident.
+NO_OFFLOAD = "0"
+
+# What CPU and mixed mode install unless the user chooses otherwise.
+# Deliberately not "the largest that fits", which is how a card in GPU mode is
+# sized: with the weights in system RAM every byte of them crosses the memory
+# bus, so the smallest pinned build is the one that moves least — and it is
+# also the shortest download. All three quantizations stay selectable.
+SYSTEM_RAM_DEFAULT_QUANT = "Q4_K_M"
 
 # Shown when the processor will not name itself.
 GENERIC_CPU_NAME = "CPU (system RAM)"
@@ -106,18 +113,32 @@ def detect_cpu() -> GpuInfo:
     return GpuInfo(CPU_INDEX, "CPU", cpu_name(), total, free, platform_tag(), None)
 
 
-def detect_devices(timeout: float = 15) -> list[GpuInfo]:
-    """Every device an install can be pinned to: each CUDA GPU, then the CPU.
+def mixed_device(gpu: GpuInfo) -> GpuInfo:
+    """The same card, chosen for mixed mode instead of a full offload."""
+    if gpu.is_cpu:
+        raise ValueError("Mixed mode needs a CUDA GPU to hand work to")
+    return dataclasses.replace(gpu, mixed=True)
 
-    The CPU is always last and always present, so a machine with no NVIDIA
+
+def detect_devices(timeout: float = 15) -> list[GpuInfo]:
+    """Every choice an install can be pinned to, in the order they are offered.
+
+    Each CUDA GPU appears twice — once holding the model, once in mixed mode —
+    and the CPU is always last and always present, so a machine with no NVIDIA
     driver is one with a single option rather than one setup refuses. A failed
     scan is therefore not an error here; it only shortens the list.
+
+    A card's own entry stays first throughout, so the first option is what it
+    has always been.
     """
     try:
         gpus = detect_gpus(timeout)
     except RuntimeError:
         gpus = []
-    return [*gpus, detect_cpu()]
+    offered: list[GpuInfo] = []
+    for gpu in gpus:
+        offered += [gpu, mixed_device(gpu)]
+    return [*offered, detect_cpu()]
 
 
 def cpu_name() -> str:
@@ -197,10 +218,11 @@ def recommended_quantization(gpu: GpuInfo) -> str:
     so whether to go ahead is the caller's decision, and ``vram_shortfall_mb``
     is what it warns with.
 
-    The processor is not sized this way — see ``CPU_DEFAULT_QUANT``.
+    A device that keeps the weights in system RAM is not sized this way — see
+    ``SYSTEM_RAM_DEFAULT_QUANT``.
     """
-    if gpu.is_cpu:
-        return CPU_DEFAULT_QUANT
+    if gpu.weights_in_system_ram:
+        return SYSTEM_RAM_DEFAULT_QUANT
     pinned = PINNED.get(gpu.name)
     if pinned is not None:
         return pinned[1]
@@ -213,14 +235,15 @@ def recommended_quantization(gpu: GpuInfo) -> str:
 def vram_shortfall_mb(gpu: GpuInfo, quantization: str) -> int:
     """How far short of a full GPU offload this pairing is; 0 when it fits.
 
-    Always 0 for the processor. A shortfall measures what would have to spill
-    out of VRAM and into system RAM; in CPU mode the weights are already in
-    system RAM, so there is nothing to fall short of and nothing to warn about.
+    Always 0 in mixed and CPU mode. A shortfall measures what would have to
+    spill out of VRAM and into system RAM; those two put the weights in system
+    RAM to begin with, so there is nothing to fall short of and nothing to warn
+    about — a card too small to hold its quantization is what mixed mode is for.
     """
     minimum = dict(QUANT_MIN_VRAM_MB).get(quantization)
     if minimum is None:
         raise ValueError(f"Unknown quantization: {quantization}")
-    if gpu.is_cpu:
+    if gpu.weights_in_system_ram:
         return 0
     return max(0, minimum - gpu.memory_total_mb)
 

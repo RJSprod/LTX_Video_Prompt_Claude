@@ -10,10 +10,14 @@ from prompt_master.inference.device_detection import (QUANTIZATIONS, detect_cpu,
     recommended_quantization, vram_shortfall_mb)
 from prompt_master.provisioning import importer, installer, verifier
 
-# Said on the model page when the install will run on the processor. A
-# disclaimer, not a warning: nothing here is a reason to choose differently.
+# Said on the model page when the model will be kept in system RAM. A
+# disclaimer, not a warning: neither mode is sized against a memory figure, so
+# there is no threshold here to be under and nothing to caution about.
 CPU_NOTE = ("This install runs on the processor and system RAM. No NVIDIA GPU or driver is "
             "used, and none is required.")
+MIXED_NOTE = ("This install loads the model into system RAM and uses {name} for the work "
+              "llama.cpp can hand it — prompt processing and image encoding — so only a small "
+              "amount of VRAM is held.")
 
 
 class SetupWizard(QWizard):
@@ -82,14 +86,17 @@ class SetupWizard(QWizard):
             self.quant.setCurrentText(recommended_quantization(self.gpu.currentData())); self._describe_quant()
 
     def _hardware_summary(self):
-        cards=[gpu for gpu in self.gpus if not gpu.is_cpu]
-        if cards: return (f"Found {len(cards)} CUDA GPU(s). The processor is offered too, for a machine "
-                          "whose card should stay free or whose driver is not installed.")
+        cards=[gpu for gpu in self.gpus if not (gpu.is_cpu or gpu.is_mixed)]
+        if cards: return (f"Found {len(cards)} CUDA GPU(s), each offered two ways: holding the model in "
+                          "its own memory, or in mixed mode, where the model is loaded into system RAM "
+                          "and the card is used for the work llama.cpp can hand it. The processor is "
+                          "offered too.")
         return "No CUDA GPU found. This install will run on the processor and system RAM."
 
     @staticmethod
     def _device_label(device):
         if device.is_cpu: return f"{device.name} — {device.memory_total_mb} MiB of system RAM — no GPU used"
+        if device.is_mixed: return f"{device.name} — mixed: model in system RAM, card used for processing"
         return f"{device.name} — {device.memory_total_mb} MiB — {device.uuid}"
 
     def _describe_quant(self,*_):
@@ -97,17 +104,21 @@ class SetupWizard(QWizard):
 
         The warning is shown rather than enforced: a card below the threshold
         still installs and runs, it just spills layers to system RAM, and that
-        trade is the user's to make. On the processor there is no threshold to
-        be below, so what is shown there is a disclaimer and not a warning."""
+        trade is the user's to make — and mixed mode is the other answer to it.
+        With the weights in system RAM there is no threshold to be below, so
+        what is shown there is a disclaimer and not a warning."""
         gpu=self.gpu.currentData()
         if gpu is None: return
         quant=self.quant.currentText()
-        if gpu.is_cpu:
-            # No card, so nothing to measure a shortfall against: the download
-            # is the only thing that differs between the three here.
+        if gpu.weights_in_system_ram:
+            # The weights are not in VRAM, so there is nothing to measure a
+            # shortfall against: the download is the only thing that differs
+            # between the three here.
+            note=CPU_NOTE if gpu.is_cpu else MIXED_NOTE.format(name=gpu.name)
+            where="" if gpu.is_cpu else " in mixed mode"
             self.recommendation.setText("\n".join([
-                f"Recommended for {gpu.name}: {recommended_quantization(gpu)}",
-                f"Download: {installer.format_download_size(gpu,quant)}.", CPU_NOTE]))
+                f"Recommended for {gpu.name}{where}: {recommended_quantization(gpu)}",
+                f"Download: {installer.format_download_size(gpu,quant)}.", note]))
             return
         lines=[f"Recommended for {gpu.name} ({gpu.memory_total_mb} MiB): {recommended_quantization(gpu)}",
                f"Download: {installer.format_download_size(gpu,quant)}."]
