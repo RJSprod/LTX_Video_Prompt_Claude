@@ -3,9 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QActionGroup
-from PySide6.QtWidgets import (QApplication,QCheckBox,QComboBox,QFileDialog,QFrame,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QMainWindow,QMessageBox,QPlainTextEdit,QPushButton,QScrollArea,QSizePolicy,QSlider,QSpinBox,QDoubleSpinBox,QSplitter,QTextEdit,QVBoxLayout,QWidget)
+from PySide6.QtWidgets import (QApplication,QCheckBox,QComboBox,QFileDialog,QFrame,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QMainWindow,QMessageBox,QPlainTextEdit,QPushButton,QScrollArea,QSizePolicy,QSlider,QSpinBox,QDoubleSpinBox,QSplitter,QStackedWidget,QTextEdit,QVBoxLayout,QWidget)
 import threading
 
+from prompt_master.core.config import atomic_write_json, read_json
 from prompt_master.core.models import RANDOM_SEED, PromptRequest, draw_seed
 from prompt_master.imaging.preprocess import image_data_url
 from prompt_master.prompt_engine import motion
@@ -15,7 +16,15 @@ from prompt_master.prompt_engine.adapter import PromptEngine, VisionUnavailable
 from prompt_master.core.paths import AppPaths
 from prompt_master.inference.service import InferenceService
 from prompt_master.ui import touch
+from prompt_master.ui.chat_page import ChatPage
 from prompt_master.ui.setup_wizard import SetupWizard
+
+# The two things this application does, and the order they appear in the mode
+# drop-down. Prompt mode is first because it is what the app was, and what an
+# install that has no characters yet can do.
+PROMPT_MODE = "prompt"
+CONVERSATION_MODE = "conversation"
+MODES = ((PROMPT_MODE, "Prompt mode"), (CONVERSATION_MODE, "Conversation mode"))
 
 
 class GenerationWorker(QObject):
@@ -89,20 +98,60 @@ class MainWindow(QMainWindow):
     Sizes come from ``ui.touch``: every target is at least a fingertip tall, and
     the scale that multiplies them is a menu item, since a tablet held at arm's
     length and a desk monitor do not agree on how big "big enough" is.
+
+    The window holds two of these pages, chosen by the drop-down along the top:
+    prompt mode, described above, and conversation mode. They share the window,
+    the display size and the one llama-server the application runs, and nothing
+    else — a chat cannot reach the prompt engine, which is what keeps the engine
+    the byte-for-byte copy of upstream that ``PARITY_REPORT.md`` says it is.
     """
 
     def __init__(self, paths: AppPaths | None = None):
         super().__init__(); self.paths = paths or AppPaths.discover(); self.service = InferenceService(self.paths); self.thread = None; self.setWindowTitle("Prompt Master Standalone"); self.image_path: Path | None = None; self.engine = PromptEngine()
         self.build_menus()
-        splitter=QSplitter(Qt.Orientation.Horizontal); splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self.compose_pane()); splitter.addWidget(self.output_pane())
-        splitter.setStretchFactor(0,4); splitter.setStretchFactor(1,5)
-        central=QWidget(); page=QVBoxLayout(central); page.addWidget(splitter,1); page.addLayout(self.action_bar())
+        self.pages=QStackedWidget(); self.pages.addWidget(self.prompt_page())
+        # The service is handed over as a callable rather than as itself: re-running
+        # setup replaces it, and the chat page must talk to the one running now.
+        self.chat=ChatPage(self.paths, lambda: self.service, self); self.pages.addWidget(self.chat)
+        central=QWidget(); page=QVBoxLayout(central); page.addLayout(self.mode_row()); page.addWidget(self.pages,1)
         self.setCentralWidget(central)
         self.apply_scale(touch.load_scale(self.paths), remember=False)
+        self.select_mode(self.remembered_mode(), remember=False)
         self.fill_screen(); self.refresh_status()
 
     # ── layout ───────────────────────────────────────────────────────────────
+
+    def prompt_page(self) -> QWidget:
+        """Everything prompt mode is: the two panes, and the bar under them."""
+        splitter=QSplitter(Qt.Orientation.Horizontal); splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self.compose_pane()); splitter.addWidget(self.output_pane())
+        splitter.setStretchFactor(0,4); splitter.setStretchFactor(1,5)
+        page=QWidget(); column=QVBoxLayout(page); column.setContentsMargins(0,0,0,0)
+        column.addWidget(splitter,1); column.addLayout(self.action_bar())
+        return page
+
+    def mode_row(self) -> QHBoxLayout:
+        """The one control that is above both pages rather than on one of them."""
+        row=QHBoxLayout(); label=QLabel("Mode"); label.setObjectName("fieldLabel")
+        self.mode_selector=self.combo(MODES,PROMPT_MODE)
+        self.mode_selector.currentIndexChanged.connect(lambda _index: self.select_mode(self.chosen(self.mode_selector,PROMPT_MODE)))
+        row.addWidget(label); row.addWidget(self.mode_selector); row.addStretch(1)
+        return row
+
+    def select_mode(self, mode: str, remember: bool = True):
+        self.pages.setCurrentIndex(1 if mode == CONVERSATION_MODE else 0)
+        self.select(self.mode_selector,mode)
+        if remember:
+            settings=self.paths.data/touch.SETTINGS_FILE
+            try: current=read_json(settings)
+            except (OSError,ValueError): current={}
+            try: atomic_write_json(settings,{**current,"mode":mode})
+            except OSError: pass                      # remembering is a convenience
+
+    def remembered_mode(self) -> str:
+        try: mode=read_json(self.paths.data/touch.SETTINGS_FILE).get("mode")
+        except (OSError,ValueError): return PROMPT_MODE
+        return mode if mode in (PROMPT_MODE,CONVERSATION_MODE) else PROMPT_MODE
 
     def build_menus(self):
         settings_menu=self.menuBar().addMenu("Settings"); settings_menu.addAction("Models and Hardware…").triggered.connect(self.open_setup)
@@ -218,11 +267,7 @@ class MainWindow(QMainWindow):
     def field(caption, widget) -> QWidget:
         """Caption above its control, not beside it: the control gets the whole
         column width, which is what makes it wide enough to hit."""
-        if caption is None: return widget
-        holder=QWidget(); column=QVBoxLayout(holder); column.setContentsMargins(0,0,0,0); column.setSpacing(2)
-        label=QLabel(caption); label.setObjectName("fieldLabel"); label.setBuddy(widget)
-        column.addWidget(label); column.addWidget(widget)
-        return holder
+        return widget if caption is None else touch.labelled(caption,widget)
 
     def output_pane(self) -> QWidget:
         """The finished prompts. QTextEdit rather than QPlainTextEdit for these
@@ -275,6 +320,9 @@ class MainWindow(QMainWindow):
         for edit in (self.positive,self.negative): edit.setMinimumHeight(m["target"]*3)
         self.generate_button.setMinimumWidth(m["target"]*4)
         for box in self.findChildren(QComboBox): box.setMaxVisibleItems(8)
+        # Conversation mode is sized by the same choice; it holds the numbers
+        # itself because a bubble's picture and avatar are measured from them.
+        if hasattr(self,"chat"): self.chat.apply_metrics(m)
         if remember: touch.save_scale(self.paths,name)
 
     def fill_screen(self):
@@ -403,7 +451,7 @@ class MainWindow(QMainWindow):
     def open_setup(self):
         self.service.stop(); wizard=SetupWizard(self.paths,self)
         if wizard.exec() and wizard.completed:
-            self.paths=wizard.paths; self.service=InferenceService(self.paths); self.refresh_status()
+            self.paths=wizard.paths; self.service=InferenceService(self.paths); self.chat.rebind(self.paths); self.refresh_status()
     def closeEvent(self,event):
         if self.thread and self.thread.isRunning(): self.thread.quit(); self.thread.wait(3000)
-        self.service.stop(); event.accept()
+        self.chat.shutdown(); self.service.stop(); event.accept()

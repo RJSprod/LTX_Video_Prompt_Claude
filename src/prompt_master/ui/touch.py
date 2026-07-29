@@ -28,9 +28,9 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QAbstractSpinBox,
-                               QComboBox, QHBoxLayout, QPushButton, QScroller,
+                               QComboBox, QHBoxLayout, QLabel, QPushButton, QScroller,
                                QScrollerProperties, QSlider, QStyle,
-                               QStyledItemDelegate, QWidget)
+                               QStyledItemDelegate, QVBoxLayout, QWidget)
 
 from prompt_master.core.config import atomic_write_json, read_json
 
@@ -190,6 +190,24 @@ def flickable(widget: QAbstractScrollArea) -> QAbstractScrollArea:
         widget.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         widget.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
     return widget
+
+
+def labelled(caption: str, widget: QWidget) -> QWidget:
+    """A control with its caption above it rather than beside it.
+
+    Above, because that leaves the control the whole width of its column, and
+    the width of a control is half of what makes it hittable.
+    """
+    holder = QWidget()
+    column = QVBoxLayout(holder)
+    column.setContentsMargins(0, 0, 0, 0)
+    column.setSpacing(2)
+    label = QLabel(caption)
+    label.setObjectName("fieldLabel")
+    label.setBuddy(widget)
+    column.addWidget(label)
+    column.addWidget(widget)
+    return holder
 
 
 def stepper(box: QAbstractSpinBox) -> QWidget:

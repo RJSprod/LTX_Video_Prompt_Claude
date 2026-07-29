@@ -1,0 +1,980 @@
+"""Conversation mode: the chat view, laid out for a finger.
+
+The shape is oobabooga's — a character, a transcript, and a box to type in —
+with its hover menus turned into things a finger can actually hit. Three
+decisions are worth stating, because they are what a touch screen changes:
+
+*Every message carries its own menu.* oobabooga puts the message actions in one
+hover menu that applies to the last reply. A finger cannot hover, and half of
+these actions — edit, branch, delete from here — are about a message somewhere
+up the transcript rather than the last one. So each message gets a ``⋯`` of its
+own, opening a menu whose rows are as tall as every other target in the window.
+
+*Regenerating pages rather than replaces.* The versions of a reply live on the
+message (see ``chat.history``), so a regenerate that came back worse is undone
+by tapping ``◀`` instead of by regenerating until luck returns.
+
+*The transcript is rebuilt, not patched.* Editing, deleting, branching and
+paging all change what the transcript is, and one path that renders the
+conversation from scratch cannot disagree with the conversation the way a dozen
+in-place mutations eventually would. Streaming is the single exception: the
+reply being written updates its own bubble, because rebuilding sixty widgets per
+token is not a thing to do to a tablet.
+"""
+
+from __future__ import annotations
+
+import base64
+import threading
+from pathlib import Path
+
+from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
+from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QGroupBox,
+                               QHBoxLayout, QInputDialog, QLabel, QMenu, QMessageBox,
+                               QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+                               QSpinBox, QSplitter, QVBoxLayout, QWidget)
+
+from prompt_master.chat import prompt
+from prompt_master.chat.characters import (Character, CharacterStore, Persona, load_persona,
+                                           save_persona)
+from prompt_master.chat.history import ASSISTANT, USER, ChatStore, Conversation, Message
+from prompt_master.core.config import atomic_write_json, read_json
+from prompt_master.core.models import RANDOM_SEED, draw_seed
+from prompt_master.imaging.preprocess import image_data_url
+from prompt_master.ui import touch
+from prompt_master.ui.character_editor import CharacterDialog, PersonaDialog
+
+# Where the chat view remembers what was open. Beside the display size, and for
+# the same reason: reopening the app on the chat you were having is the whole
+# of what "remembered" has to mean here.
+STATE_FILE = "chat-ui.json"
+
+# The context window llama-server is started with when setup recorded none.
+DEFAULT_CONTEXT = 8192
+
+
+class ChatWorker(QObject):
+    """One reply, streamed off the UI thread."""
+
+    chunk = Signal(str)
+    completed = Signal(str)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, service, messages, needs_vision, temperature, top_p, max_tokens, seed):
+        super().__init__()
+        self.service, self.messages, self.needs_vision = service, messages, needs_vision
+        self.temperature, self.top_p = temperature, top_p
+        self.max_tokens, self.seed = max_tokens, seed
+        self.cancelled = threading.Event()
+
+    @Slot()
+    def cancel(self) -> None:
+        self.cancelled.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            client = self.service.client(self.needs_vision)
+            text = client.stream_chat(self.messages, self.max_tokens, self.seed,
+                                      self.chunk.emit, self.cancelled,
+                                      temperature=self.temperature, top_p=self.top_p)
+            self.completed.emit(text)
+        except Exception as exc:                      # surfaced, never swallowed
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class MessageBubble(QFrame):
+    """One turn: who said it, what they said, and everything doable to it."""
+
+    def __init__(self, page: "ChatPage", message: Message, index: int):
+        super().__init__()
+        self.page, self.message, self.index = page, message, index
+        self.setObjectName("bubbleYou" if message.role == USER else "bubbleThem")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        column = QVBoxLayout(self)
+        column.addLayout(self._header())
+        if message.image:
+            column.addWidget(self._picture())
+        self.body = QLabel(message.text or "…")
+        self.body.setWordWrap(True)
+        self.body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        column.addWidget(self.body)
+        self.editor: QPlainTextEdit | None = None
+        self.column = column
+
+    def _header(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        avatar = self.page.avatar_pixmap() if self.message.role == ASSISTANT else None
+        if avatar is not None and not avatar.isNull():
+            face = QLabel()
+            face.setPixmap(avatar)
+            face.setFixedSize(avatar.size())
+            row.addWidget(face)
+        speaker = QLabel(self.page.speaker_name(self.message.role))
+        speaker.setObjectName("fieldLabel")
+        row.addWidget(speaker)
+        row.addStretch(1)
+        if len(self.message.versions) > 1:
+            row.addLayout(self._versions())
+        self.actions_button = QPushButton("⋯")
+        self.actions_button.setToolTip("What to do with this message")
+        self.actions_button.clicked.connect(self.open_menu)
+        row.addWidget(self.actions_button)
+        return row
+
+    def _versions(self) -> QHBoxLayout:
+        """The pager a regenerate leaves behind."""
+        row = QHBoxLayout()
+        back = QPushButton("◀")
+        forward = QPushButton("▶")
+        count = QLabel(f"{self.message.active + 1}/{len(self.message.versions)}")
+        count.setObjectName("fieldLabel")
+        back.setEnabled(self.message.active > 0)
+        forward.setEnabled(self.message.active < len(self.message.versions) - 1)
+        back.clicked.connect(lambda: self.page.show_version(self.index, self.message.active - 1))
+        forward.clicked.connect(lambda: self.page.show_version(self.index, self.message.active + 1))
+        for widget in (back, count, forward):
+            row.addWidget(widget)
+        return row
+
+    def _picture(self) -> QLabel:
+        label = QLabel()
+        pixmap = _pixmap_from_data_url(self.message.image)
+        if pixmap is None:
+            label.setText(f"[{self.message.image_name or 'image'}]")
+            return label
+        side = self.page.metrics["target"] * 4
+        label.setPixmap(pixmap.scaled(QSize(side, side), Qt.AspectRatioMode.KeepAspectRatio,
+                                      Qt.TransformationMode.SmoothTransformation))
+        label.setToolTip(self.message.image_name)
+        return label
+
+    def set_text(self, text: str) -> None:
+        """Used while a reply streams, where a rebuild per token is not on."""
+        self.body.setText(text or "…")
+
+    # ── the menu ─────────────────────────────────────────────────────────────
+
+    def open_menu(self) -> None:
+        menu = QMenu(self)
+        page, index = self.page, self.index
+        last = index == len(page.conversation.messages) - 1 if page.conversation else False
+        menu.addAction("Edit").triggered.connect(self.start_edit)
+        menu.addAction("Copy").triggered.connect(lambda: page.copy_text(self.message.text))
+        if self.message.role == ASSISTANT:
+            menu.addAction("Regenerate").triggered.connect(lambda: page.regenerate(index))
+            if last:
+                menu.addAction("Continue").triggered.connect(lambda: page.continue_reply(index))
+            if len(self.message.versions) > 1:
+                menu.addAction("Delete this version").triggered.connect(
+                    lambda: page.drop_version(index))
+        else:
+            menu.addAction("Send again from here").triggered.connect(lambda: page.resend(index))
+        menu.addSeparator()
+        menu.addAction("Branch from here").triggered.connect(lambda: page.branch(index))
+        menu.addAction("Delete message").triggered.connect(lambda: page.delete_message(index))
+        menu.addAction("Delete from here").triggered.connect(lambda: page.delete_from(index))
+        # Under the button that opened it, which is where the finger already is.
+        menu.exec(self.actions_button.mapToGlobal(self.actions_button.rect().bottomLeft()))
+
+    def start_edit(self) -> None:
+        if self.editor is not None:
+            return
+        self.body.hide()
+        self.editor = QPlainTextEdit(self.message.text)
+        self.editor.setMinimumHeight(self.page.metrics["target"] * 3)
+        touch.flickable(self.editor)
+        row = QHBoxLayout()
+        cancel = QPushButton("Cancel")
+        save = QPushButton("Save")
+        cancel.clicked.connect(self.cancel_edit)
+        save.clicked.connect(self.commit_edit)
+        row.addStretch(1)
+        row.addWidget(cancel)
+        row.addWidget(save)
+        self.edit_row = row
+        self.column.addWidget(self.editor)
+        self.column.addLayout(row)
+        self.editor.setFocus()
+
+    def commit_edit(self) -> None:
+        if self.editor is None:
+            return
+        self.page.edit_message(self.index, self.editor.toPlainText())
+
+    def cancel_edit(self) -> None:
+        self.page.render()
+
+
+class ChatPage(QWidget):
+    """The whole of conversation mode."""
+
+    def __init__(self, paths, service_provider, parent=None):
+        super().__init__(parent)
+        self.paths = paths
+        self.service_provider = service_provider
+        self.characters = CharacterStore.from_paths(paths)
+        self.chats = ChatStore.from_paths(paths)
+        self.persona: Persona = load_persona(paths)
+        self.character: Character | None = None
+        self.conversation: Conversation | None = None
+        self.attachment: Path | None = None
+        self.metrics = touch.metrics(1.0)
+        self.thread: QThread | None = None
+        self._worker: ChatWorker | None = None
+        self._streaming_index = -1
+        self._streaming_prefix = ""
+        self._into_input = False
+        self._join_space = False
+        self.bubbles: list[MessageBubble] = []
+        self._avatar: QPixmap | None = None
+
+        column = QVBoxLayout(self)
+        column.addLayout(self.character_row())
+        column.addLayout(self.chat_row())
+        column.addWidget(self.middle(), 1)
+        column.addLayout(self.quick_actions())
+        column.addLayout(self.input_row())
+        column.addWidget(self.status_label())
+
+        send = QShortcut(QKeySequence("Ctrl+Return"), self)
+        # Scoped to this page: the same window holds prompt mode, and a chord
+        # pressed there must not send a half-written chat message.
+        send.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        send.activated.connect(self.send)
+        self.reload_characters()
+
+    # ── layout ───────────────────────────────────────────────────────────────
+
+    def character_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        label = QLabel("Talking to")
+        label.setObjectName("fieldLabel")
+        self.character_box = touch.touchable_popup(QComboBox())
+        self.character_box.currentIndexChanged.connect(self._character_chosen)
+        edit = QPushButton("Characters…")
+        edit.clicked.connect(self.open_characters)
+        you = QPushButton("You…")
+        you.setToolTip("Give yourself a name and a description the character can use")
+        you.clicked.connect(self.open_persona)
+        row.addWidget(label)
+        row.addWidget(self.character_box, 1)
+        row.addWidget(edit)
+        row.addWidget(you)
+        return row
+
+    def chat_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        label = QLabel("Chat")
+        label.setObjectName("fieldLabel")
+        self.chat_box = touch.touchable_popup(QComboBox())
+        self.chat_box.currentIndexChanged.connect(self._chat_chosen)
+        new = QPushButton("New")
+        new.clicked.connect(self.new_chat)
+        rename = QPushButton("Rename")
+        rename.clicked.connect(self.rename_chat)
+        delete = QPushButton("Delete")
+        delete.clicked.connect(self.delete_chat)
+        self.settings_button = QPushButton("Settings")
+        self.settings_button.setCheckable(True)
+        self.settings_button.toggled.connect(self._toggle_settings)
+        row.addWidget(label)
+        row.addWidget(self.chat_box, 1)
+        for button in (new, rename, delete, self.settings_button):
+            row.addWidget(button)
+        return row
+
+    def middle(self) -> QSplitter:
+        """The transcript, and the settings pane that folds away beside it."""
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self.transcript_area())
+        self.settings_pane = self.settings_area()
+        splitter.addWidget(self.settings_pane)
+        self.settings_pane.hide()          # after the splitter has taken it
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 2)
+        return splitter
+
+    def transcript_area(self) -> QScrollArea:
+        self.transcript = QWidget()
+        self.transcript_column = QVBoxLayout(self.transcript)
+        self.transcript_column.setContentsMargins(0, 0, 0, 0)
+        self.transcript_column.addStretch(1)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setWidget(self.transcript)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        touch.flickable(area)
+        self.transcript_scroll = area
+        return area
+
+    def settings_area(self) -> QScrollArea:
+        """Temperature and its neighbours, saved with the character."""
+        box = QGroupBox("How this character replies")
+        column = QVBoxLayout(box)
+        self.temperature = QDoubleSpinBox()
+        self.temperature.setRange(0.05, 2.0)
+        self.temperature.setSingleStep(0.05)
+        self.temperature.setDecimals(2)
+        self.top_p = QDoubleSpinBox()
+        self.top_p.setRange(0.05, 1.0)
+        self.top_p.setSingleStep(0.05)
+        self.top_p.setDecimals(2)
+        self.max_tokens = QSpinBox()
+        self.max_tokens.setRange(64, 4096)
+        self.max_tokens.setSingleStep(64)
+        self.seed = QSpinBox()
+        self.seed.setRange(RANDOM_SEED, 2 ** 31 - 1)
+        self.seed.setSpecialValueText("Random each reply (-1)")
+        for caption, widget in (("Temperature", self.temperature), ("Top-p", self.top_p),
+                                ("Reply length (tokens)", self.max_tokens), ("Seed", self.seed)):
+            column.addWidget(touch.labelled(caption, touch.stepper(widget)))
+        self.system = QPlainTextEdit()
+        self.system.setPlaceholderText(
+            "Leave empty to use the character's context as written. Anything here replaces the "
+            "whole system message — {{char}} and {{user}} still work.")
+        touch.flickable(self.system)
+        column.addWidget(touch.labelled("Custom system message", self.system), 1)
+        note = QLabel("Saved with the character.")
+        note.setObjectName("fieldLabel")
+        note.setWordWrap(True)
+        column.addWidget(note)
+
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setWidget(box)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        touch.flickable(area)
+        return area
+
+    def quick_actions(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        self.regenerate_button = QPushButton("Regenerate")
+        self.regenerate_button.setToolTip("Write the last reply again, keeping the one it had")
+        self.regenerate_button.clicked.connect(lambda: self.regenerate(self._last(ASSISTANT)))
+        self.continue_button = QPushButton("Continue")
+        self.continue_button.setToolTip("Carry on from where the last reply stopped")
+        self.continue_button.clicked.connect(lambda: self.continue_reply(self._last(ASSISTANT)))
+        self.impersonate_button = QPushButton("Impersonate")
+        self.impersonate_button.setToolTip("Have the model write your next message for you")
+        self.impersonate_button.clicked.connect(self.impersonate)
+        self.undo_button = QPushButton("Remove last")
+        self.undo_button.setToolTip("Take back the last exchange")
+        self.undo_button.clicked.connect(self.remove_last)
+        for button in (self.regenerate_button, self.continue_button,
+                       self.impersonate_button, self.undo_button):
+            row.addWidget(button, 1)
+        return row
+
+    def input_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        self.attach_button = QPushButton("Attach…")
+        self.attach_button.setToolTip("Send a picture with your message")
+        self.attach_button.clicked.connect(self.attach_image)
+        self.input = QPlainTextEdit()
+        self.input.setPlaceholderText("Say something…   (Ctrl+Enter sends)")
+        touch.flickable(self.input)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop)
+        self.send_button = QPushButton("Send")
+        self.send_button.setObjectName("primary")
+        self.send_button.clicked.connect(self.send)
+        buttons = QVBoxLayout()
+        buttons.addWidget(self.stop_button)
+        buttons.addWidget(self.send_button)
+        row.addWidget(self.attach_button)
+        row.addWidget(self.input, 1)
+        row.addLayout(buttons)
+        return row
+
+    def status_label(self) -> QLabel:
+        self.status = QLabel("")
+        self.status.setObjectName("status")
+        self.status.setWordWrap(True)
+        return self.status
+
+    # ── characters ───────────────────────────────────────────────────────────
+
+    def reload_characters(self, select: str | None = None) -> None:
+        names = self.characters.names()
+        wanted = select or (self.character.name if self.character else None) or self._remembered("character")
+        self.character_box.blockSignals(True)
+        self.character_box.clear()
+        for name in names:
+            self.character_box.addItem(name, name)
+        self.character_box.blockSignals(False)
+        if not names:
+            self.character = None
+            self.conversation = None
+            self.render()
+            self.set_status("No characters yet — press Characters… to make one, or to import "
+                            "one you already have.")
+            self._enable(False)
+            return
+        index = self.character_box.findData(wanted)
+        # Signals stay blocked through the selection so the character is loaded
+        # once, here, rather than once by the signal and once by this call.
+        self.character_box.blockSignals(True)
+        self.character_box.setCurrentIndex(index if index >= 0 else 0)
+        self.character_box.blockSignals(False)
+        self.open_character(self.character_box.currentData())
+
+    def _character_chosen(self, _index: int) -> None:
+        name = self.character_box.currentData()
+        if name:
+            self.open_character(name)
+
+    def open_character(self, name: str) -> None:
+        self.persist_settings()
+        try:
+            self.character = self.characters.load(name)
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            self.set_status(f"Could not open {name}: {exc}")
+            return
+        self._avatar = None
+        self.show_settings_for(self.character)
+        self.remember(character=name)
+        self.reload_chats()
+
+    def show_settings_for(self, character: Character) -> None:
+        for widget, value in ((self.temperature, character.temperature),
+                              (self.top_p, character.top_p),
+                              (self.max_tokens, character.max_reply_tokens),
+                              (self.seed, character.seed)):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+        self.system.blockSignals(True)
+        self.system.setPlainText(character.system)
+        self.system.blockSignals(False)
+
+    def persist_settings(self) -> None:
+        """Write the panel back to the character it belongs to.
+
+        Called at the points where the values have stopped moving — sending,
+        switching character, closing — rather than on every tick of a spin box,
+        because each one of those would rewrite the file.
+        """
+        if self.character is None:
+            return
+        updated = Character(name=self.character.name, context=self.character.context,
+                            greeting=self.character.greeting,
+                            temperature=self.temperature.value(), top_p=self.top_p.value(),
+                            max_reply_tokens=self.max_tokens.value(), seed=self.seed.value(),
+                            system=self.system.toPlainText().strip())
+        if updated == self.character:
+            return
+        try:
+            self.characters.save(updated)
+        except (OSError, ValueError):
+            return                      # a settings write must never lose a chat
+        self.character = updated
+
+    def open_characters(self) -> None:
+        self.persist_settings()
+        dialog = CharacterDialog(self.characters, self.metrics, self,
+                                 selected=self.character.name if self.character else None)
+        dialog.exec()
+        self.reload_characters(select=dialog.chosen)
+
+    def open_persona(self) -> None:
+        dialog = PersonaDialog(self.persona, self)
+        if dialog.exec():
+            self.persona = dialog.persona()
+            save_persona(self.paths, self.persona)
+            self.render()               # the name over your own messages changed
+
+    def speaker_name(self, role: str) -> str:
+        if role == USER:
+            return self.persona.display
+        return self.character.name if self.character else "Assistant"
+
+    def avatar_pixmap(self) -> QPixmap | None:
+        if self.character is None:
+            return None
+        if self._avatar is None:
+            path = self.characters.avatar_for(self.character.name)
+            if path is None:
+                return None
+            side = self.metrics["target"]
+            self._avatar = QPixmap(str(path)).scaled(
+                QSize(side, side), Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+        return self._avatar
+
+    # ── chats ────────────────────────────────────────────────────────────────
+
+    def reload_chats(self, select: str | None = None) -> None:
+        if self.character is None:
+            return
+        rows = self.chats.listing(self.character.name)
+        self.chat_box.blockSignals(True)
+        self.chat_box.clear()
+        for row in rows:
+            self.chat_box.addItem(row.title, row.identifier)
+        self.chat_box.blockSignals(False)
+        wanted = select or self._remembered("chat")
+        index = self.chat_box.findData(wanted) if wanted else -1
+        if index < 0 and rows:
+            index = 0
+        if index < 0:
+            self.new_chat()
+            return
+        self.chat_box.blockSignals(True)
+        self.chat_box.setCurrentIndex(index)
+        self.chat_box.blockSignals(False)
+        self.open_chat(self.chat_box.currentData())
+
+    def _chat_chosen(self, _index: int) -> None:
+        identifier = self.chat_box.currentData()
+        if identifier:
+            self.open_chat(identifier)
+
+    def open_chat(self, identifier: str) -> None:
+        if self.character is None:
+            return
+        try:
+            self.conversation = self.chats.load(self.character.name, identifier)
+        except (OSError, ValueError, FileNotFoundError):
+            self.new_chat()
+            return
+        self.remember(chat=identifier)
+        self.render()
+        self.set_status("")
+        self._enable(True)
+
+    def new_chat(self) -> None:
+        if self.character is None:
+            return
+        self.conversation = self.chats.new(self.character.name)
+        greeting = prompt.greeting_text(self.character, self.persona)
+        if greeting:
+            self.conversation.append(ASSISTANT, greeting)
+        self.chats.save(self.conversation)
+        self.remember(chat=self.conversation.identifier)
+        self._refresh_chat_box()
+        self.render()
+        self.set_status("")
+        self._enable(True)
+
+    def rename_chat(self) -> None:
+        if self.conversation is None:
+            return
+        title, accepted = QInputDialog.getText(self, "Rename chat", "Name this chat",
+                                               text=self.conversation.title)
+        if not accepted or not title.strip():
+            return
+        self.conversation.title = title.strip()
+        self.chats.save(self.conversation)
+        self._refresh_chat_box()
+
+    def delete_chat(self) -> None:
+        if self.conversation is None or self.character is None:
+            return
+        if QMessageBox.question(self, "Delete chat",
+                                f"Delete “{self.conversation.title}”? This cannot be undone.") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self.chats.delete(self.character.name, self.conversation.identifier)
+        self.conversation = None
+        self.reload_chats()
+
+    def _refresh_chat_box(self) -> None:
+        """Rebuild the past-chats list around whatever is open."""
+        if self.character is None or self.conversation is None:
+            return
+        rows = self.chats.listing(self.character.name)
+        self.chat_box.blockSignals(True)
+        self.chat_box.clear()
+        for row in rows:
+            self.chat_box.addItem(row.title, row.identifier)
+        index = self.chat_box.findData(self.conversation.identifier)
+        if index >= 0:
+            self.chat_box.setCurrentIndex(index)
+        self.chat_box.blockSignals(False)
+
+    # ── the transcript ───────────────────────────────────────────────────────
+
+    def render(self) -> None:
+        """Rebuild every bubble from the conversation as it stands."""
+        while self.transcript_column.count():
+            item = self.transcript_column.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.bubbles = []
+        messages = self.conversation.messages if self.conversation else []
+        for index, message in enumerate(messages):
+            bubble = MessageBubble(self, message, index)
+            self.bubbles.append(bubble)
+            self.transcript_column.addWidget(bubble)
+        if not messages:
+            empty = QLabel("Nothing said yet." if self.character
+                           else "Make a character to start talking.")
+            empty.setObjectName("fieldLabel")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.transcript_column.addWidget(empty)
+        self.transcript_column.addStretch(1)
+        self.scroll_to_end()
+
+    def scroll_to_end(self) -> None:
+        bar = self.transcript_scroll.verticalScrollBar()
+        # After the layout has actually placed the new bubbles, not before.
+        QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+
+    # ── message actions ──────────────────────────────────────────────────────
+
+    def edit_message(self, index: int, text: str) -> None:
+        if self.conversation is None:
+            return
+        self.conversation.messages[index].text = text.strip()
+        self.save()
+        self.render()
+
+    def delete_message(self, index: int) -> None:
+        if self.conversation is None:
+            return
+        self.conversation.delete(index)
+        self.save()
+        self.render()
+
+    def delete_from(self, index: int) -> None:
+        if self.conversation is None:
+            return
+        self.conversation.delete_from(index)
+        self.save()
+        self.render()
+
+    def branch(self, index: int) -> None:
+        if self.conversation is None:
+            return
+        self.conversation = self.chats.branch(self.conversation, index)
+        self.remember(chat=self.conversation.identifier)
+        self._refresh_chat_box()
+        self.render()
+        self.set_status("Branched — this is a new chat, and the one it came from is untouched.")
+
+    def show_version(self, index: int, version: int) -> None:
+        if self.conversation is None:
+            return
+        self.conversation.messages[index].show(version)
+        self.save()
+        self.render()
+
+    def drop_version(self, index: int) -> None:
+        if self.conversation is None:
+            return
+        self.conversation.messages[index].drop_version()
+        self.save()
+        self.render()
+
+    def copy_text(self, text: str) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.clipboard().setText(text)
+        self.set_status("Copied.")
+
+    def remove_last(self) -> None:
+        """Take back the last exchange, putting your message back in the box."""
+        if self.conversation is None or not self.conversation.messages:
+            return
+        messages = self.conversation.messages
+        if messages[-1].role == ASSISTANT:
+            messages.pop()
+        if messages and messages[-1].role == USER:
+            taken = messages.pop()
+            self.input.setPlainText(taken.text)
+        self.save()
+        self.render()
+
+    # ── sending ──────────────────────────────────────────────────────────────
+
+    def attach_image(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(self, "Attach an image", "",
+                                                  "Images (*.png *.jpg *.jpeg *.webp)")
+        if not filename:
+            return
+        self.attachment = Path(filename)
+        self.attach_button.setText(f"Attached: {self.attachment.name}")
+        self.set_status(f"{self.attachment.name} goes with your next message. "
+                        "Press Attach again to change it.")
+
+    def clear_attachment(self) -> None:
+        self.attachment = None
+        self.attach_button.setText("Attach…")
+
+    def send(self) -> None:
+        if self.busy() or self.conversation is None or self.character is None:
+            return
+        text = self.input.toPlainText().strip()
+        if not text and self.attachment is None:
+            return
+        image, name = "", ""
+        if self.attachment is not None:
+            try:
+                image, name = image_data_url(self.attachment), self.attachment.name
+            except (OSError, ValueError) as exc:
+                QMessageBox.critical(self, "Image error", str(exc))
+                return
+        self.conversation.append(USER, text, image=image, image_name=name)
+        self.input.clear()
+        self.clear_attachment()
+        self.save()
+        self._refresh_chat_box()          # an untitled chat has just been named
+        self.render()
+        self.reply()
+
+    def reply(self) -> None:
+        """A fresh assistant message, streamed into."""
+        if self.conversation is None:
+            return
+        message = self.conversation.append(ASSISTANT, "")
+        self.render()
+        self.stream(len(self.conversation.messages) - 1, message.text)
+
+    def regenerate(self, index: int) -> None:
+        """Write this reply again, keeping the one it had as a version."""
+        if self.conversation is None or index < 0 or self.busy():
+            return
+        message = self.conversation.messages[index]
+        if message.role != ASSISTANT:
+            return
+        self.conversation.truncate_after(index)
+        message.add_version("")
+        self.render()
+        self.stream(index, "")
+
+    def resend(self, index: int) -> None:
+        """Answer this message of yours again, dropping everything after it."""
+        if self.conversation is None or self.busy():
+            return
+        self.conversation.truncate_after(index)
+        self.save()
+        self.render()
+        self.reply()
+
+    def continue_reply(self, index: int) -> None:
+        """Carry the reply on from where it stopped."""
+        if self.conversation is None or index < 0 or self.busy() or self.character is None:
+            return
+        message = self.conversation.messages[index]
+        if message.role != ASSISTANT or not message.text.strip():
+            return
+        # ``upto`` includes the reply itself: the model cannot carry on from
+        # text it was not shown.
+        self.stream(index, message.text, instruction=prompt.continue_instruction(self.character),
+                    upto=index + 1)
+
+    def impersonate(self) -> None:
+        """Have the model write your next message into the input box."""
+        if self.conversation is None or self.busy() or self.character is None:
+            return
+        self.stream(-1, "", instruction=prompt.impersonate_instruction(self.persona),
+                    into_input=True)
+
+    def stream(self, index: int, prefix: str, instruction: str | None = None,
+               upto: int | None = None, into_input: bool = False) -> None:
+        """Run one generation, writing into message ``index`` or the input box.
+
+        ``prefix`` is what is already there — the text a continuation extends —
+        and ``upto`` bounds the history sent, so continuing a reply does not
+        include the empty message being written.
+        """
+        if self.character is None or self.conversation is None or self.busy():
+            return
+        self.persist_settings()
+        history = self.conversation.messages[:upto if upto is not None else index]
+        if into_input:
+            history = list(self.conversation.messages)
+        reply_tokens = self.max_tokens.value()
+        messages = prompt.build(self.character, self.persona, history,
+                                context_size=self.context_size(),
+                                reply_tokens=reply_tokens, instruction=instruction)
+        seed = self.seed.value()
+        worker = ChatWorker(self.service_provider(), messages, prompt.has_image(history),
+                            self.temperature.value(), self.top_p.value(), reply_tokens,
+                            draw_seed() if seed == RANDOM_SEED else seed)
+        self._streaming_index = -1 if into_input else index
+        self._streaming_prefix = prefix
+        self._into_input = into_input
+        # A continuation is joined to what is already there, and the model is
+        # not reliable about starting with the space that needs.
+        self._join_space = bool(prefix) and not prefix[-1].isspace()
+        self.thread = QThread(self)
+        self._worker = worker
+        worker.moveToThread(self.thread)
+        self.thread.started.connect(worker.run)
+        worker.chunk.connect(self._chunk)
+        worker.completed.connect(self._completed)
+        worker.failed.connect(self._failed)
+        worker.finished.connect(self.thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        self.thread.finished.connect(self._generation_done)
+        self._enable(False)
+        self.stop_button.setEnabled(True)
+        self.set_status("Thinking…" if not into_input else "Writing as you…")
+        self.thread.start()
+
+    def _chunk(self, text: str) -> None:
+        if self._join_space and text and not text[0].isspace():
+            self._streaming_prefix += " "
+        self._join_space = False
+        self._streaming_prefix += text
+        if self._into_input:
+            self.input.setPlainText(self._streaming_prefix)
+            return
+        if 0 <= self._streaming_index < len(self.bubbles):
+            self.bubbles[self._streaming_index].set_text(self._streaming_prefix)
+            self.scroll_to_end()
+
+    def _completed(self, _raw: str) -> None:
+        text = self._streaming_prefix
+        if self._into_input:
+            self.input.setPlainText(prompt.clean_reply(text, self.character, self.persona)
+                                    if self.character else text)
+            self.set_status("Written as you — edit it, then send.")
+            return
+        if self.conversation is None or not (0 <= self._streaming_index < len(self.conversation.messages)):
+            return
+        message = self.conversation.messages[self._streaming_index]
+        cleaned = prompt.clean_reply(text, self.character, self.persona) if self.character else text
+        message.text = cleaned or "…"
+        self.save()
+        self.render()
+        self.set_status("")
+
+    def _failed(self, message: str) -> None:
+        self.set_status(f"Generation failed — {message}")
+        # The empty shell of a reply that never arrived is not left behind.
+        if (self.conversation is not None and not self._into_input
+                and 0 <= self._streaming_index < len(self.conversation.messages)):
+            failed = self.conversation.messages[self._streaming_index]
+            if not failed.text.strip():
+                if len(failed.versions) > 1:
+                    failed.drop_version()
+                elif self._streaming_index == len(self.conversation.messages) - 1:
+                    self.conversation.delete(self._streaming_index)
+            self.save()
+            self.render()
+
+    def _generation_done(self) -> None:
+        self._enable(True)
+        self.stop_button.setEnabled(False)
+        if self.thread is not None:
+            self.thread.deleteLater()
+        self.thread, self._worker = None, None
+
+    def stop(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+            self.set_status("Stopping…")
+
+    def busy(self) -> bool:
+        return self.thread is not None and self.thread.isRunning()
+
+    # ── plumbing ─────────────────────────────────────────────────────────────
+
+    def context_size(self) -> int:
+        """The window llama-server was started with, which the history has to fit.
+
+        Read per generation rather than cached: re-running setup can change it,
+        and a state file that cannot be read is a reason to use the default
+        rather than to refuse to answer.
+        """
+        try:
+            recorded = read_json(self.paths.state_file).get("context_size")
+            return int(recorded) if recorded else DEFAULT_CONTEXT
+        except (OSError, ValueError, TypeError):
+            return DEFAULT_CONTEXT
+
+    def save(self) -> None:
+        if self.conversation is not None:
+            try:
+                self.chats.save(self.conversation)
+            except OSError as exc:
+                self.set_status(f"Could not save this chat — {exc}")
+
+    def set_status(self, text: str) -> None:
+        self.status.setText(text)
+
+    def _enable(self, enabled: bool) -> None:
+        ready = enabled and self.character is not None and self.conversation is not None
+        for button in (self.send_button, self.regenerate_button, self.continue_button,
+                       self.impersonate_button, self.undo_button, self.attach_button):
+            button.setEnabled(ready)
+
+    def _last(self, role: str) -> int:
+        return self.conversation.last_index(role) if self.conversation else -1
+
+    def _toggle_settings(self, shown: bool) -> None:
+        self.settings_pane.setVisible(shown)
+        if not shown:
+            self.persist_settings()
+
+    def apply_metrics(self, metrics: dict) -> None:
+        """Follow the window's display size."""
+        self.metrics = metrics
+        self.input.setMinimumHeight(metrics["target"] * 2)
+        self.input.setMaximumHeight(metrics["target"] * 4)
+        self.system.setMinimumHeight(metrics["target"] * 3)
+        self.send_button.setMinimumWidth(metrics["target"] * 3)
+        self._avatar = None
+        self.render()
+
+    def rebind(self, paths) -> None:
+        """Follow a setup run that moved the installation root."""
+        self.persist_settings()
+        self.paths = paths
+        self.characters = CharacterStore.from_paths(paths)
+        self.chats = ChatStore.from_paths(paths)
+        self.persona = load_persona(paths)
+        self.character, self.conversation = None, None
+        self.reload_characters()
+
+    def remember(self, character: str | None = None, chat: str | None = None) -> None:
+        state = self._state()
+        if character is not None:
+            state["character"] = character
+            state.pop("chat", None)          # the chat belonged to the old one
+        if chat is not None:
+            state["chat"] = chat
+        try:
+            atomic_write_json(self.paths.data / STATE_FILE, state)
+        except OSError:
+            pass                              # remembering is a convenience
+
+    def _remembered(self, key: str) -> str | None:
+        value = self._state().get(key)
+        return value if isinstance(value, str) else None
+
+    def _state(self) -> dict:
+        try:
+            return read_json(self.paths.data / STATE_FILE)
+        except (OSError, ValueError):
+            return {}
+
+    def shutdown(self) -> None:
+        self.persist_settings()
+        if self._worker is not None:
+            self._worker.cancel()
+        if self.thread is not None and self.thread.isRunning():
+            self.thread.quit()
+            self.thread.wait(3000)
+
+
+def _pixmap_from_data_url(data_url: str) -> QPixmap | None:
+    _, _, encoded = data_url.partition(",")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+        return None
+    pixmap = QPixmap()
+    return pixmap if pixmap.loadFromData(raw) else None
+
