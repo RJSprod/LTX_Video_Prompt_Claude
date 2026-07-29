@@ -196,6 +196,84 @@ def test_the_controls_still_carry_upstream_keys_into_the_request(qt, window):
     assert request.lexicon == "Ada = a runner" and request.negative_extra == "logo"
 
 
+def test_a_seed_of_minus_one_draws_a_new_one_for_every_generation(qt, window):
+    """The dial stays on -1 — the next run should be random too — while each
+    request carries a real number, because upstream seeds its casting with it."""
+    from prompt_master.core.models import RANDOM_SEED
+
+    window.intent.setPlainText("A runner on a bridge")
+    assert window.seed.minimum() == RANDOM_SEED
+    assert window.seed.specialValueText()                 # shown in place of -1
+
+    window.seed.setValue(RANDOM_SEED)
+    drawn = {window.request().seed for _ in range(12)}
+    assert window.seed.value() == RANDOM_SEED
+    assert all(seed >= 0 for seed in drawn)
+    assert len(drawn) > 8, "the same seed keeps coming back"
+
+    window.seed.setValue(1234)
+    assert {window.request().seed for _ in range(3)} == {1234}
+
+
+def test_the_motion_preset_is_offered_and_carried(qt, window):
+    from prompt_master.prompt_engine import motion
+
+    window.intent.setPlainText("A runner on a bridge")
+    assert [window.motion.itemData(i) for i in range(window.motion.count())] == list(motion.PRESETS)
+    assert window.request().motion == motion.DEFAULT       # opens on upstream behaviour
+
+    window.select(window.motion, "flow")
+    assert window.request().motion == "flow"
+
+
+def test_the_speech_slider_goes_where_it_is_tapped(qt, window):
+    """Ten positions on a track, inside an area that flicks: a tap has to land
+    on a value, because a drag there has to be told apart from a scroll."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from prompt_master.prompt_engine import speech
+
+    slider = window.speech_slider
+    slider.resize(400, 48)
+    assert (slider.minimum(), slider.maximum(), slider.value()) == (speech.NONE, speech.MOST, speech.NONE)
+
+    def tap(x):
+        event = QMouseEvent(QMouseEvent.Type.MouseButtonPress, QPointF(x, 24), QPointF(x, 24),
+                            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        slider.mousePressEvent(event)
+
+    tap(400)
+    assert slider.value() == speech.MOST          # the far right is ten times
+    tap(0)
+    assert slider.value() == speech.NONE          # and the far left is untouched
+    tap(200)
+    assert speech.NONE < slider.value() < speech.MOST
+
+
+def test_the_slider_says_what_its_position_means(qt, window):
+    from prompt_master.prompt_engine import speech
+
+    window.speech_slider.setValue(speech.NONE)
+    assert "exactly" in window.speech_note.text().casefold()
+
+    window.dialogue.setValue(20)
+    window.speech_slider.setValue(speech.MOST)
+    assert "10×" in window.speech_note.text()
+    assert "100%" in window.speech_note.text()          # the budget it will use
+
+    window.dialogue.setValue(60)                        # moving the dial refreshes it
+    assert "100%" in window.speech_note.text()
+    window.speech_slider.setValue(2)
+    assert "2×" in window.speech_note.text()
+
+
+def test_the_slider_value_reaches_the_request(qt, window):
+    window.intent.setPlainText('She says "Get back inside"')
+    assert window.request().speech == 1                 # opens on "as written"
+    window.speech_slider.setValue(7)
+    assert window.request().speech == 7
+
+
 def test_attaching_an_image_switches_the_mode_and_names_the_file(qt, window, tmp_path):
     from PIL import Image
 

@@ -1,6 +1,18 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
+
+# A seed the user has not chosen. Upstream has no notion of one — it seeds the
+# casting and the sampler with whatever integer it is given — so a request
+# carrying this must have it resolved to a real number before the engine sees
+# it, which is what ``draw_seed`` is for.
+RANDOM_SEED = -1
+
+
+def draw_seed() -> int:
+    """A fresh seed, in the range llama.cpp and upstream's casting both accept."""
+    return random.randrange(0, 2 ** 31 - 1)
 
 
 @dataclass(slots=True)
@@ -43,6 +55,11 @@ class PromptRequest:
     seconds: float = 12.0
     # a key from upstream styles.STYLE_KEYS
     style: str = "off"
+    # a key from prompt_engine.motion.PRESETS; "default" is upstream unchanged
+    motion: str = "default"
+    # prompt_engine.speech multiplier: 1 leaves the intent exactly as typed
+    speech: int = 1
+    # RANDOM_SEED asks for a new one per generation; the UI resolves it
     seed: int = 7
     negative_extra: str = ""
     smart_negative: bool = False

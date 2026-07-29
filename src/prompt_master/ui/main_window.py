@@ -3,11 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QActionGroup
-from PySide6.QtWidgets import (QApplication,QCheckBox,QComboBox,QFileDialog,QFrame,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QMainWindow,QMessageBox,QPlainTextEdit,QPushButton,QScrollArea,QSizePolicy,QSpinBox,QDoubleSpinBox,QSplitter,QTextEdit,QVBoxLayout,QWidget)
+from PySide6.QtWidgets import (QApplication,QCheckBox,QComboBox,QFileDialog,QFrame,QGridLayout,QGroupBox,QHBoxLayout,QLabel,QMainWindow,QMessageBox,QPlainTextEdit,QPushButton,QScrollArea,QSizePolicy,QSlider,QSpinBox,QDoubleSpinBox,QSplitter,QTextEdit,QVBoxLayout,QWidget)
 import threading
 
-from prompt_master.core.models import PromptRequest
+from prompt_master.core.models import RANDOM_SEED, PromptRequest, draw_seed
 from prompt_master.imaging.preprocess import image_data_url
+from prompt_master.prompt_engine import motion
+from prompt_master.prompt_engine import speech
 from prompt_master.prompt_engine import options as opt
 from prompt_master.prompt_engine.adapter import PromptEngine, VisionUnavailable
 from prompt_master.core.paths import AppPaths
@@ -38,9 +40,18 @@ class GenerationWorker(QObject):
             # service.client() raises when vision is needed and the projector is
             # missing, so reaching this line means the still can go on the wire.
             client = self.service.client(needs_vision)
+            if self.request.speech > speech.NONE:
+                # Before the brief, not after: the extra lines have to be in the
+                # intent the engine reads, not bolted onto the shot it wrote.
+                self.status.emit("Writing extra speech…")
+                self.request, note = speech.expand(self.request, self._chat_stream(client),
+                                                   seed=self.request.seed)
+                if note: self.status.emit(f"Intent expanded — {note}")
             plan = self.engine.build(self.request, vision_available=True)
             self.status.emit(f"Generating positive prompt… ({plan.frames} frames, {plan.word_budget[0]}-{plan.word_budget[1]} words)")
-            raw = client.stream_chat(plan.messages, plan.max_tokens, self.request.seed, self.positive_chunk.emit, self.cancelled)
+            temperature, top_p = self.engine.sampling(self.request)
+            raw = client.stream_chat(plan.messages, plan.max_tokens, self.request.seed, self.positive_chunk.emit,
+                                     self.cancelled, temperature=temperature, top_p=top_p)
             if self.cancelled.is_set(): self.status.emit("Generation cancelled"); return
             positive = self.engine.clean_positive(raw)
             if not positive.strip(): raise RuntimeError("The model returned an empty script.")
@@ -50,7 +61,7 @@ class GenerationWorker(QObject):
                 self.status.emit("Negative pass…")
                 auto = self.engine.run_smart_negative(positive, self._chat_stream(client))
             self.negative_ready.emit(self.engine.merge_negative(self.request, auto))
-            self.status.emit("Server: running · Generation: complete")
+            self.status.emit(f"Server: running · Generation: complete · Seed: {self.request.seed}")
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
@@ -133,8 +144,11 @@ class MainWindow(QMainWindow):
         self.seconds=QDoubleSpinBox(); self.seconds.setRange(1,60); self.seconds.setSingleStep(0.5); self.seconds.setValue(d["seconds"]); self.seconds.setSuffix(" s")
         self.fps=QSpinBox(); self.fps.setRange(8,60); self.fps.setValue(d["fps"])
         self.dimensions=self.combo([("704x1216","704 × 1216 (portrait)"),("1216x704","1216 × 704 (landscape)"),("768x768","768 × 768 (square)"),("1920x1080","1920 × 1080"),("1080x1920","1080 × 1920")],f"{d['output_width']}x{d['output_height']}")
-        self.seed=QSpinBox(); self.seed.setRange(0,2**31-1); self.seed.setValue(d["seed"])
+        self.seed=QSpinBox(); self.seed.setRange(RANDOM_SEED,2**31-1); self.seed.setValue(d["seed"])
+        # Qt shows the special text in place of the minimum, which is what -1 is.
+        self.seed.setSpecialValueText("Random each time (-1)")
         self.style=self.grouped_combo(opt.STYLES_GROUPED,d["style"])
+        self.motion=self.combo(motion.OPTIONS,motion.DEFAULT)
         self.camera=self.combo(opt.CAMERAS,d["camera"])
         self.transition=self.combo(opt.TRANSITIONS,d["transition"])
         self.pov=self.combo(opt.POV,d["pov"])
@@ -145,6 +159,15 @@ class MainWindow(QMainWindow):
         self.dialogue=QSpinBox(); self.dialogue.setRange(0,100); self.dialogue.setValue(d["dialogue"]); self.dialogue.setSuffix("%")
         self.music=self.combo(opt.MUSIC,d["music"])
         self.music_bg=QCheckBox("Music plays low under the scene"); self.music_bg.setChecked(d["music_bg"])
+        self.speech_slider=touch.TouchSlider(Qt.Orientation.Horizontal)
+        self.speech_slider.setRange(speech.NONE,speech.MOST); self.speech_slider.setValue(speech.NONE)
+        self.speech_slider.setPageStep(1); self.speech_slider.setTickInterval(1); self.speech_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.speech_slider.setToolTip("Extra lines are written in the voice the intent already quotes, mixed back\ninto the intent, and the dialogue budget above is lifted to match so they survive\ninto the finished shot.")
+        self.speech_note=QLabel(); self.speech_note.setObjectName("fieldLabel"); self.speech_note.setWordWrap(True)
+        self.speech_slider.valueChanged.connect(self.describe_speech); self.describe_speech(self.speech_slider.value())
+        # The sentence names a budget worked out from the dial above it, so it
+        # goes stale the moment that dial moves.
+        self.dialogue.valueChanged.connect(lambda _value: self.describe_speech(self.speech_slider.value()))
         self.output_format=self.combo(opt.OUTPUT_FORMATS,d["fmt"])
         self.smart=QCheckBox("Smart negative — a second pass over the finished script"); self.smart.setChecked(d["smart_negative"])
         self.lexicon=QPlainTextEdit(); self.lexicon.setPlaceholderText("Name = description, one per line. Only names present in the intent are used."); touch.flickable(self.lexicon)
@@ -153,11 +176,12 @@ class MainWindow(QMainWindow):
             ("Shot", [("Video mode",self.mode),("Duration",touch.stepper(self.seconds)),
                       ("FPS",touch.stepper(self.fps)),("Dimensions",self.dimensions),
                       ("Seed",touch.stepper(self.seed))]),
-            ("Look", [("Style",self.style),("Camera",self.camera),("Transition",self.transition),
-                      ("First person",self.pov),("Wardrobe",self.wardrobe),(None,self.undress)]),
+            ("Look", [("Style",self.style),("Motion",self.motion),("Camera",self.camera),
+                      ("Transition",self.transition),("First person",self.pov),
+                      ("Wardrobe",self.wardrobe),(None,self.undress)]),
             ("Voice and music", [("Accent",self.accent),("Accent strength",self.accent_strength),
                                  ("Dialogue / talk",touch.stepper(self.dialogue)),("Music",self.music),
-                                 (None,self.music_bg)]),
+                                 (None,self.music_bg),("Extra speech",self.speech_field(),2)]),
             ("Wording", [("Output format",self.output_format),(None,self.smart),
                          ("Lexicon",self.lexicon),("Extra negative terms",self.negative_extra)]),
         ]
@@ -167,13 +191,28 @@ class MainWindow(QMainWindow):
         a check box says what it is — takes the full width."""
         box=QGroupBox(title); grid=QGridLayout(box); grid.setColumnStretch(0,1); grid.setColumnStretch(1,1)
         row=column=0
-        for caption,widget in fields:
-            span=2 if caption is None or isinstance(widget,QPlainTextEdit) else 1
+        for caption,widget,*rest in fields:
+            span=rest[0] if rest else (2 if caption is None or isinstance(widget,QPlainTextEdit) else 1)
             if span == 2 and column: row+=1; column=0
             grid.addWidget(self.field(caption,widget),row,column,1,span)
             column+=span
             if column >= 2: row+=1; column=0
         return box
+
+    def speech_field(self) -> QWidget:
+        """The slider with the sentence that says what its position means. Ten
+        positions of a bare track say nothing; "3× the lines" says all of it."""
+        holder=QWidget(); column=QVBoxLayout(holder); column.setContentsMargins(0,0,0,0); column.setSpacing(2)
+        column.addWidget(self.speech_slider); column.addWidget(self.speech_note)
+        return holder
+
+    def describe_speech(self, value):
+        if value <= speech.NONE:
+            self.speech_note.setText("Speech exactly as the intent quotes it")
+        else:
+            self.speech_note.setText(
+                f"{value}× the lines — extra speech written to match, and the dialogue "
+                f"budget raised to {speech.dialogue_floor(value, self.dialogue.value())}%")
 
     @staticmethod
     def field(caption, widget) -> QWidget:
@@ -304,6 +343,8 @@ class MainWindow(QMainWindow):
             seconds=self.seconds.value(),
             fps=self.fps.value(),
             style=self.chosen(self.style,"off"),
+            motion=self.chosen(self.motion,motion.DEFAULT),
+            speech=self.speech_slider.value(),
             camera=self.chosen(self.camera,"off"),
             transition=self.chosen(self.transition,"off"),
             pov=self.chosen(self.pov,"off"),
@@ -317,7 +358,9 @@ class MainWindow(QMainWindow):
             lexicon=self.lexicon.toPlainText(),
             fmt=self.chosen(self.output_format,"flowing"),
             negative_extra=self.negative_extra.toPlainText(),
-            seed=self.seed.value(),
+            # -1 means "a different one every time": resolved here, so the
+            # casting upstream seeds and the sampler both get the same number.
+            seed=self.seed.value() if self.seed.value() != RANDOM_SEED else draw_seed(),
             smart_negative=self.smart.isChecked(),
             output_width=width,
             output_height=height,

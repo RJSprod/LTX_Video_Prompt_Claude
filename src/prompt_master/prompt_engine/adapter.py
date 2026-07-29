@@ -5,6 +5,13 @@ output contract comes from ``prompt_engine.upstream``; the job here is only to
 hand upstream the values it expects and hand the caller back what upstream
 returned.
 
+The one addition it makes is the motion preset, and it makes it at the seams
+rather than inside: a directive appended after upstream's finished system
+prompt, and terms merged into the extra negatives upstream already accepts as
+an input. On the default preset both are empty, so a default build is upstream
+byte-for-byte — which ``test_prompt_engine.py`` asserts against ``build_system``
+directly.
+
 The call order mirrors ``upstream/routes.py::_build_messages`` exactly, and for
 one reason that module records: ``send_vision`` must be decided BEFORE
 ``build_system``, because the i2v opener changes completely depending on whether
@@ -20,6 +27,7 @@ from typing import Any
 
 from prompt_master.core.models import PromptRequest
 
+from . import motion
 from .upstream import brain
 from .upstream import negative as neg
 from .upstream.imaging import b64_to_pil, jpeg_b64, style_hint
@@ -103,6 +111,9 @@ class PromptEngine:
             style_hint=hint,
             has_image=send_vision,
         )
+        # After upstream has finished, never woven through it: removing the
+        # preset removes the whole of the difference it makes.
+        system = motion.applied(system, request.motion)
         user = brain.build_user(
             intent=request.intent,
             mode=mode,
@@ -175,12 +186,21 @@ class PromptEngine:
             fmt=request.fmt,
             transition=request.transition,
             intent=request.intent,
-            extra=request.negative_extra,
+            # The preset's terms arrive as extra terms — the same input the user
+            # types into — so upstream's dedupe sees them beside its own banks.
+            extra=motion.with_terms(request.motion, request.negative_extra),
             camera=request.camera,
             style=request.style,
             mode=request.video_mode,
             auto=auto,
         )
+
+    @staticmethod
+    def sampling(request: PromptRequest) -> tuple[float, float]:
+        """``(temperature, top_p)`` for the writer pass. The smart-negative pass
+        keeps upstream's own cooler numbers and does not consult this."""
+        chosen = motion.preset(request.motion)
+        return chosen.temperature, chosen.top_p
 
     @staticmethod
     def smart_negative_messages(script: str) -> list[dict[str, Any]]:

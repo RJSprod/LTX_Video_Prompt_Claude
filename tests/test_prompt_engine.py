@@ -15,7 +15,9 @@ import io
 import pytest
 from PIL import Image
 
-from prompt_master.core.models import PromptRequest
+from prompt_master.core.models import RANDOM_SEED, PromptRequest, draw_seed
+from prompt_master.prompt_engine import motion
+from prompt_master.prompt_engine import speech
 from prompt_master.prompt_engine import options as opt
 from prompt_master.prompt_engine.adapter import PromptEngine, VisionUnavailable
 from prompt_master.prompt_engine.upstream import brain
@@ -241,6 +243,211 @@ def test_every_default_is_a_real_engine_key():
         assert getattr(request, field) in opt.values(options), field
 
 
+# ── motion presets ───────────────────────────────────────────────────────────
+#
+# Three settings, and the first of them has to be indistinguishable from the
+# application that had no such setting.
+
+def motion_request(key, **overrides):
+    return PromptRequest(intent="a runner crosses a bridge at dawn", video_mode="t2v",
+                         motion=key, **overrides)
+
+
+def test_default_motion_changes_nothing_at_all():
+    """Not "changes little": the default build must be the upstream build, in
+    the system prompt, the negative and the sampling alike."""
+    engine = PromptEngine()
+    default = engine.build(motion_request(motion.DEFAULT))
+    assert default.system == brain.build_system(
+        mode="t2v", pov="off", accent="off", accent_strength="natural", dialogue=20,
+        wardrobe="auto", undress=False, seed=7, intent="a runner crosses a bridge at dawn",
+        camera="off", transition="off", music="off", music_bg=False, lexicon="",
+        fmt="flowing", fps=24, seconds=12.0, style="off", style_hint="", has_image=False)
+    assert default.base_negative == brain.build_negative(
+        pov="off", dialogue=20, undress=False, fmt="flowing", transition="off",
+        intent="a runner crosses a bridge at dawn", extra="", camera="off",
+        style="off", mode="t2v", auto="")
+    # backend.chat_stream's own numbers.
+    assert engine.sampling(motion_request(motion.DEFAULT)) == (0.85, 0.95)
+
+
+@pytest.mark.parametrize("key", [key for key in motion.PRESETS if key != motion.DEFAULT])
+def test_a_preset_is_appended_after_upstream_never_woven_into_it(key):
+    """The whole of the difference has to be removable by removing the preset,
+    which is only true if upstream's prompt is still there, unedited, at the
+    front of it."""
+    engine = PromptEngine()
+    default = engine.build(motion_request(motion.DEFAULT)).system
+    built = engine.build(motion_request(key)).system
+
+    assert built.startswith(default)
+    assert built.removeprefix(default) == f"\n\n{motion.PRESETS[key].directive}"
+
+
+def test_the_two_presets_pull_in_opposite_directions():
+    """Inertia is abrupt and Flow is continuous; a preset that asked for both
+    would be a preset that asks for nothing."""
+    inertia, flow = motion.PRESETS["inertia"], motion.PRESETS["flow"]
+    assert "abrupt" in inertia.directive.casefold() and "no slow" in inertia.directive.casefold()
+    assert "continuity" in flow.directive.casefold() and "no snap cuts" in flow.directive.casefold()
+    # Hotter for jolts, cooler for continuity, and neither one is the default.
+    assert inertia.temperature > 0.85 > flow.temperature
+    assert len({preset.temperature for preset in motion.PRESETS.values()}) == 3
+
+
+def test_preset_negative_terms_go_through_upstreams_dedupe():
+    """They are supplied as extra terms — the same input the user types into —
+    so a term upstream already banks is not banked twice."""
+    built = PromptEngine().build(motion_request("flow"))
+    assert "jerky motion" in built.base_negative
+    # "strobing" is in the preset's terms and in upstream's own bank. Asking
+    # for it twice must not weight it twice.
+    assert "strobing" in motion.PRESETS["flow"].negative
+    assert built.base_negative.count("strobing") == 1
+
+
+def test_a_preset_does_not_displace_the_users_own_terms():
+    built = PromptEngine().build(motion_request("inertia", negative_extra="my own term"))
+    assert "my own term" in built.base_negative and "floaty movement" in built.base_negative
+
+
+def test_an_unknown_preset_falls_back_to_upstream_behaviour():
+    """A state file written by another version must not break generation."""
+    engine = PromptEngine()
+    assert motion.preset("chartreuse").key == motion.DEFAULT
+    assert engine.build(motion_request("chartreuse")).system == engine.build(motion_request(motion.DEFAULT)).system
+    assert engine.sampling(motion_request(None)) == (0.85, 0.95)
+
+
+def test_every_preset_is_offered_with_its_name_first():
+    """The drop-down carries the key and shows the label; the name the setting
+    is known by has to lead it."""
+    assert [key for key, _ in motion.OPTIONS] == list(motion.PRESETS)
+    for key, label in motion.OPTIONS:
+        assert label.split(" —")[0].casefold() in (key, "default")
+
+
+# ── speech expansion ─────────────────────────────────────────────────────────
+#
+# A pass over the intent, before the brief is built. At 1x it does not run at
+# all, which is the behaviour this application has always had.
+
+SPOKEN = 'Ada slams the door and says "Get back inside" while rain hammers the porch'
+
+
+def answering(*lines):
+    """A model that returns these lines, ignoring what it was asked."""
+    return lambda messages, **kwargs: ["\n".join(lines)]
+
+
+def test_the_slider_at_one_leaves_the_intent_exactly_as_typed():
+    request = PromptRequest(intent=SPOKEN, video_mode="t2v", dialogue=20, speech=speech.NONE)
+    unchanged, note = speech.expand(request, lambda *a, **k: pytest.fail("no pass at 1x"))
+    assert unchanged is request and note == ""
+
+
+def test_extra_lines_are_mixed_into_the_intent_the_engine_reads():
+    """The lines have to be in the brief, not appended to the finished shot —
+    the engine writes the shot, and it only ever sees the intent."""
+    request = PromptRequest(intent=SPOKEN, video_mode="t2v", dialogue=20, speech=3)
+    model = answering('"Don\'t make me come out there"', '"You will catch your death out here"')
+
+    expanded, note = speech.expand(request, model)
+
+    assert "Get back inside" in expanded.intent          # the original survives
+    assert "Don't make me come out there" in expanded.intent
+    assert "2 extra lines in the same voice" == note
+    # And it reaches the engine as part of the director's request.
+    assert "You will catch your death out here" in PromptEngine().build(expanded).user
+
+
+def test_the_multiplier_counts_total_lines_not_added_ones():
+    assert speech.wanted(1, 4) == 0
+    assert speech.wanted(10, 1) == 9                     # ten times one line
+    assert speech.wanted(3, 2) == 4                      # three times two lines
+    assert speech.wanted(10, 20) == speech.LINE_CEILING - 20
+
+
+def test_the_dialogue_budget_is_lifted_from_the_users_setting_never_below_it():
+    """Twenty extra lines against a budget of two is nineteen lines the model is
+    being told to drop, so the budget moves with the slider."""
+    assert speech.dialogue_floor(speech.NONE, 20) == 20  # 1x changes nothing
+    assert speech.dialogue_floor(10, 20) == 100
+    assert speech.dialogue_floor(10, 0) == 100           # a zero dial is still lifted
+    assert speech.dialogue_floor(3, 80) >= 80            # a high dial is never lowered
+    assert speech.dialogue_floor(5, 20) == 56
+    for multiplier in range(speech.NONE, speech.MOST + 1):
+        assert 20 <= speech.dialogue_floor(multiplier, 20) <= 100
+
+
+def test_an_intent_with_no_speech_gets_lines_written_for_the_scene():
+    silent = PromptRequest(intent="A lone runner crosses a bridge at dawn",
+                           video_mode="t2v", speech=4)
+    model = answering('"The bridge is longer than it looks"', '"I can make it before the light"')
+
+    expanded, note = speech.expand(silent, model)
+    assert "written for the scene" in note
+    assert "The bridge is longer than it looks" in expanded.intent
+    # And the pass says so: the system prompt for that case is a different one.
+    assert speech.messages(silent.intent, [], 3)[0]["content"] == speech.SYSTEM_UNQUOTED
+    assert speech.messages(SPOKEN, ["Get back inside"], 3)[0]["content"] == speech.SYSTEM
+
+
+def test_a_reply_that_wanders_is_cleaned_rather_than_trusted():
+    request = PromptRequest(intent=SPOKEN, video_mode="t2v", speech=10)
+    model = answering(
+        'Here are the lines you asked for:',
+        '1. "The storm is not going to wait for you"',
+        '"Too short"',                                   # under five words
+        '"Get back inside"',                             # already in the intent
+        '"' + " ".join(["word"] * 40) + '"',             # a speech, not a line
+        '"You will catch your death out here"')
+
+    expanded, _note = speech.expand(request, model)
+    kept = speech.quoted_lines(expanded.intent.split("in the same voices:")[1])
+    assert kept == ["The storm is not going to wait for you",
+                    "You will catch your death out here"]
+
+
+def test_a_failed_pass_costs_the_extra_lines_and_not_the_shot():
+    """Upstream's second pass never raises for the same reason: the user pressed
+    a button for a generation, not for an expansion."""
+    def broken(messages, **kwargs):
+        raise RuntimeError("llama-server died")
+
+    request = PromptRequest(intent=SPOKEN, video_mode="t2v", dialogue=20, speech=10)
+    same, note = speech.expand(request, broken)
+    assert same.intent == SPOKEN and "skipped" in note
+    # The budget still moves: it is the half of "more speech" that still works.
+    assert same.dialogue == 100
+
+
+def test_quoted_lines_reads_both_kinds_of_quote_and_keeps_the_order():
+    found = speech.quoted_lines('He says "first line here" then she says “second line here”')
+    assert found == ["first line here", "second line here"]
+    assert speech.quoted_lines("nothing quoted at all") == []
+
+
+# ── random seed ──────────────────────────────────────────────────────────────
+
+def test_a_drawn_seed_is_one_upstream_and_llama_cpp_both_accept():
+    """Upstream seeds its casting with this integer and llama.cpp seeds its
+    sampler with it; a negative one is meaningful to neither."""
+    drawn = {draw_seed() for _ in range(50)}
+    assert all(0 <= seed < 2 ** 31 for seed in drawn)
+    assert len(drawn) > 40, "draw_seed keeps returning the same number"
+    assert RANDOM_SEED == -1
+
+
+def test_the_seed_reaches_upstreams_casting_not_only_the_sampler():
+    """It picks the cast and the wardrobe as well as seeding llama.cpp, which
+    is why a drawn seed has to be fixed before the brief is built rather than
+    at the point the request goes on the wire."""
+    built = PromptEngine().build(motion_request(motion.DEFAULT, seed=4242))
+    unseeded = PromptEngine().build(motion_request(motion.DEFAULT, seed=99))
+    assert built.system != unseeded.system      # the seed reached upstream's casting
+
+
 def test_every_control_value_builds_a_brief():
     """Sweep each control across its whole range — no key may crash the engine."""
     engine = PromptEngine()
@@ -250,6 +457,7 @@ def test_every_control_value_builds_a_brief():
                           ("music", ["auto"] + list(MUSIC_KEYS)), ("fmt", FORMATS),
                           ("accent_strength", list(STRENGTHS)),
                           ("pov", ["off", "male", "female"]),
+                          ("motion", list(motion.PRESETS)),
                           ("wardrobe", ["auto", "off", "her", "him"])]:
         for value in values:
             built = engine.build(PromptRequest(**{**base, field: value}))
