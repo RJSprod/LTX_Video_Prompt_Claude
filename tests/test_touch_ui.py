@@ -492,6 +492,76 @@ def test_the_settings_panel_is_saved_with_the_character(qt, chat_window):
     assert saved.context == "A runner." and saved.greeting == "Hello {{user}}."
 
 
+def test_touching_a_setting_writes_it_without_anything_being_pressed(qt, chat_window):
+    """Changing a value is what saves it. The panel schedules the write a
+    moment after the control stops moving, so holding a stepper down is one
+    write rather than forty."""
+    from prompt_master.ui import chat_page
+
+    page = chat_window.chat
+    page.settings_button.setChecked(True)
+
+    page.temperature.setValue(0.42)
+    assert page._settings_timer.isActive(), "no write was scheduled"
+    assert page.save_settings_button.isEnabled(), "the panel does not say it has anything to write"
+    page._settings_timer.timeout.emit()          # what a moment of stillness does
+
+    assert page.characters.load("Ada").temperature == 0.42
+    assert not page.save_settings_button.isEnabled()
+    assert page.settings_note.text() == chat_page.SETTINGS_SAVED
+
+
+def test_the_panels_save_button_writes_now_and_names_what_it_wrote_to(qt, chat_window):
+    """The button is not the only way to save; it is the way to be told that
+    it saved, which is the half that was missing."""
+    page = chat_window.chat
+    page.settings_button.setChecked(True)
+    page.top_p.setValue(0.5)
+    page.max_tokens.setValue(256)
+    page.system.setPlainText("Answer as {{char}}, tersely.")
+    page._settings_timer.stop()                  # nothing has written it yet
+
+    page.save_settings_button.click()
+
+    saved = page.characters.load("Ada")
+    assert (saved.top_p, saved.max_reply_tokens) == (0.5, 256)
+    assert saved.system == "Answer as {{char}}, tersely."
+    assert "Ada" in page.status.text() and "saved" in page.status.text()
+    assert not page.save_settings_button.isEnabled()
+
+
+def test_a_settings_write_that_fails_says_so_instead_of_going_quiet(qt, chat_window, monkeypatch):
+    """A write that silently failed is exactly what "the temperature will not
+    stick" looks like from the outside."""
+    page = chat_window.chat
+    page.settings_button.setChecked(True)
+
+    def refuse(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(page.characters, "save", refuse)
+    page.temperature.setValue(0.31)
+    page.save_settings_button.click()
+
+    assert "disk full" in page.settings_note.text()
+    assert "disk full" in page.status.text()
+    assert page.save_settings_button.isEnabled(), "there is still something to write"
+
+
+def test_opening_another_character_does_not_look_like_an_unsaved_change(qt, chat_window):
+    """Filling the panel in is not a change to it: the previous character's
+    pending write is dropped, and the new one opens saved."""
+    from prompt_master.chat.characters import Character
+
+    page = chat_window.chat
+    page.characters.save(Character(name="Chiharu", context="An engineer.", temperature=1.1))
+    page.reload_characters(select="Chiharu")
+
+    assert page.temperature.value() == 1.1
+    assert not page._settings_timer.isActive()
+    assert not page.save_settings_button.isEnabled()
+
+
 class _ScriptedClient:
     """A llama-server that answers from a list instead of from a model."""
 
@@ -1077,3 +1147,165 @@ def test_the_model_cannot_be_unloaded_mid_generation(qt, window, monkeypatch):
 
     window.unload_model()
     assert stopped == [] and told and "Stop" in told[0]
+
+
+# ── which model runs, as against what runs it ────────────────────────────────
+
+@pytest.fixture
+def model_window(qt, window):
+    """A window with a finished install behind it and a second model on disk."""
+    from prompt_master.core.config import atomic_write_json
+
+    atomic_write_json(window.paths.state_file, {
+        "runtime": "runtime/llama-server.exe", "runtime_id": "llama-runtime-cuda12",
+        "model": "models/model.gguf", "mmproj": "models/mmproj.gguf",
+        "mode": "gpu", "gpu_index": 0, "gpu_name": "NVIDIA GeForce RTX 4090",
+        "gpu_device": "CUDA0", "gpu_device_name": "RTX 4090",
+        "quantization": "Q4_K_M", "context_size": 16384, "gpu_layers": "all",
+    })
+    for relative in ("models/model.gguf", "models/mmproj.gguf",
+                     "models/Other-Q6_K_P.gguf", "models/Other-mmproj-f16.gguf"):
+        target = window.paths.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"stand-in")
+    return window
+
+
+class _Picked:
+    """The dialog, already answered. Standing in for one nobody can click."""
+
+    def __init__(self, model, mmproj=None):
+        self.model, self.mmproj = model, mmproj
+
+    def __call__(self, _paths, _parent=None): return self
+    def exec(self): return 1
+    def model_path(self): return self.model
+    def mmproj_path(self): return self.mmproj
+
+
+def test_the_dialog_opens_on_the_model_that_is_running(qt, model_window):
+    from prompt_master.ui.model_chooser import ModelDialog
+
+    dialog = ModelDialog(model_window.paths, model_window)
+    try:
+        assert dialog.model.text() == str((model_window.paths.root / "models/model.gguf").resolve())
+        assert dialog.mmproj.text() == str((model_window.paths.root / "models/mmproj.gguf").resolve())
+        none = next(button for button in dialog.findChildren(qt.QPushButton)
+                    if button.text() == "None")
+        none.click()
+        assert dialog.mmproj_path() is None, "None means run it without one"
+        assert dialog.model_path() == (model_window.paths.root / "models/model.gguf").resolve()
+    finally:
+        dialog.close()
+
+
+def test_choosing_another_model_records_it_and_unloads_the_one_running(qt, model_window, monkeypatch):
+    import json
+    from prompt_master.ui import main_window as module
+
+    stopped = []
+    chosen = model_window.paths.root / "models" / "Other-Q6_K_P.gguf"
+    projector = model_window.paths.root / "models" / "Other-mmproj-f16.gguf"
+    monkeypatch.setattr(module, "ModelDialog", _Picked(chosen, projector))
+    monkeypatch.setattr(model_window.service, "stop", lambda: stopped.append(True))
+
+    model_window.choose_model()
+
+    state = json.loads(model_window.paths.state_file.read_text(encoding="utf-8"))
+    assert state["model"] == "models/Other-Q6_K_P.gguf"
+    assert state["mmproj"] == "models/Other-mmproj-f16.gguf"
+    assert state["quantization"] == "Q6_K_P"
+    # The device it runs on is not what this menu changes.
+    assert state["gpu_device"] == "CUDA0" and state["runtime_id"] == "llama-runtime-cuda12"
+    assert stopped, "the server still holds the old weights until it is stopped"
+    assert "Other-Q6_K_P.gguf" in model_window.status.text()
+    assert "loads on your next generation" in model_window.chat.status.text()
+
+
+def test_a_model_chosen_without_a_projector_says_images_are_gone(qt, model_window, monkeypatch):
+    import json
+    from prompt_master.ui import main_window as module
+
+    chosen = model_window.paths.root / "models" / "Other-Q6_K_P.gguf"
+    monkeypatch.setattr(module, "ModelDialog", _Picked(chosen))
+    monkeypatch.setattr(model_window.service, "stop", lambda: None)
+
+    model_window.choose_model()
+
+    assert json.loads(model_window.paths.state_file.read_text(encoding="utf-8"))["mmproj"] == ""
+    assert "No vision projector" in model_window.status.text()
+    # And the bar keeps saying it, not just once at the moment it changed.
+    model_window.refresh_status()
+    assert "no vision" in model_window.status.text()
+
+
+def test_an_image_is_refused_before_a_generation_starts_when_nothing_can_see_it(
+        qt, model_window, monkeypatch, tmp_path):
+    from PIL import Image
+    from prompt_master.ui import main_window as module
+
+    refused = []
+    monkeypatch.setattr(module.QMessageBox, "critical",
+                        lambda _self, _title, text, *a, **k: refused.append(text))
+    monkeypatch.setattr(module, "ModelDialog",
+                        _Picked(model_window.paths.root / "models" / "Other-Q6_K_P.gguf"))
+    monkeypatch.setattr(model_window.service, "stop", lambda: None)
+    model_window.choose_model()
+
+    picture = tmp_path / "still.png"
+    Image.new("RGB", (32, 32), (10, 10, 10)).save(picture)
+    model_window.image_path = picture
+    model_window.select(model_window.mode, "i2v")
+    model_window.intent.setPlainText("A red ball rolls across a table")
+
+    model_window.generate()
+
+    assert model_window.thread is None, "nothing was started"
+    assert refused and "no vision projector" in refused[0]
+
+
+def test_attaching_a_picture_in_a_chat_says_so_too(qt, model_window, monkeypatch):
+    from prompt_master.ui import main_window as module
+    from prompt_master.ui import chat_page as chat_module
+
+    monkeypatch.setattr(module, "ModelDialog",
+                        _Picked(model_window.paths.root / "models" / "Other-Q6_K_P.gguf"))
+    monkeypatch.setattr(model_window.service, "stop", lambda: None)
+    model_window.choose_model()
+
+    picture = model_window.paths.root / "still.png"
+    picture.write_bytes(b"not really a picture")
+    monkeypatch.setattr(chat_module.QFileDialog, "getOpenFileName",
+                        lambda *a, **k: (str(picture), ""))
+
+    model_window.chat.attach_image()
+
+    assert model_window.chat.attachment == picture, "it is still attached"
+    assert "no vision projector" in model_window.chat.status.text()
+
+
+def test_the_model_cannot_be_changed_mid_generation(qt, model_window, monkeypatch):
+    from prompt_master.ui import main_window as module
+
+    told = []
+    monkeypatch.setattr(model_window.chat, "busy", lambda: True)
+    monkeypatch.setattr(module, "ModelDialog",
+                        lambda *a, **k: pytest.fail("the dialog must not open"))
+    monkeypatch.setattr(module.QMessageBox, "information",
+                        lambda _self, _title, text, *a, **k: told.append(text))
+
+    model_window.choose_model()
+    assert told and "Stop" in told[0]
+
+
+def test_the_model_dialog_is_finger_sized_too(qt, model_window):
+    from prompt_master.ui.model_chooser import ModelDialog
+
+    dialog = ModelDialog(model_window.paths, model_window)
+    try:
+        small = [(type(widget).__name__, widget.sizeHint().height())
+                 for widget in targets(qt, dialog)
+                 if widget.sizeHint().height() < FINGERTIP]
+        assert small == []
+    finally:
+        dialog.close()

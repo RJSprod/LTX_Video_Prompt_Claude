@@ -101,3 +101,35 @@ class AppPaths:
         if candidate != self.root.resolve() and self.root.resolve() not in candidate.parents:
             raise ValueError("Path escapes installation root")
         return candidate
+
+    def locate(self, recorded: str | Path) -> Path:
+        """Where an artifact the state file names actually is.
+
+        Everything setup installs is recorded relative to the install root and
+        has to stay inside it — that is ``contained``, and it is what keeps a
+        state file from pointing the launcher at an executable somewhere else.
+        A model chosen by hand is the one thing that is not installed: it is
+        already on the disk, it is 16-27 GiB, and moving it into the install
+        root to satisfy a rule about tidiness is not a thing to do to somebody
+        else's drive. So an absolute path is taken as given, and a relative one
+        is contained exactly as before.
+
+        This is for the weights and the projector — data the server reads.
+        The runtime is still resolved with ``contained``, because that one is a
+        program this application starts.
+        """
+        path = Path(recorded).expanduser()
+        return path.resolve() if path.is_absolute() else self.contained(path)
+
+    def record(self, path: str | Path) -> str:
+        """``path`` as the state file should hold it — relative when it is ours.
+
+        The inverse of ``locate``: a file under the install root is recorded
+        relative to it, so the whole installation stays movable, and anything
+        outside is recorded as the absolute path it was chosen at.
+        """
+        resolved = Path(path).expanduser().resolve()
+        root = self.root.resolve()
+        if resolved == root or root in resolved.parents:
+            return resolved.relative_to(root).as_posix()
+        return str(resolved)
