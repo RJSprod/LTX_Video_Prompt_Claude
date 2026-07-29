@@ -217,11 +217,51 @@ status, Clear, Cancel and Generate never scrolls at all.
   drop-down row is at least 48 logical pixels tall, and spin boxes get a full
   height `−` and `+` either side of the value — hold either one to run it up —
   in place of Qt's two stacked arrows, which are half that.
-- **View → Display size** switches between Comfortable, Large and Larger. It
-  restyles the window live, applies to the setup wizard too, and is remembered.
+- **View → Display size** switches between Smaller, Small, Comfortable, Large
+  and Larger. It restyles the window live, applies to the setup wizard too, and
+  is remembered.
+
+  Comfortable and up keep every target at a fingertip or more. **Small** and
+  **Smaller** deliberately go under that floor — 41 and 35 logical pixels
+  against the 48 a fingertip wants — because prompt mode has a great many
+  controls and a large monitor with a mouse on it is a real way to use this.
+  Everything scales together, so nothing overlaps or clips; it only gets small,
+  and a finger will start to miss things at Smaller. Neither is ever a default.
 
 The window opens on most of the screen rather than at a fixed size, and the
 divider between the two panes can be dragged to give either one more room.
+
+### Changing what runs the model, and giving the memory back
+
+**Settings → What runs the model** lists the same devices setup offers — every
+CUDA card twice, once holding the model and once in mixed mode, and your
+processor — with the one in use ticked. See
+[the three ways to run it](#the-three-ways-to-run-it). Picking another one says
+what it will do and what it costs before it does anything:
+
+- **the model is not downloaded again.** It is 16–27 GiB already on disk and it
+  is the same file whichever device runs it. Only the llama.cpp build changes,
+  and only when the new device needs a different one — a card and the same card
+  in mixed mode share theirs, so that switch touches nothing on disk. When a
+  build *is* needed it is fetched against the same pinned SHA-256 setup uses,
+  or unpacked from the download cache if it has been fetched before;
+- **the model is unloaded now and loads again on your next generation**, which
+  takes a little while at that size. Nothing reloads until you ask for
+  something;
+- if the installed quantization wants more VRAM than the card you picked
+  reports, it says so and by how much — the same warning setup gives, with the
+  same answer: mixed mode.
+
+A device cannot be changed while a generation or a reply is running. It says so
+rather than interrupting one; wait for it, or press Stop.
+
+Model quality stays in **Models and Hardware**, because changing it means
+downloading a different 16–27 GiB file and that belongs in the wizard that
+shows the size and the progress.
+
+**Settings → Unload the model from memory** hands the VRAM or system RAM back
+now instead of when the application closes — for giving a card to something
+else without quitting. The next generation starts the server again by itself.
 
 ## Conversation mode
 
@@ -375,7 +415,9 @@ What changed, and only this:
 | Running without a card | Not possible | The processor and system RAM are an option in both front ends, on the pinned CPU build of `llama.cpp` |
 | Running with a card too small for the model | Not possible | Mixed mode: same CUDA install, weights in system RAM, nothing resident on the card, which keeps the work `llama.cpp` can give it |
 | Where the model comes from | Downloaded, always | Downloaded, or installed from a `.gguf` you already have — against the same pinned SHA-256 |
-| Window | One column of mouse-sized controls | Two panes, fingertip-sized targets, drag-to-scroll, a display-size setting |
+| Window | One column of mouse-sized controls | Two panes, fingertip-sized targets, drag-to-scroll, five display sizes from Smaller to Larger |
+| Changing device | Re-run setup | That, or Settings → What runs the model, which swaps the llama.cpp build and keeps the model that is installed |
+| Freeing the memory | Close the application | That, or Settings → Unload the model from memory |
 | What the window does | Writes prompts | That, or — on Settings → Mode — a chat with characters you write or import, on the same model |
 | Motion | One way of writing it | Default is that way exactly; **Inertia** and **Flow** are opt-in |
 | Seed | A number | A number, or `-1` for a fresh one each generation |
@@ -411,23 +453,25 @@ the mode drop-down set either way is the same prompt.
 ## Tests
 
 ```
-python -m pytest tests/        # 682 passed
+python -m pytest tests/        # 701 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
 - `test_prompt_engine.py` (44) — the adapter seam, the motion presets, speech
   expansion and the UI option sources
-- `test_touch_ui.py` (46) — target sizes, drag-to-scroll, the sliders and the
-  display size, the menu-bar mode switch and the View toggles, the transcript's
-  layout and its sticky bottom, and conversation mode driven end to end against
-  a scripted server, measured on a real window built offscreen
+- `test_touch_ui.py` (59) — target sizes, drag-to-scroll, the sliders and the
+  five display sizes, the menu-bar mode switch and the View toggles, the
+  runtime device menu and unloading, the transcript's layout and its sticky
+  bottom, and conversation mode driven end to end against a scripted server,
+  measured on a real window built offscreen
 - `test_chat.py` (36) — the character format and its three imports, chat
   history and branching, and what a chat turn puts on the wire
 - `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
   download resume and retry
-- `test_install_flow.py` (107) — install-root discovery, GPU sizing, the CPU
+- `test_install_flow.py` (113) — install-root discovery, GPU sizing, the CPU
   and mixed devices, manifest resolution, console setup, supplying a model from
-  disk, and the installer's interpreter and environment checks
+  disk, changing device without re-downloading the model, and the installer's
+  interpreter and environment checks
 
 Output-level parity against an upstream checkout is checked separately:
 

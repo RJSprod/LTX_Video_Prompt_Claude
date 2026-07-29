@@ -167,14 +167,48 @@ def test_an_unknown_saved_size_falls_back_instead_of_failing(tmp_path):
         touch.save_scale(paths, "Enormous")
 
 
-def test_metrics_grow_with_the_scale_and_never_go_under_a_fingertip():
+def test_metrics_grow_with_the_scale_and_the_touch_sizes_stay_a_fingertip():
+    """Every size keeps its proportions. The fingertip floor holds for all of
+    them except the two compact ones, which are under it deliberately and only
+    when they are asked for by name."""
     from prompt_master.ui import touch
 
     for name, scale in touch.SCALES.items():
         sizes = touch.metrics(scale)
-        assert sizes["target"] >= FINGERTIP, name
         assert sizes["primary"] > sizes["action"] >= sizes["target"], name
-    assert touch.metrics(1.35)["text"] > touch.metrics(1.0)["text"]
+        if name in touch.COMPACT:
+            # Smaller than a fingertip, but still a control rather than a line
+            # of text — and still tall enough to hit with a mouse.
+            assert 28 <= sizes["target"] < FINGERTIP, name
+        else:
+            assert sizes["target"] >= FINGERTIP, name
+    assert touch.metrics(1.35)["text"] > touch.metrics(1.0)["text"] > touch.metrics(0.72)["text"]
+
+
+def test_the_compact_sizes_are_the_two_below_comfortable():
+    from prompt_master.ui import touch
+
+    assert list(touch.SCALES) == ["Smaller", "Small", "Comfortable", "Large", "Larger"]
+    assert touch.COMPACT == ("Smaller", "Small")
+    assert touch.DEFAULT_SCALE == "Comfortable" and touch.DEFAULT_SCALE not in touch.COMPACT
+    assert touch.SCALES["Smaller"] < touch.SCALES["Small"] < touch.SCALES["Comfortable"]
+
+
+def test_the_display_size_menu_offers_the_compact_sizes_and_they_shrink_it(qt, window, tmp_path):
+    from prompt_master.ui import touch
+
+    assert [action.data() for action in window.size_actions.actions()] == list(touch.SCALES)
+    comfortable = window.generate_button.sizeHint().height()
+
+    window.apply_scale("Small")
+    small = window.generate_button.sizeHint().height()
+    window.apply_scale("Smaller")
+    smaller = window.generate_button.sizeHint().height()
+    assert smaller < small < comfortable
+    assert touch.load_scale(AppPaths(tmp_path)) == "Smaller"
+
+    window.apply_scale("Comfortable")
+    assert window.generate_button.sizeHint().height() == comfortable
 
 
 # ── the rewiring survived the new layout ─────────────────────────────────────
@@ -861,3 +895,185 @@ def test_rebuilding_the_transcript_leaves_no_ghosts_behind(qt, chat_window):
     still_there = [bubble for bubble in page.transcript.findChildren(MessageBubble)
                    if bubble.parent() is page.transcript]
     assert len(still_there) == len(page.conversation.messages) == len(page.bubbles)
+
+
+# ── what runs the model, at runtime ──────────────────────────────────────────
+
+def _three_devices():
+    """A card offered both ways, and the processor — what setup offers."""
+    import dataclasses
+
+    from prompt_master.core.models import CPU_INDEX, GpuInfo
+
+    card = GpuInfo(0, "GPU-0", "NVIDIA GeForce RTX 4090", 24564, 22000, "560.94", 8.9)
+    processor = GpuInfo(CPU_INDEX, "CPU", "Test Processor", 65413, 40000, "AMD64", None)
+    return [card, dataclasses.replace(card, mixed=True), processor]
+
+
+@pytest.fixture
+def device_window(qt, window, monkeypatch):
+    """A window whose device scan is a fixture rather than this machine."""
+    from prompt_master.core.config import atomic_write_json
+    from prompt_master.ui import main_window as module
+
+    monkeypatch.setattr(module, "detect_devices", lambda *a, **k: _three_devices())
+    atomic_write_json(window.paths.state_file, {
+        "runtime": "runtime/llama-server.exe", "runtime_id": "llama-runtime-cuda12",
+        "model": "models/model.gguf", "mmproj": "models/mmproj.gguf",
+        "mode": "gpu", "gpu_index": 0, "gpu_name": "NVIDIA GeForce RTX 4090",
+        "gpu_device": "CUDA0", "gpu_device_name": "RTX 4090",
+        "quantization": "Q4_K_M", "context_size": 16384, "gpu_layers": "all",
+    })
+    monkeypatch.setattr(module.installer, "runtime_ready", lambda *a, **k: True)
+    monkeypatch.setattr(module.installer, "runtime_downloaded", lambda *a, **k: True)
+    return window
+
+
+def test_the_device_menu_offers_every_way_to_run_the_model_with_the_current_one_ticked(
+        qt, device_window):
+    device_window.populate_devices()
+    actions = device_window.device_actions.actions()
+
+    assert len(actions) == 3
+    assert "4090" in actions[0].text() and "mixed" in actions[1].text()
+    assert "no GPU used" in actions[2].text()
+    ticked = [action for action in actions if action.isChecked()]
+    assert len(ticked) == 1 and ticked[0].data().mode == "gpu"
+    # The same wording setup uses, so one device is not two things.
+    from prompt_master.inference.device_detection import describe
+    assert actions[1].text() == describe(_three_devices()[1])
+
+
+def test_changing_the_device_warns_switches_and_unloads_the_model(qt, device_window, monkeypatch):
+    from prompt_master.ui import main_window as module
+
+    asked, switched, stopped = [], [], []
+    monkeypatch.setattr(module.QMessageBox, "question",
+                        lambda _self, _title, text, *a, **k: asked.append(text)
+                        or module.QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(module.installer, "switch_device",
+                        lambda paths, device, **kwargs: switched.append(device))
+    monkeypatch.setattr(device_window.service, "stop", lambda: stopped.append(True))
+
+    processor = _three_devices()[2]
+    device_window.choose_device(processor)
+
+    assert switched == [processor]
+    assert stopped, "the model has to be let go of, or the switch means nothing"
+    warning = asked[0]
+    assert "unloaded" in warning and "loads again on your next generation" in warning
+    assert "16-27 GiB" in warning
+    assert "loads again" in device_window.status.text()
+    assert "loads again" in device_window.chat.status.text()
+
+
+def test_declining_the_warning_changes_nothing(qt, device_window, monkeypatch):
+    from prompt_master.ui import main_window as module
+
+    monkeypatch.setattr(module.QMessageBox, "question",
+                        lambda *a, **k: module.QMessageBox.StandardButton.No)
+    monkeypatch.setattr(module.installer, "switch_device",
+                        lambda *a, **k: pytest.fail("switched without being told to"))
+    device_window.choose_device(_three_devices()[2])
+
+
+def test_choosing_the_device_already_running_does_nothing_at_all(qt, device_window, monkeypatch):
+    from prompt_master.ui import main_window as module
+
+    monkeypatch.setattr(module.QMessageBox, "question",
+                        lambda *a, **k: pytest.fail("asked about the device already in use"))
+    monkeypatch.setattr(module.installer, "switch_device", lambda *a, **k: pytest.fail("switched"))
+    device_window.choose_device(_three_devices()[0])
+
+
+def test_the_device_cannot_be_changed_while_something_is_generating(qt, device_window, monkeypatch):
+    from prompt_master.ui import main_window as module
+
+    told = []
+    monkeypatch.setattr(device_window.chat, "busy", lambda: True)
+    monkeypatch.setattr(module.QMessageBox, "information",
+                        lambda _self, _title, text, *a, **k: told.append(text))
+    monkeypatch.setattr(module.installer, "switch_device",
+                        lambda *a, **k: pytest.fail("switched mid-generation"))
+
+    device_window.choose_device(_three_devices()[2])
+    assert told and "Stop" in told[0]
+
+
+def test_a_switch_that_fails_says_so_and_leaves_the_model_loaded(qt, device_window, monkeypatch):
+    from prompt_master.ui import main_window as module
+
+    complained, stopped = [], []
+    monkeypatch.setattr(module.QMessageBox, "question",
+                        lambda *a, **k: module.QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(module.QMessageBox, "critical",
+                        lambda _self, _title, text, *a, **k: complained.append(text))
+    monkeypatch.setattr(module.installer, "switch_device",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no such runtime")))
+    monkeypatch.setattr(device_window.service, "stop", lambda: stopped.append(True))
+
+    device_window.choose_device(_three_devices()[2])
+    assert complained == ["no such runtime"] and stopped == []
+
+
+def test_a_switch_names_a_download_only_when_there_is_one(qt, device_window, monkeypatch):
+    from prompt_master.ui import main_window as module
+
+    state = device_window.setup_state()
+    monkeypatch.setattr(module.installer, "runtime_ready", lambda *a, **k: True)
+    assert "download" not in device_window.switch_warning(_three_devices()[2], state)
+
+    monkeypatch.setattr(module.installer, "runtime_ready", lambda *a, **k: False)
+    monkeypatch.setattr(module.installer, "runtime_downloaded", lambda *a, **k: False)
+    assert "downloaded first" in device_window.switch_warning(_three_devices()[2], state)
+    monkeypatch.setattr(module.installer, "runtime_downloaded", lambda *a, **k: True)
+    assert "unpacked from the download cache" in device_window.switch_warning(
+        _three_devices()[2], state)
+
+
+def test_the_warning_repeats_the_vram_shortfall_setup_would_have_shown(qt, device_window):
+    from prompt_master.core.config import atomic_write_json
+
+    state = device_window.setup_state()
+    state["quantization"] = "Q8_K_P"           # 40 GiB wanted, 24 GiB card
+    atomic_write_json(device_window.paths.state_file, state)
+
+    warning = device_window.switch_warning(_three_devices()[0], device_window.setup_state())
+    assert "more VRAM than this card reports" in warning and "mixed mode" in warning
+    # Mixed mode has nothing to fall short of: the weights are in system RAM.
+    assert "more VRAM" not in device_window.switch_warning(_three_devices()[1],
+                                                           device_window.setup_state())
+
+
+# ── unloading the model ──────────────────────────────────────────────────────
+
+def test_unloading_gives_the_memory_back_and_says_when_it_comes_again(qt, window, monkeypatch):
+    stopped = []
+    monkeypatch.setattr(window.service, "stop", lambda: stopped.append(True))
+    monkeypatch.setattr(type(window.service.process), "running", property(lambda _self: True))
+
+    window.unload_model()
+
+    assert stopped
+    assert "unloaded" in window.status.text()
+    assert "loads again on your next generation" in window.status.text()
+    assert "loads again" in window.chat.status.text()
+
+
+def test_unloading_with_nothing_loaded_says_so(qt, window, monkeypatch):
+    monkeypatch.setattr(window.service, "stop", lambda: None)
+    window.unload_model()
+    assert "No model was loaded" in window.status.text()
+
+
+def test_the_model_cannot_be_unloaded_mid_generation(qt, window, monkeypatch):
+    from prompt_master.ui import main_window as module
+
+    told, stopped = [], []
+    monkeypatch.setattr(window.chat, "busy", lambda: True)
+    monkeypatch.setattr(window.service, "stop", lambda: stopped.append(True))
+    monkeypatch.setattr(module.QMessageBox, "information",
+                        lambda _self, _title, text, *a, **k: told.append(text))
+
+    window.unload_model()
+    assert stopped == [] and told and "Stop" in told[0]

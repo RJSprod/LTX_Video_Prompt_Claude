@@ -1146,3 +1146,116 @@ def test_launcher_reexec_is_guarded_against_looping(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, "env_python", lambda: tmp_path / "python")
     monkeypatch.setenv(launcher.REEXEC_GUARD, "1")
     launcher.reexec_if_needed()      # returns instead of re-executing
+
+
+# ── changing what runs the model, without touching the model ─────────────────
+
+def _installed_state(tmp_path, monkeypatch=None, *, quantization="Q4_K_M",
+                     runtime_id="llama-runtime-cuda12", gpu_layers="all"):
+    """An install that has already been provisioned, on disk.
+
+    Written out rather than provisioned: this is the starting position for the
+    switch under test, so it must not depend on the code path being tested or
+    on the CUDA probe the tests around it disallow.
+    """
+    paths = AppPaths(tmp_path)
+    paths.create_managed_dirs()
+    for relative in ("models/model.gguf", "models/mmproj.gguf"):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"weights")
+    server = tmp_path / "runtime" / "llama-server.exe"
+    server.parent.mkdir(parents=True, exist_ok=True)
+    server.write_bytes(b"")
+    paths.state_file.write_text(json.dumps({
+        "runtime": "runtime/llama-server.exe", "runtime_id": runtime_id,
+        "model": "models/model.gguf", "mmproj": "models/mmproj.gguf",
+        "mode": "gpu", "gpu_index": 0, "gpu_uuid": "GPU-0",
+        "gpu_name": "NVIDIA GeForce RTX 4090", "gpu_device": "CUDA0",
+        "gpu_device_name": "RTX 4090", "quantization": quantization,
+        "context_size": 16384, "gpu_layers": gpu_layers,
+    }), encoding="utf-8")
+    return paths
+
+
+def test_a_device_switch_needing_no_new_runtime_downloads_nothing(tmp_path, monkeypatch):
+    """The same card in mixed mode is the same llama.cpp build and the same
+    model: there is nothing to fetch and nothing to unpack, only state to
+    rewrite."""
+    monkeypatch.setattr(installer, "list_llama_devices", lambda *_a, **_k: ("CUDA0", "RTX 4090"))
+    monkeypatch.setattr(installer, "download", lambda *a, **k: pytest.fail("downloaded"))
+    monkeypatch.setattr(installer, "extract_zips_atomic", lambda *a, **k: pytest.fail("extracted"))
+    paths = _installed_state(tmp_path, monkeypatch)
+
+    state = installer.switch_device(paths, mixed())
+
+    assert state["mode"] == "mixed"
+    assert state["gpu_layers"] == NO_OFFLOAD
+    # The 16-27 GiB that was not re-downloaded is the point of the whole thing.
+    assert state["model"] == "models/model.gguf" and state["mmproj"] == "models/mmproj.gguf"
+    assert state["quantization"] == "Q4_K_M"
+
+
+def test_switching_to_the_processor_fetches_only_the_cpu_runtime(tmp_path, monkeypatch):
+    fetched, extracted = [], []
+    components = {key: Component(key, f"https://example.invalid/{key}.zip", f"cache/downloads/{key}.zip",
+                                 None, "a" * 64, "1")
+                  for key in (CPU_RUNTIME, "llama-runtime-cuda12", "llama-runtime-cuda12-cudart",
+                              "model-Q4_K_M", "mmproj")}
+    monkeypatch.setattr(installer, "load_components", lambda: components)
+    monkeypatch.setattr(installer, "download",
+                        lambda component, target, *a, **k: fetched.append(component.component_id) or target)
+    monkeypatch.setattr(installer, "extract_zips_atomic",
+                        lambda archives, target: extracted.append(target))
+    monkeypatch.setattr(installer, "list_llama_devices",
+                        lambda *_a, **_k: pytest.fail("must not probe for a CUDA device"))
+    paths = _installed_state(tmp_path, monkeypatch)
+
+    state = installer.switch_device(paths, cpu())
+
+    assert fetched == [CPU_RUNTIME], "only the runtime, never the model"
+    assert extracted == [tmp_path / "runtime"]
+    assert state["mode"] == "cpu" and state["gpu_device"] == CPU_DEVICE
+    assert state["runtime_id"] == CPU_RUNTIME
+    assert state["model"] == "models/model.gguf"
+
+
+def test_a_switch_back_to_the_same_card_keeps_its_partial_offload(tmp_path, monkeypatch):
+    """A card set up with a layer count should still have it when it is chosen
+    again — and must not hand that number to a different card."""
+    monkeypatch.setattr(installer, "list_llama_devices", lambda *_a, **_k: ("CUDA0", "RTX 4090"))
+    paths = _installed_state(tmp_path, monkeypatch, gpu_layers="40")
+
+    assert installer.switch_device(paths, gpu())["gpu_layers"] == "40"
+    assert installer.switch_device(paths, gpu(index=1))["gpu_layers"] == installer.FULL_OFFLOAD
+
+
+def test_a_switch_refuses_when_the_model_it_would_keep_is_gone(tmp_path, monkeypatch):
+    monkeypatch.setattr(installer, "list_llama_devices", lambda *_a, **_k: ("CUDA0", "RTX 4090"))
+    paths = _installed_state(tmp_path, monkeypatch)
+    (tmp_path / "models" / "model.gguf").unlink()
+
+    with pytest.raises(RuntimeError, match="model is missing"):
+        installer.switch_device(paths, mixed())
+
+
+def test_a_switch_refuses_on_an_install_that_never_finished(tmp_path):
+    paths = AppPaths(tmp_path)
+    paths.create_managed_dirs()
+    with pytest.raises(RuntimeError, match="no recorded model"):
+        installer.switch_device(paths, cpu())
+
+
+def test_the_state_records_which_runtime_is_unpacked(tmp_path, monkeypatch):
+    """Every build extracts to the same llama-server path, so without this a
+    later switch cannot tell what is on disk."""
+    monkeypatch.setattr(installer, "list_llama_devices", lambda *_a, **_k: ("CUDA0", "RTX 5090"))
+    installed = installer.Installed("runtime/llama-server.exe", "models/m.gguf", "models/p.gguf")
+
+    state = installer.write_state(AppPaths(tmp_path), gpu(name="NVIDIA GeForce RTX 5090"),
+                                  "Q6_K_P", installed)
+
+    assert state["runtime_id"] == "llama-runtime-cuda13"
+    assert installer.runtime_component_ids(cpu()) == (CPU_RUNTIME,)
+    assert installer.runtime_component_ids(gpu()) == ("llama-runtime-cuda12",
+                                                      "llama-runtime-cuda12-cudart")

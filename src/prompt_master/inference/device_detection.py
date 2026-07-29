@@ -141,6 +141,20 @@ def detect_devices(timeout: float = 15) -> list[GpuInfo]:
     return [*offered, detect_cpu()]
 
 
+def describe(device: GpuInfo) -> str:
+    """One line naming a device and what it will do with the model.
+
+    Written once and read in three places — the console questions, the setup
+    wizard's list and the runtime menu — because a device that is described
+    differently in two of them reads as two different devices.
+    """
+    if device.is_cpu:
+        return f"{device.name} — {device.memory_total_mb} MiB of system RAM — no GPU used"
+    if device.is_mixed:
+        return f"{device.name} — mixed: model in system RAM, card used for processing"
+    return f"{device.name} — {device.memory_total_mb} MiB — {device.uuid}"
+
+
 def cpu_name() -> str:
     """The processor's marketing name, e.g. "Intel(R) Core(TM) i7-13700K".
 

@@ -6,8 +6,8 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFormLayout
     QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWizard, QWizardPage)
 
 from prompt_master.core.paths import AppPaths
-from prompt_master.inference.device_detection import (QUANTIZATIONS, detect_cpu, detect_devices,
-    recommended_quantization, vram_shortfall_mb)
+from prompt_master.inference.device_detection import (QUANTIZATIONS, describe, detect_cpu,
+    detect_devices, recommended_quantization, vram_shortfall_mb)
 from prompt_master.provisioning import importer, installer, verifier
 
 # Said on the model page when the model will be kept in system RAM. A
@@ -95,9 +95,8 @@ class SetupWizard(QWizard):
 
     @staticmethod
     def _device_label(device):
-        if device.is_cpu: return f"{device.name} — {device.memory_total_mb} MiB of system RAM — no GPU used"
-        if device.is_mixed: return f"{device.name} — mixed: model in system RAM, card used for processing"
-        return f"{device.name} — {device.memory_total_mb} MiB — {device.uuid}"
+        # One wording, shared with the runtime menu — see device_detection.describe.
+        return describe(device)
 
     def _describe_quant(self,*_):
         """Recommendation, download size and the VRAM warning, together.

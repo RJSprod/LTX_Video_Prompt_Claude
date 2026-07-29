@@ -7,7 +7,9 @@ That is the number the platform guidelines converge on for a fingertip, and it
 is what the metrics below are derived from rather than chosen around: a combo
 box, its drop-down arrow, the rows of its popup, a spin box's steppers, a
 checkbox's indicator and a scroll bar's handle are all sized from it, because a
-control is only as touchable as its smallest part.
+control is only as touchable as its smallest part. The display size multiplies
+that number, and the two settings below 1.0 — see ``COMPACT`` — are the one
+place it is allowed under the floor, by asking for it.
 
 *Scrolling.* A touch screen scrolls by dragging the content, not by finding a
 scroll bar. ``flickable`` grabs the touch gesture for a widget's viewport, which
@@ -37,10 +39,21 @@ from prompt_master.core.config import atomic_write_json, read_json
 # The fingertip. Everything else is a multiple of it.
 TARGET = 48
 
-# What the View menu offers. A 10" tablet held at arm's length and a 27" panel
-# on a desk want different numbers, and no single default is right for both.
-SCALES: dict[str, float] = {"Comfortable": 1.0, "Large": 1.15, "Larger": 1.35}
+# What the View menu offers, smallest first. A 10" tablet held at arm's length
+# and a 27" panel on a desk want different numbers, and no single default is
+# right for both.
+SCALES: dict[str, float] = {"Smaller": 0.72, "Small": 0.85, "Comfortable": 1.0,
+                            "Large": 1.15, "Larger": 1.35}
 DEFAULT_SCALE = "Comfortable"
+
+# The two sizes below Comfortable, which deliberately go under the fingertip
+# floor the rest of this module is built around: 41 logical pixels at Small and
+# 35 at Smaller, against the 48 a fingertip wants. They exist because the
+# prompt-mode window has a great many controls and a large monitor with a mouse
+# on it is a real way to use this application — but they are a choice made
+# explicitly, never a default, and a finger will start to miss things at
+# Smaller. Everything scales together, so nothing overlaps; it only gets small.
+COMPACT = ("Smaller", "Small")
 
 SETTINGS_FILE = "ui.json"
 
