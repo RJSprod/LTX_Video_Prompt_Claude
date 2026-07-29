@@ -1,18 +1,32 @@
 """Conversation mode: the chat view, laid out for a finger.
 
 The shape is oobabooga's — a character, a transcript, and a box to type in —
-with its hover menus turned into things a finger can actually hit. Three
+with its hover menus turned into things a finger can actually hit. Five
 decisions are worth stating, because they are what a touch screen changes:
 
-*Every message carries its own menu.* oobabooga puts the message actions in one
-hover menu that applies to the last reply. A finger cannot hover, and half of
-these actions — edit, branch, delete from here — are about a message somewhere
-up the transcript rather than the last one. So each message gets a ``⋯`` of its
-own, opening a menu whose rows are as tall as every other target in the window.
+*The transcript reads as a conversation, not as a log.* Bubbles held to their
+own side, held to a fraction of the width, and carrying no name label at all:
+the side a bubble sits on is what says who said it, and the character's picture
+appears once at the start of a run of their replies rather than beside every
+one of them.
+
+*Every message has its own menu, and a tap is what reveals it.* oobabooga puts
+the message actions in one hover menu that applies to the last reply. A finger
+cannot hover, and half of these actions — edit, branch, delete from here — are
+about a message somewhere up the transcript rather than the last one. So a tap
+on a bubble shows a ``⋯`` on that message alone; a drag still scrolls the
+transcript, and a drag across words still selects them.
 
 *Regenerating pages rather than replaces.* The versions of a reply live on the
 message (see ``chat.history``), so a regenerate that came back worse is undone
-by tapping ``◀`` instead of by regenerating until luck returns.
+by tapping ``◀`` instead of by regenerating until luck returns. That pager is
+the one thing shown without a tap, because "2/3" is what says an earlier
+attempt is still there.
+
+*The newest message stays in view until you leave it.* The transcript follows
+what arrives only while it is already at the end. Scroll up to read something
+and it stops chasing; scroll back to the bottom and it resumes. Sending a
+message, opening a chat and starting one all count as going back to the end.
 
 *The transcript is rebuilt, not patched.* Editing, deleting, branching and
 paging all change what the transcript is, and one path that renders the
@@ -28,8 +42,8 @@ import base64
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QKeySequence, QPainter, QPainterPath, QPixmap, QShortcut
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QGroupBox,
                                QHBoxLayout, QInputDialog, QLabel, QMenu, QMessageBox,
                                QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
@@ -52,6 +66,11 @@ STATE_FILE = "chat-ui.json"
 
 # The context window llama-server is started with when setup recorded none.
 DEFAULT_CONTEXT = 8192
+
+# How near the end counts as being at it. A scroll bar rarely lands exactly on
+# its maximum, and a few pixels short of the bottom is still the bottom to the
+# person looking at it.
+STICKY_MARGIN = 24
 
 
 class ChatWorker(QObject):
@@ -87,51 +106,127 @@ class ChatWorker(QObject):
             self.finished.emit()
 
 
-class MessageBubble(QFrame):
-    """One turn: who said it, what they said, and everything doable to it."""
+class MessageBubble(QWidget):
+    """One turn: a bubble on its own side of the transcript.
 
-    def __init__(self, page: "ChatPage", message: Message, index: int):
+    The widget is the whole row rather than the bubble itself — the bubble sits
+    inside it, held against one edge and stopped from growing past ``WIDEST`` of
+    the width, because a line of text that runs the full width of a tablet is a
+    line that has to be tracked back across the screen to read the next one.
+
+    What is *not* on the row is as deliberate as what is. No name over every
+    message: the side it sits on says who said it, and a name repeated down the
+    whole transcript is the thing that made the first version look like a log
+    file rather than a conversation. The picture appears once at the start of a
+    run of replies, and the ``⋯`` appears when the bubble is tapped.
+    """
+
+    # The fraction of the transcript a bubble may fill.
+    WIDEST = 0.72
+    # How far a finger may travel and still be a tap rather than a drag or a
+    # text selection. A flick through the transcript must not open a menu.
+    TAP_SLOP = 12
+
+    def __init__(self, page: "ChatPage", message: Message, index: int, opens_run: bool = True):
         super().__init__()
         self.page, self.message, self.index = page, message, index
-        self.setObjectName("bubbleYou" if message.role == USER else "bubbleThem")
-        self.setFrameShape(QFrame.Shape.StyledPanel)
-        column = QVBoxLayout(self)
-        column.addLayout(self._header())
+        self.mine = message.role == USER
+        self.editor: QPlainTextEdit | None = None
+        self._press_at = None
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, page.metrics["gap"] if opens_run else 2, 0, 0)
+        row.setSpacing(round(page.metrics["gap"] / 2))
+        stack = QVBoxLayout()
+        stack.setSpacing(2)
+        stack.addWidget(self.frame_for(message))
+        stack.addWidget(self.actions_for(message))
+        if self.mine:
+            row.addStretch(1)
+            row.addLayout(stack)
+        else:
+            # Level with the first line of the bubble rather than centred on
+            # the whole message, which on a long reply floats it in mid-air.
+            row.addWidget(self.face(opens_run), 0, Qt.AlignmentFlag.AlignTop)
+            row.addLayout(stack)
+            row.addStretch(1)
+        self.set_max_width(page.bubble_width())
+
+    def frame_for(self, message: Message) -> QFrame:
+        """The bubble: the picture if there is one, then the words."""
+        self.frame = QFrame()
+        self.frame.setObjectName("bubbleYou" if self.mine else "bubbleThem")
+        pad = self.page.metrics["pad"]
+        column = QVBoxLayout(self.frame)
+        column.setContentsMargins(pad, round(pad * 0.7), pad, round(pad * 0.7))
+        column.setSpacing(round(pad / 2))
         if message.image:
-            column.addWidget(self._picture())
+            column.addWidget(self.picture())
         self.body = QLabel(message.text or "…")
         self.body.setWordWrap(True)
         self.body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.body.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         column.addWidget(self.body)
-        self.editor: QPlainTextEdit | None = None
         self.column = column
+        # Tapping anywhere on the bubble reveals its menu, so both the frame
+        # and the label it is filled with have to be watched.
+        for widget in (self.frame, self.body):
+            widget.installEventFilter(self)
+        return self.frame
 
-    def _header(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        avatar = self.page.avatar_pixmap() if self.message.role == ASSISTANT else None
+    def face(self, opens_run: bool) -> QWidget:
+        """The character's picture, once per run of their messages.
+
+        A holder of the same width is left behind on the messages that follow,
+        so a run of replies stays in one column instead of stepping sideways.
+        """
+        side = self.page.metrics["target"]
+        holder = QLabel()
+        holder.setFixedSize(QSize(side, side))
+        avatar = self.page.avatar_pixmap() if opens_run else None
         if avatar is not None and not avatar.isNull():
-            face = QLabel()
-            face.setPixmap(avatar)
-            face.setFixedSize(avatar.size())
-            row.addWidget(face)
-        speaker = QLabel(self.page.speaker_name(self.message.role))
-        speaker.setObjectName("fieldLabel")
-        row.addWidget(speaker)
-        row.addStretch(1)
-        if len(self.message.versions) > 1:
-            row.addLayout(self._versions())
+            holder.setPixmap(avatar)
+            holder.setToolTip(self.page.speaker_name(self.message.role))
+        return holder
+
+    def actions_for(self, message: Message) -> QWidget:
+        """The row under the bubble: the version pager, and the ``⋯``.
+
+        The pager is shown whenever a reply has more than one version, because
+        "2/3" is the only thing that says an earlier attempt is still there.
+        The menu button is not: it appears on the message being tapped.
+        """
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(round(self.page.metrics["gap"] / 2))
+        if self.mine:
+            row.addStretch(1)
+        self.pager = self.versions() if len(message.versions) > 1 else None
+        if self.pager is not None:
+            row.addWidget(self.pager)
         self.actions_button = QPushButton("⋯")
+        self.actions_button.setObjectName("bubbleAction")
         self.actions_button.setToolTip("What to do with this message")
         self.actions_button.clicked.connect(self.open_menu)
+        self.actions_button.hide()
         row.addWidget(self.actions_button)
-        return row
+        if not self.mine:
+            row.addStretch(1)
+        self.actions_row = holder
+        holder.setVisible(self.pager is not None)
+        return holder
 
-    def _versions(self) -> QHBoxLayout:
+    def versions(self) -> QWidget:
         """The pager a regenerate leaves behind."""
-        row = QHBoxLayout()
-        back = QPushButton("◀")
-        forward = QPushButton("▶")
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+        back, forward = QPushButton("◀"), QPushButton("▶")
+        for button in (back, forward):
+            button.setObjectName("bubbleAction")
         count = QLabel(f"{self.message.active + 1}/{len(self.message.versions)}")
         count.setObjectName("fieldLabel")
         back.setEnabled(self.message.active > 0)
@@ -140,9 +235,9 @@ class MessageBubble(QFrame):
         forward.clicked.connect(lambda: self.page.show_version(self.index, self.message.active + 1))
         for widget in (back, count, forward):
             row.addWidget(widget)
-        return row
+        return holder
 
-    def _picture(self) -> QLabel:
+    def picture(self) -> QLabel:
         label = QLabel()
         pixmap = _pixmap_from_data_url(self.message.image)
         if pixmap is None:
@@ -152,11 +247,53 @@ class MessageBubble(QFrame):
         label.setPixmap(pixmap.scaled(QSize(side, side), Qt.AspectRatioMode.KeepAspectRatio,
                                       Qt.TransformationMode.SmoothTransformation))
         label.setToolTip(self.message.image_name)
+        label.installEventFilter(self)
         return label
 
     def set_text(self, text: str) -> None:
         """Used while a reply streams, where a rebuild per token is not on."""
         self.body.setText(text or "…")
+        self.fit_body()
+
+    def set_max_width(self, width: int) -> None:
+        self.frame.setMaximumWidth(max(self.page.metrics["target"] * 4, width))
+        self.fit_body()
+
+    def fit_body(self) -> None:
+        """Make the bubble as wide as its longest line, and no wider.
+
+        A word-wrapped label asks its layout for very little, so a bubble left
+        to its own size hint collapses into a narrow column of two-word lines
+        with the rest of the row empty beside it. The width the text actually
+        wants is measured here — the longest line it has, capped at the widest
+        a bubble may be — and asked for as a minimum, which is what lets a short
+        message stay short and a long one fill the space it is allowed.
+        """
+        inside = self.frame.maximumWidth() - 2 * self.page.metrics["pad"] - 4
+        metrics = self.body.fontMetrics()
+        longest = max((metrics.horizontalAdvance(line)
+                       for line in self.body.text().split("\n")), default=0)
+        self.body.setMinimumWidth(max(0, min(longest + 2, inside)))
+
+    def set_revealed(self, revealed: bool) -> None:
+        """Show or hide this message's menu button."""
+        self.actions_button.setVisible(revealed)
+        self.actions_row.setVisible(revealed or self.pager is not None)
+
+    def eventFilter(self, watched, event) -> bool:
+        """A tap on the bubble reveals its menu; a drag still scrolls or selects."""
+        kind = event.type()
+        if kind == QEvent.Type.MouseButtonPress:
+            self._press_at = event.globalPosition().toPoint()
+        elif kind == QEvent.Type.MouseButtonRelease and self._press_at is not None:
+            travelled = (event.globalPosition().toPoint() - self._press_at).manhattanLength()
+            self._press_at = None
+            if travelled <= self.TAP_SLOP and not self.body.selectedText():
+                # Which message is open is the page's to know: a widget's own
+                # visibility is false for every widget in a window that has not
+                # been shown, which is not what "already open" means.
+                self.page.reveal(-1 if self.page.revealed == self.index else self.index)
+        return False                      # watched, never swallowed
 
     # ── the menu ─────────────────────────────────────────────────────────────
 
@@ -212,7 +349,17 @@ class MessageBubble(QFrame):
 
 
 class ChatPage(QWidget):
-    """The whole of conversation mode."""
+    """The whole of conversation mode.
+
+    Three of the rows here are optional, and the window's View menu is what
+    turns them off: on a small screen, a chat that has been set up is mostly
+    transcript, and the two drop-downs that chose the character and the chat are
+    a row each that only matter when they are being changed.
+    """
+
+    # The rows the View menu can hide, and what it calls them.
+    BARS = (("character", "“Talking to” bar"), ("chat", "Chat bar"),
+            ("actions", "Quick actions"))
 
     def __init__(self, paths, service_provider, parent=None):
         super().__init__(parent)
@@ -233,14 +380,24 @@ class ChatPage(QWidget):
         self._join_space = False
         self.bubbles: list[MessageBubble] = []
         self._avatar: QPixmap | None = None
+        # Which message is showing its menu, and whether the transcript is
+        # following what arrives. Both are about where you are looking, so both
+        # are reset by anything that changes what you are looking at.
+        self.revealed = -1
+        self.pinned = True
 
         column = QVBoxLayout(self)
-        column.addLayout(self.character_row())
-        column.addLayout(self.chat_row())
+        self.bars = {"character": _bar(self.character_row()),
+                     "chat": _bar(self.chat_row())}
+        column.addWidget(self.bars["character"])
+        column.addWidget(self.bars["chat"])
         column.addWidget(self.middle(), 1)
-        column.addLayout(self.quick_actions())
+        self.bars["actions"] = _bar(self.quick_actions())
+        column.addWidget(self.bars["actions"])
         column.addLayout(self.input_row())
         column.addWidget(self.status_label())
+        for key, _label in self.BARS:
+            self.bars[key].setVisible(self.bar_visible(key))
 
         send = QShortcut(QKeySequence("Ctrl+Return"), self)
         # Scoped to this page: the same window holds prompt mode, and a chord
@@ -305,6 +462,7 @@ class ChatPage(QWidget):
         self.transcript = QWidget()
         self.transcript_column = QVBoxLayout(self.transcript)
         self.transcript_column.setContentsMargins(0, 0, 0, 0)
+        self.transcript_column.setSpacing(0)
         self.transcript_column.addStretch(1)
         area = QScrollArea()
         area.setWidgetResizable(True)
@@ -312,6 +470,13 @@ class ChatPage(QWidget):
         area.setFrameShape(QFrame.Shape.NoFrame)
         touch.flickable(area)
         self.transcript_scroll = area
+        # Sticky bottom: the bar says where you are looking, and its range
+        # changing is content arriving. Following one and reacting to the other
+        # is the whole of it — scrolling away stops the transcript chasing the
+        # newest message, and scrolling back to the end starts it again.
+        bar = area.verticalScrollBar()
+        bar.valueChanged.connect(self._note_scroll)
+        bar.rangeChanged.connect(self._follow_if_pinned)
         return area
 
     def settings_area(self) -> QScrollArea:
@@ -497,6 +662,12 @@ class ChatPage(QWidget):
         return self.character.name if self.character else "Assistant"
 
     def avatar_pixmap(self) -> QPixmap | None:
+        """The character's picture, round, at one fingertip across.
+
+        Round because a square photograph beside a rounded bubble is the one
+        thing on the row with a corner, and drawn once per character rather
+        than once per message — every reply in a chat shows the same face.
+        """
         if self.character is None:
             return None
         if self._avatar is None:
@@ -504,9 +675,19 @@ class ChatPage(QWidget):
             if path is None:
                 return None
             side = self.metrics["target"]
-            self._avatar = QPixmap(str(path)).scaled(
-                QSize(side, side), Qt.AspectRatioMode.KeepAspectRatio,
+            source = QPixmap(str(path)).scaled(
+                QSize(side, side), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation)
+            round_face = QPixmap(side, side)
+            round_face.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(round_face)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            clip = QPainterPath()
+            clip.addEllipse(0, 0, side, side)
+            painter.setClipPath(clip)
+            painter.drawPixmap((side - source.width()) // 2, (side - source.height()) // 2, source)
+            painter.end()
+            self._avatar = round_face
         return self._avatar
 
     # ── chats ────────────────────────────────────────────────────────────────
@@ -546,6 +727,7 @@ class ChatPage(QWidget):
             self.new_chat()
             return
         self.remember(chat=identifier)
+        self.pinned = True                # a chat opens on its newest message
         self.render()
         self.set_status("")
         self._enable(True)
@@ -560,6 +742,7 @@ class ChatPage(QWidget):
         self.chats.save(self.conversation)
         self.remember(chat=self.conversation.identifier)
         self._refresh_chat_box()
+        self.pinned = True
         self.render()
         self.set_status("")
         self._enable(True)
@@ -608,11 +791,18 @@ class ChatPage(QWidget):
             item = self.transcript_column.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                # Unparented first: taking a widget out of a layout leaves it
+                # parented and visible where it was, so a rebuild that only
+                # schedules deletion paints the old transcript underneath the
+                # new one until the event loop gets around to it.
+                widget.setParent(None)
                 widget.deleteLater()
         self.bubbles = []
+        self.revealed = -1          # the message under it may not exist any more
         messages = self.conversation.messages if self.conversation else []
         for index, message in enumerate(messages):
-            bubble = MessageBubble(self, message, index)
+            opens_run = index == 0 or messages[index - 1].role != message.role
+            bubble = MessageBubble(self, message, index, opens_run)
             self.bubbles.append(bubble)
             self.transcript_column.addWidget(bubble)
         if not messages:
@@ -624,7 +814,43 @@ class ChatPage(QWidget):
         self.transcript_column.addStretch(1)
         self.scroll_to_end()
 
-    def scroll_to_end(self) -> None:
+    def reveal(self, index: int) -> None:
+        """Show one message's menu, and no other's."""
+        self.revealed = index
+        for bubble in self.bubbles:
+            bubble.set_revealed(bubble.index == index)
+
+    def bubble_width(self) -> int:
+        return int(self.transcript_scroll.viewport().width() * MessageBubble.WIDEST)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        width = self.bubble_width()
+        for bubble in self.bubbles:
+            bubble.set_max_width(width)
+
+    # ── following the newest message ─────────────────────────────────────────
+
+    def at_end(self) -> bool:
+        bar = self.transcript_scroll.verticalScrollBar()
+        return bar.value() >= bar.maximum() - STICKY_MARGIN
+
+    def _note_scroll(self, _value: int) -> None:
+        """Scrolling away stops the transcript following; scrolling back starts it."""
+        self.pinned = self.at_end()
+
+    def _follow_if_pinned(self, *_range) -> None:
+        bar = self.transcript_scroll.verticalScrollBar()
+        if self.pinned:
+            bar.setValue(bar.maximum())
+
+    def scroll_to_end(self, force: bool = False) -> None:
+        """Go to the newest message — always when ``force``, otherwise only if
+        that is where you already were."""
+        if force:
+            self.pinned = True
+        if not self.pinned:
+            return
         bar = self.transcript_scroll.verticalScrollBar()
         # After the layout has actually placed the new bubbles, not before.
         QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
@@ -724,6 +950,7 @@ class ChatPage(QWidget):
                 QMessageBox.critical(self, "Image error", str(exc))
                 return
         self.conversation.append(USER, text, image=image, image_name=name)
+        self.pinned = True                # you just wrote it; go and look at it
         self.input.clear()
         self.clear_attachment()
         self.save()
@@ -921,6 +1148,11 @@ class ChatPage(QWidget):
     def apply_metrics(self, metrics: dict) -> None:
         """Follow the window's display size."""
         self.metrics = metrics
+        # Bubbles are held off the edges of the transcript rather than against
+        # them, so the scroll bar has somewhere to be that is not on top of a
+        # message.
+        self.transcript_column.setContentsMargins(metrics["pad"], 0,
+                                                  metrics["pad"], metrics["gap"])
         self.input.setMinimumHeight(metrics["target"] * 2)
         self.input.setMaximumHeight(metrics["target"] * 4)
         self.system.setMinimumHeight(metrics["target"] * 3)
@@ -950,6 +1182,27 @@ class ChatPage(QWidget):
         except OSError:
             pass                              # remembering is a convenience
 
+    def bar_visible(self, key: str) -> bool:
+        """Whether a hideable row is showing. Everything starts out shown."""
+        bars = self._state().get("bars")
+        if isinstance(bars, dict) and isinstance(bars.get(key), bool):
+            return bars[key]
+        return True
+
+    def show_bar(self, key: str, shown: bool) -> None:
+        bar = self.bars.get(key)
+        if bar is None:
+            return
+        bar.setVisible(shown)
+        state = self._state()
+        bars = dict(state.get("bars") or {}) if isinstance(state.get("bars"), dict) else {}
+        bars[key] = bool(shown)
+        state["bars"] = bars
+        try:
+            atomic_write_json(self.paths.data / STATE_FILE, state)
+        except OSError:
+            pass                              # remembering is a convenience
+
     def _remembered(self, key: str) -> str | None:
         value = self._state().get(key)
         return value if isinstance(value, str) else None
@@ -967,6 +1220,14 @@ class ChatPage(QWidget):
         if self.thread is not None and self.thread.isRunning():
             self.thread.quit()
             self.thread.wait(3000)
+
+
+def _bar(row: QHBoxLayout) -> QWidget:
+    """A row of controls as one widget, so the View menu can hide all of it."""
+    holder = QWidget()
+    row.setContentsMargins(0, 0, 0, 0)
+    holder.setLayout(row)
+    return holder
 
 
 def _pixmap_from_data_url(data_url: str) -> QPixmap | None:

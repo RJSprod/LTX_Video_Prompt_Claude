@@ -108,12 +108,14 @@ class MainWindow(QMainWindow):
 
     def __init__(self, paths: AppPaths | None = None):
         super().__init__(); self.paths = paths or AppPaths.discover(); self.service = InferenceService(self.paths); self.thread = None; self.setWindowTitle("Prompt Master Standalone"); self.image_path: Path | None = None; self.engine = PromptEngine()
-        self.build_menus()
         self.pages=QStackedWidget(); self.pages.addWidget(self.prompt_page())
         # The service is handed over as a callable rather than as itself: re-running
         # setup replaces it, and the chat page must talk to the one running now.
         self.chat=ChatPage(self.paths, lambda: self.service, self); self.pages.addWidget(self.chat)
-        central=QWidget(); page=QVBoxLayout(central); page.addLayout(self.mode_row()); page.addWidget(self.pages,1)
+        # After the pages, because the View menu switches parts of one of them on
+        # and off and reads their current state to check its own boxes.
+        self.build_menus()
+        central=QWidget(); page=QVBoxLayout(central); page.addWidget(self.pages,1)
         self.setCentralWidget(central)
         self.apply_scale(touch.load_scale(self.paths), remember=False)
         self.select_mode(self.remembered_mode(), remember=False)
@@ -130,17 +132,9 @@ class MainWindow(QMainWindow):
         column.addWidget(splitter,1); column.addLayout(self.action_bar())
         return page
 
-    def mode_row(self) -> QHBoxLayout:
-        """The one control that is above both pages rather than on one of them."""
-        row=QHBoxLayout(); label=QLabel("Mode"); label.setObjectName("fieldLabel")
-        self.mode_selector=self.combo(MODES,PROMPT_MODE)
-        self.mode_selector.currentIndexChanged.connect(lambda _index: self.select_mode(self.chosen(self.mode_selector,PROMPT_MODE)))
-        row.addWidget(label); row.addWidget(self.mode_selector); row.addStretch(1)
-        return row
-
     def select_mode(self, mode: str, remember: bool = True):
         self.pages.setCurrentIndex(1 if mode == CONVERSATION_MODE else 0)
-        self.select(self.mode_selector,mode)
+        for action in self.mode_actions.actions(): action.setChecked(action.data() == mode)
         if remember:
             settings=self.paths.data/touch.SETTINGS_FILE
             try: current=read_json(settings)
@@ -154,11 +148,24 @@ class MainWindow(QMainWindow):
         return mode if mode in (PROMPT_MODE,CONVERSATION_MODE) else PROMPT_MODE
 
     def build_menus(self):
-        settings_menu=self.menuBar().addMenu("Settings"); settings_menu.addAction("Models and Hardware…").triggered.connect(self.open_setup)
+        """Settings chooses what the window is doing; View, how much of it shows."""
+        settings_menu=self.menuBar().addMenu("Settings")
+        modes=settings_menu.addMenu("Mode"); self.mode_actions=QActionGroup(self); self.mode_actions.setExclusive(True)
+        for value,label in MODES:
+            action=modes.addAction(label); action.setCheckable(True); action.setData(value); self.mode_actions.addAction(action)
+            action.triggered.connect(lambda _checked=False,chosen=value: self.select_mode(chosen))
+        settings_menu.addSeparator(); settings_menu.addAction("Models and Hardware…").triggered.connect(self.open_setup)
         view_menu=self.menuBar().addMenu("View"); sizes=view_menu.addMenu("Display size"); self.size_actions=QActionGroup(self); self.size_actions.setExclusive(True)
         for name in touch.SCALES:
             action=sizes.addAction(name); action.setCheckable(True); action.setData(name); self.size_actions.addAction(action)
             action.triggered.connect(lambda _checked=False,chosen=name: self.apply_scale(chosen))
+        # The rows of conversation mode that are worth the screen only while
+        # they are being used. Ticked from what the chat page last remembered.
+        conversation=view_menu.addMenu("Conversation"); self.bar_actions={}
+        for key,label in ChatPage.BARS:
+            action=conversation.addAction(label); action.setCheckable(True); action.setChecked(self.chat.bar_visible(key)); action.setData(key)
+            action.toggled.connect(lambda shown,chosen=key: self.chat.show_bar(chosen,shown))
+            self.bar_actions[key]=action
 
     def compose_pane(self) -> QWidget:
         """Intent and image stay put; the settings under them scroll."""

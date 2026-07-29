@@ -60,6 +60,7 @@ def metrics(scale: float) -> dict[str, int]:
         "gap": round(12 * scale),
         "indicator": round(unit * 0.62),   # checkbox box
         "stepper": round(unit * 0.9),      # spin box up/down
+        "bubble": round(unit * 0.38),      # corner of a chat bubble
         "bar": round(unit * 0.42),         # scroll bar: wide enough to drag
         "grip": round(unit * 1.3),         # shortest a scroll handle may get
     }
@@ -105,6 +106,15 @@ QComboBox QAbstractItemView::item {{ min-height: {m['target']}px; }}
 QPushButton#stepper {{
     min-width: {m['stepper']}px; max-width: {m['stepper']}px;
     min-height: {m['target']}px; padding: 0; font-size: {m['heading']}px; font-weight: 700;
+}}
+
+/* The buttons that belong to a message — its ⋯ and its version pager. Square
+   and target-sized rather than the wide ones the rest of the window uses: they
+   sit against a bubble, and a full-width button beside a short message is the
+   loudest thing in the transcript. */
+QPushButton#bubbleAction {{
+    min-width: {m['stepper']}px; max-width: {m['stepper']}px;
+    min-height: {m['target']}px; padding: 0; font-size: {m['label']}px;
 }}
 
 QCheckBox {{ min-height: {m['target']}px; spacing: {m['gap']}px; }}
@@ -153,6 +163,28 @@ QScrollBar::handle:vertical {{ min-height: {m['grip']}px; }}
 QScrollBar::handle:horizontal {{ min-width: {m['grip']}px; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+
+/* Chat bubbles. The two sides are told apart by the edge they sit on and by
+   weight, never by hue: the one colour in this window is the primary action,
+   and a transcript that competes with it makes that button harder to find
+   rather than easier. Grey at two alphas reads on a light window and a dark
+   one alike, and the corner nearest the speaker is squared off — the tail,
+   without drawing one. */
+QFrame#bubbleYou, QFrame#bubbleThem {{
+    border-radius: {m['bubble']}px;
+    border: 1px solid rgba(128, 128, 128, 0.30);
+}}
+QFrame#bubbleYou {{
+    background: rgba(128, 128, 128, 0.26);
+    border-bottom-right-radius: {round(m['bubble'] / 4)}px;
+}}
+QFrame#bubbleThem {{
+    background: rgba(128, 128, 128, 0.11);
+    border-bottom-left-radius: {round(m['bubble'] / 4)}px;
+}}
+/* The label inside a bubble draws no background of its own, or it paints a
+   rectangle over the rounded corners it sits in. */
+QFrame#bubbleYou QLabel, QFrame#bubbleThem QLabel {{ background: transparent; }}
 
 QSplitter::handle {{ background: rgba(128, 128, 128, 0.35); }}
 QSplitter::handle:horizontal {{ width: {m['pad']}px; }}

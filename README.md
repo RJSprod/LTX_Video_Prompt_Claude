@@ -126,8 +126,7 @@ with a card in mixed mode — with `--gpu`, or the first card without it.
 
 ## Using it
 
-The **Mode** drop-down along the top of the window chooses what the application
-is doing:
+**Settings → Mode** chooses what the application is doing:
 
 | Mode | What it is |
 | --- | --- |
@@ -136,7 +135,8 @@ is doing:
 
 The two share the window, the display size and the one `llama-server` the
 application runs, and nothing else: a conversation cannot reach the prompt
-engine, which is what keeps the engine byte-identical to upstream.
+engine, which is what keeps the engine byte-identical to upstream. The mode is
+remembered, so the application reopens on the one you were using.
 
 ### Prompt mode
 
@@ -271,12 +271,32 @@ stored in `data/persona.json`.
 Type, and press **Send** or Ctrl+Enter. The reply streams in as it is written,
 and **Stop** ends it early, keeping what had arrived.
 
+The transcript is bubbles on their own sides — yours to the right, theirs to
+the left with their picture beside the first reply of each run — and no names
+over anything, because the side a message is on is what says who said it. A
+bubble is as wide as its words and no wider, up to about three-quarters of the
+transcript.
+
+**It follows the newest message until you leave it.** Scroll up to read
+something and it stops chasing what arrives; scroll back to the bottom and it
+starts again. Sending a message, opening a chat and starting one all count as
+going back to the end.
+
+**View → Conversation** hides any of the three rows around the transcript —
+the *Talking to* bar, the *Chat* bar and the quick actions — one at a time and
+independently. On a small screen a chat that has been set up is mostly
+transcript, and the two drop-downs only matter while they are being changed.
+What you hide is remembered.
+
 Under the transcript are the four things done between messages — **Regenerate**,
 **Continue**, **Impersonate** (the model writes your next message into the box
 for you to edit), and **Remove last**, which takes back the last exchange and
 puts your message back where you typed it.
 
-Every message also carries a **⋯** of its own, which is where the rest of it is:
+**Tap a message** to reveal a **⋯** on it — the touch equivalent of a
+long-press, and where the rest of what can be done to that message lives.
+Tapping it again puts it away, dragging still scrolls, and dragging across
+words still selects them:
 
 | Action | What it does |
 | --- | --- |
@@ -289,7 +309,8 @@ Every message also carries a **⋯** of its own, which is where the rest of it i
 | **Copy** | The message text, to the clipboard. |
 
 **Regenerating keeps the reply it replaced.** A regenerated message grows a
-`◀ 2/3 ▶` pager, and paging back to an earlier attempt is how a regenerate that
+`◀ 2/3 ▶` pager — the one thing shown without a tap, because it is what says an
+earlier attempt is still there — and paging back to it is how a regenerate that
 came back worse is undone. **Delete this version** drops just the one showing.
 
 **Past chats** are the drop-down at the top: every conversation with that
@@ -355,7 +376,7 @@ What changed, and only this:
 | Running with a card too small for the model | Not possible | Mixed mode: same CUDA install, weights in system RAM, nothing resident on the card, which keeps the work `llama.cpp` can give it |
 | Where the model comes from | Downloaded, always | Downloaded, or installed from a `.gguf` you already have — against the same pinned SHA-256 |
 | Window | One column of mouse-sized controls | Two panes, fingertip-sized targets, drag-to-scroll, a display-size setting |
-| What the window does | Writes prompts | That, or — on the mode drop-down — a chat with characters you write or import, on the same model |
+| What the window does | Writes prompts | That, or — on Settings → Mode — a chat with characters you write or import, on the same model |
 | Motion | One way of writing it | Default is that way exactly; **Inertia** and **Flow** are opt-in |
 | Seed | A number | A number, or `-1` for a fresh one each generation |
 | Speech | Whatever the intent quotes | That, or up to 10× more written in the same voice — opt-in |
@@ -390,15 +411,16 @@ the mode drop-down set either way is the same prompt.
 ## Tests
 
 ```
-python -m pytest tests/        # 671 passed
+python -m pytest tests/        # 682 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
 - `test_prompt_engine.py` (44) — the adapter seam, the motion presets, speech
   expansion and the UI option sources
-- `test_touch_ui.py` (35) — target sizes, drag-to-scroll, the sliders and the
-  display size, the mode switch, and conversation mode driven end to end
-  against a scripted server, measured on a real window built offscreen
+- `test_touch_ui.py` (46) — target sizes, drag-to-scroll, the sliders and the
+  display size, the menu-bar mode switch and the View toggles, the transcript's
+  layout and its sticky bottom, and conversation mode driven end to end against
+  a scripted server, measured on a real window built offscreen
 - `test_chat.py` (36) — the character format and its three imports, chat
   history and branching, and what a chat turn puts on the wire
 - `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,

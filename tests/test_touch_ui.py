@@ -314,20 +314,48 @@ def chat_window(qt, tmp_path):
     made.close()
 
 
-def test_the_mode_drop_down_switches_the_page_and_is_remembered(qt, chat_window, tmp_path):
-    """One dropdown, two pages, and the one you left it on next time."""
+def test_the_mode_lives_in_the_menu_bar_and_is_remembered(qt, chat_window, tmp_path):
+    """Settings → Mode, not a control taking a row off the top of the window."""
     from prompt_master.ui.main_window import CONVERSATION_MODE, PROMPT_MODE, MainWindow
 
-    assert chat_window.pages.currentWidget() is chat_window.chat
-    chat_window.select_mode(PROMPT_MODE)
-    assert chat_window.pages.currentWidget() is chat_window.pages.widget(0)
-    assert chat_window.generate_button.isVisible() or not chat_window.isVisible()
+    assert not hasattr(chat_window, "mode_selector"), "the mode is a menu item now"
+    chosen = {action.data(): action for action in chat_window.mode_actions.actions()}
+    assert set(chosen) == {PROMPT_MODE, CONVERSATION_MODE}
+    assert chosen[CONVERSATION_MODE].isChecked() and not chosen[PROMPT_MODE].isChecked()
 
-    chat_window.select_mode(CONVERSATION_MODE)
+    chosen[PROMPT_MODE].trigger()
+    assert chat_window.pages.currentWidget() is chat_window.pages.widget(0)
+    chosen[CONVERSATION_MODE].trigger()
+    assert chat_window.pages.currentWidget() is chat_window.chat
+
     reopened = MainWindow(AppPaths(tmp_path))
     try:
         assert reopened.pages.currentWidget() is reopened.chat
-        assert reopened.chosen(reopened.mode_selector) == CONVERSATION_MODE
+        checked = [a.data() for a in reopened.mode_actions.actions() if a.isChecked()]
+        assert checked == [CONVERSATION_MODE]
+    finally:
+        reopened.close()
+
+
+def test_the_view_menu_hides_each_chat_bar_on_its_own_and_remembers_it(qt, chat_window, tmp_path):
+    from prompt_master.ui.main_window import MainWindow
+
+    page = chat_window.chat
+    keys = [key for key, _label in page.BARS]
+    assert keys == ["character", "chat", "actions"]
+    assert all(page.bars[key].isVisibleTo(page) for key in keys)
+    assert all(chat_window.bar_actions[key].isChecked() for key in keys)
+
+    chat_window.bar_actions["chat"].setChecked(False)
+    assert not page.bars["chat"].isVisibleTo(page)
+    assert page.bars["character"].isVisibleTo(page)      # one each, not one switch
+    assert page.bars["actions"].isVisibleTo(page)
+
+    reopened = MainWindow(AppPaths(tmp_path))
+    try:
+        assert not reopened.chat.bars["chat"].isVisibleTo(reopened.chat)
+        assert not reopened.bar_actions["chat"].isChecked()
+        assert reopened.bar_actions["character"].isChecked()
     finally:
         reopened.close()
 
@@ -650,3 +678,186 @@ def test_the_persona_dialog_returns_what_was_typed(qt, chat_window):
         assert typed.defined and typed.display == "Rashan" and typed.description == "A director."
     finally:
         dialog.close()
+
+
+# ── the transcript reads as a conversation ───────────────────────────────────
+
+def _tap(widget, travel=0):
+    """A press and release on ``widget``, ``travel`` pixels apart."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    for kind, offset in ((QMouseEvent.Type.MouseButtonPress, 0),
+                         (QMouseEvent.Type.MouseButtonRelease, travel)):
+        local = QPointF(4 + offset, 4)
+        event = QMouseEvent(kind, local, QPointF(100 + offset, 100),
+                            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                            Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(widget, event)
+
+
+def test_the_bubbles_sit_on_their_own_side_and_carry_no_name(qt, chat_window):
+    """Which side a bubble is on is what says who said it."""
+    page = chat_window.chat
+    page.conversation.append("user", "one")
+    page.render()
+    theirs, mine = page.bubbles[0], page.bubbles[1]
+
+    # Mine is pushed right by a stretch; theirs opens with the avatar holder.
+    assert mine.layout().itemAt(0).spacerItem() is not None
+    assert theirs.layout().itemAt(0).widget() is not None
+    assert mine.mine and not theirs.mine
+
+    labels = [label.text() for bubble in page.bubbles
+              for label in bubble.findChildren(qt.QLabel)]
+    assert "Ada" not in labels and "You" not in labels
+    assert "one" in labels                                   # the words are there
+
+    # And a bubble stops well short of the full width.
+    assert 0 < mine.frame.maximumWidth() <= max(1, page.bubble_width())
+
+
+def test_the_picture_appears_once_at_the_start_of_a_run(qt, chat_window, tmp_path):
+    from PIL import Image
+
+    page = chat_window.chat
+    picture = tmp_path / "face.png"
+    Image.new("RGB", (32, 32), "red").save(picture)
+    page.characters.set_avatar("Ada", picture)
+    page.open_character("Ada")
+
+    page.conversation.append("assistant", "and another thing")
+    page.render()
+    faces = [bubble.layout().itemAt(0).widget() for bubble in page.bubbles]
+    assert not faces[0].pixmap().isNull()                     # opens the run
+    assert faces[1].pixmap().isNull()                         # follows it
+    assert faces[0].size() == faces[1].size()                 # still in one column
+
+
+def test_a_message_shows_its_menu_only_when_it_is_tapped(qt, chat_window):
+    page = chat_window.chat
+    page.conversation.append("user", "one")
+    page.conversation.append("assistant", "two")
+    page.render()
+    assert all(not bubble.actions_button.isVisibleTo(bubble) for bubble in page.bubbles)
+
+    _tap(page.bubbles[1].body)
+    assert page.bubbles[1].actions_button.isVisibleTo(page.bubbles[1])
+    assert not page.bubbles[2].actions_button.isVisibleTo(page.bubbles[2])
+    assert page.revealed == 1
+
+    _tap(page.bubbles[2].frame)                       # one at a time
+    assert not page.bubbles[1].actions_button.isVisibleTo(page.bubbles[1])
+    assert page.bubbles[2].actions_button.isVisibleTo(page.bubbles[2])
+
+    _tap(page.bubbles[2].frame)                       # tapping again puts it away
+    assert not page.bubbles[2].actions_button.isVisibleTo(page.bubbles[2])
+
+
+def test_a_drag_through_the_transcript_opens_nothing(qt, chat_window):
+    """A flick is how the transcript scrolls, and must not be read as a tap."""
+    page = chat_window.chat
+    page.conversation.append("user", "one")
+    page.render()
+
+    _tap(page.bubbles[1].body, travel=200)
+    assert page.revealed == -1
+    assert all(not bubble.actions_button.isVisibleTo(bubble) for bubble in page.bubbles)
+
+
+def test_the_version_pager_shows_without_a_tap(qt, chat_window):
+    """The ⋯ hides, but "2/3" is the only thing that says an older reply is
+    still there."""
+    page = chat_window.chat
+    page.conversation.append("assistant", "first try")
+    page.conversation.messages[-1].add_version("second try")
+    page.render()
+
+    regenerated, plain = page.bubbles[1], page.bubbles[0]
+    assert regenerated.pager is not None and regenerated.actions_row.isVisibleTo(regenerated)
+    assert not regenerated.actions_button.isVisibleTo(regenerated)
+    assert plain.pager is None and not plain.actions_row.isVisibleTo(plain)
+
+
+# ── it follows the newest message until you scroll away ──────────────────────
+
+def test_the_transcript_follows_new_content_only_while_it_is_at_the_end(qt, chat_window):
+    page = chat_window.chat
+    bar = page.transcript_scroll.verticalScrollBar()
+
+    bar.setRange(0, 400)
+    bar.setValue(400)
+    assert page.pinned
+    bar.setRange(0, 800)                      # a reply arrives
+    assert bar.value() == 800                 # and is followed
+
+    bar.setValue(100)                         # scrolled up to read something
+    assert not page.pinned
+    bar.setRange(0, 1200)                     # more arrives
+    assert bar.value() == 100                 # and is not chased
+
+    bar.setValue(1200)                        # back to the bottom
+    assert page.pinned
+    bar.setRange(0, 1600)
+    assert bar.value() == 1600
+
+
+def test_sending_goes_back_to_the_newest_message(qt, chat_window):
+    page = chat_window.chat
+    service = _ScriptedService(["Hello there."])
+    page.service_provider = lambda: service
+    bar = page.transcript_scroll.verticalScrollBar()
+    bar.setRange(0, 400)
+    bar.setValue(0)
+    assert not page.pinned
+
+    page.input.setPlainText("hello")
+    page.send()
+    _finish(qt, page)
+    assert page.pinned, "sending a message should put you back at the end"
+
+
+def test_opening_a_chat_starts_at_its_newest_message(qt, chat_window):
+    page = chat_window.chat
+    identifier = page.conversation.identifier
+    bar = page.transcript_scroll.verticalScrollBar()
+    bar.setRange(0, 400)
+    bar.setValue(0)
+    assert not page.pinned
+
+    page.open_chat(identifier)
+    assert page.pinned
+
+
+def test_a_bubble_is_as_wide_as_its_words_and_no_wider(qt, chat_window):
+    """A word-wrapped label asks its layout for almost nothing, which collapses
+    a bubble into a narrow column of two-word lines. The width is measured from
+    the text instead, and capped."""
+    page = chat_window.chat
+    page.conversation.append("user", "ok")
+    page.conversation.append("user", "a considerably longer message that has to wrap "
+                                     "somewhere sensible rather than after every second word")
+    page.render()
+    short, long_message = page.bubbles[-2], page.bubbles[-1]
+
+    assert short.body.minimumWidth() < long_message.body.minimumWidth()
+    assert long_message.body.minimumWidth() <= page.bubble_width()
+    assert short.frame.maximumWidth() == long_message.frame.maximumWidth() == page.bubble_width()
+
+
+def test_rebuilding_the_transcript_leaves_no_ghosts_behind(qt, chat_window):
+    """Taking a widget out of a layout leaves it parented and visible where it
+    was, so a rebuild that only schedules deletion paints the old transcript
+    under the new one."""
+    from prompt_master.ui.chat_page import MessageBubble
+
+    page = chat_window.chat
+    page.conversation.append("user", "one")
+    page.render()
+    page.conversation.append("assistant", "two")
+    page.render()
+
+    still_there = [bubble for bubble in page.transcript.findChildren(MessageBubble)
+                   if bubble.parent() is page.transcript]
+    assert len(still_there) == len(page.conversation.messages) == len(page.bubbles)
