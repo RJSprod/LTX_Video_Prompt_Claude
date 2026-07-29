@@ -884,40 +884,87 @@ def test_the_version_pager_shows_without_a_tap(qt, chat_window):
     assert plain.pager is None and not plain.actions_row.isVisibleTo(plain)
 
 
-def test_nothing_is_shown_before_it_is_in_the_layout(qt, chat_window):
-    """A widget made visible while it still has no parent *is* a top-level
-    window, and Qt duly puts one on the screen: a bare white rectangle that
-    flashes up and vanishes the instant the layout claims it.
+class _WindowWatcher:
+    """Every top-level window that appears while it is installed.
 
-    The transcript is rebuilt on every send, so one widget doing this in a
-    constructor is a window flashing in the corner of the screen every time
-    anybody says anything. Nothing rendered here may be shown before the row
-    it belongs to exists.
+    An application-wide event filter rather than a patched ``setVisible``,
+    because the shows that matter here do not come from Python at all: Qt
+    raises them from C++ on its way through the event loop, and a patched
+    Python method never sees them.
     """
-    from PySide6.QtWidgets import QWidget
 
+    def __init__(self, qt):
+        from PySide6.QtCore import QEvent, QObject
+        from PySide6.QtWidgets import QApplication, QWidget
+
+        self.shown: list[str] = []
+        watcher = self
+
+        class Filter(QObject):
+            def eventFilter(self, watched, event):
+                if (event.type() == QEvent.Type.Show
+                        and isinstance(watched, QWidget) and watched.isWindow()):
+                    watcher.shown.append(type(watched).__name__)
+                return False
+
+        # Held on the instance: an event filter nothing refers to is collected,
+        # and a collected filter silently watches nothing.
+        self._filter = Filter()
+        self._app = QApplication.instance()
+
+    def __enter__(self):
+        self._app.installEventFilter(self._filter)
+        return self
+
+    def __exit__(self, *_exc):
+        self._app.processEvents()      # the show is deferred; give it its turn
+        self._app.removeEventFilter(self._filter)
+        return False
+
+
+def test_sending_a_message_puts_no_window_on_the_screen(qt, chat_window):
+    """Sending a message rebuilt the transcript, and the bubbles it replaced
+    flashed up as blank windows of their own.
+
+    Two things did it, and both come down to one Qt rule: a widget with no
+    parent *is* a top-level window. The row under a bubble was made visible
+    before the layout had claimed it; and the outgoing bubbles were unparented
+    while still counting as visible, which Qt honours by showing each of them
+    on its next pass through the event loop.
+
+    Neither is visible to a test that watches the conversation, and neither
+    comes from a Python call that could be patched, so what is watched here is
+    the screen itself — any window appearing during a send is the bug.
+
+    The send has to be a real one, and the window has to be on it: Qt marks a
+    reparented widget hidden only when it was never created in the first place,
+    so a synthetic ``render()`` on a window nobody showed cannot demonstrate
+    this at all.
+    """
     page = chat_window.chat
-    page.conversation.append("user", "one")
-    page.conversation.append("assistant", "first try")
-    page.conversation.messages[-1].add_version("second try")
+    service = _ScriptedService(["Hello there.", "A second try.", "And again."])
+    page.service_provider = lambda: service
+    application = qt.QApplication.instance()
+    chat_window.show()
+    for _ in range(5):
+        application.processEvents()
 
-    shown, original = [], QWidget.setVisible
+    # A first exchange, and a regenerate to leave a pager behind, so the send
+    # under test replaces a transcript that is on screen and carries both cases.
+    page.input.setPlainText("hello")
+    page.send()
+    _finish(qt, page)
+    page.regenerate(page._last("assistant"))
+    _finish(qt, page)
+    assert any(bubble.pager is not None for bubble in page.bubbles), "no pager to cover"
 
-    def watched(widget, visible):
-        if visible and widget.parentWidget() is None:
-            shown.append(type(widget).__name__)
-        return original(widget, visible)
+    with _WindowWatcher(qt) as watcher:
+        page.input.setPlainText("and again")
+        page.send()
+        _finish(qt, page)
 
-    QWidget.setVisible = watched
-    try:
-        page.render()
-    finally:
-        QWidget.setVisible = original
-
-    assert shown == []
-    # And the case that used to do it is still the case being covered: a reply
-    # with a pager is the one bubble with something to show without a tap.
-    assert page.bubbles[2].pager is not None
+    assert watcher.shown == []
+    chat_window.hide()
 
 
 # ── it follows the newest message until you scroll away ──────────────────────

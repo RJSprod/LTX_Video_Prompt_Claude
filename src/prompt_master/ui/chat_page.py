@@ -883,10 +883,25 @@ class ChatPage(QWidget):
             item = self.transcript_column.takeAt(0)
             widget = item.widget()
             if widget is not None:
-                # Unparented first: taking a widget out of a layout leaves it
-                # parented and visible where it was, so a rebuild that only
-                # schedules deletion paints the old transcript underneath the
-                # new one until the event loop gets around to it.
+                # Hidden, then unparented, and the order is the whole of it.
+                #
+                # Unparenting alone was the first half of a bug worth stating.
+                # Taking a widget out of a layout leaves it parented and visible
+                # where it was, so a rebuild that only schedules deletion paints
+                # the old transcript underneath the new one until the event loop
+                # gets around to it — which is why the unparenting is here.
+                #
+                # But a widget with no parent *is* a top-level window, and Qt
+                # marks a reparented widget hidden only if it was never created.
+                # These were on screen, so they are created, so they kept their
+                # "not hidden" state and Qt duly put each one on the screen as a
+                # window of its own on the next pass through the event loop: a
+                # blank rectangle per message, flashing up and vanishing again
+                # every time the transcript was rebuilt — which is every send.
+                #
+                # hide() first makes that state explicit, and the widget stays
+                # hidden through the reparenting and on into deletion.
+                widget.hide()
                 widget.setParent(None)
                 widget.deleteLater()
         self.bubbles = []
