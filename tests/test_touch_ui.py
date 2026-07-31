@@ -364,40 +364,17 @@ def test_the_mode_lives_in_the_menu_bar_and_is_remembered(qt, chat_window, tmp_p
 
     chosen[PROMPT_MODE].trigger()
     assert chat_window.pages.currentWidget() is chat_window.pages.widget(0)
-    chosen[IMAGE_MODE].trigger()
-    assert chat_window.pages.currentWidget() is chat_window.image
     chosen[CONVERSATION_MODE].trigger()
     assert chat_window.pages.currentWidget() is chat_window.chat
+    # Image mode is switched to at the end of this file rather than here. It is
+    # the one page that is built on demand, and the widgets it builds outlive
+    # the window that built them — see the note on that test.
 
     reopened = MainWindow(AppPaths(tmp_path))
     try:
         assert reopened.pages.currentWidget() is reopened.chat
         checked = [a.data() for a in reopened.mode_actions.actions() if a.isChecked()]
         assert checked == [CONVERSATION_MODE]
-    finally:
-        reopened.close()
-
-
-def test_image_mode_is_a_page_of_its_own_and_is_remembered(qt, window, tmp_path):
-    """The third page. It shares the window, the display size and the one
-    llama-server, and nothing else — including, deliberately, the engine.
-
-    It is also built when it is first opened rather than with the window: it is
-    some five hundred widgets, and every one of them is re-polished each time
-    the display size changes.
-    """
-    from prompt_master.ui.main_window import IMAGE_MODE, MainWindow
-
-    assert window._image is None, "image mode is built on demand, not with the window"
-    window.select_mode(IMAGE_MODE)
-    assert window.pages.currentWidget() is window.image
-    assert window.image.generate_button.isEnabled()
-
-    reopened = MainWindow(AppPaths(tmp_path))
-    try:
-        assert reopened.pages.currentWidget() is reopened.image
-        checked = [a.data() for a in reopened.mode_actions.actions() if a.isChecked()]
-        assert checked == [IMAGE_MODE]
     finally:
         reopened.close()
 
@@ -1423,3 +1400,35 @@ def test_the_model_dialog_is_finger_sized_too(qt, model_window):
         assert small == []
     finally:
         dialog.close()
+
+
+# ── image mode ───────────────────────────────────────────────────────────────
+#
+# Last in the file on purpose. Qt's scroller keeps a reference to every widget
+# it was grabbed for, so the windows these tests build are never collected, and
+# a style sheet change re-polishes every widget still alive in the process.
+# Image mode is five hundred of them, and it is built on demand — so building
+# it here costs the tests after it, of which there are now none.
+
+def test_image_mode_is_a_page_of_its_own_and_is_remembered(qt, window, tmp_path):
+    """The third page. It shares the window, the display size and the one
+    llama-server, and nothing else — including, deliberately, the engine.
+
+    It is also built when it is first opened rather than with the window: it is
+    some five hundred widgets, and every one of them is re-polished each time
+    the display size changes.
+    """
+    from prompt_master.ui.main_window import IMAGE_MODE, MainWindow
+
+    assert window._image is None, "image mode is built on demand, not with the window"
+    window.select_mode(IMAGE_MODE)
+    assert window.pages.currentWidget() is window.image
+    assert window.image.generate_button.isEnabled()
+
+    reopened = MainWindow(AppPaths(tmp_path))
+    try:
+        assert reopened.pages.currentWidget() is reopened.image
+        checked = [a.data() for a in reopened.mode_actions.actions() if a.isChecked()]
+        assert checked == [IMAGE_MODE]
+    finally:
+        reopened.close()

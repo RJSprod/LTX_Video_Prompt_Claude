@@ -187,6 +187,8 @@ def qt():
 
 @pytest.fixture
 def page(qt, tmp_path):
+    from PySide6 import QtCore
+
     from prompt_master.ui.image_page import ImagePage
 
     paths = AppPaths(tmp_path)
@@ -194,6 +196,13 @@ def page(qt, tmp_path):
     made = ImagePage(paths, lambda: FakeService())
     yield made
     made.shutdown()
+    # Destroyed, not merely dropped. Qt's scroller keeps a reference to every
+    # viewport ``touch.flickable`` grabbed, so a page that goes out of scope is
+    # still alive — and setting a style sheet re-polishes every widget alive in
+    # the process, which is what every window the rest of the suite builds
+    # does. Forty pages left lying about here made those windows crawl.
+    made.deleteLater()
+    QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
 
 
 def choose_model(page, key):
