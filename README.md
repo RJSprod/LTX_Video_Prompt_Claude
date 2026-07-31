@@ -147,11 +147,13 @@ with a card in mixed mode — with `--gpu`, or the first card without it.
 | --- | --- |
 | **Prompt mode** | Everything below — an intent in, an LTX-Video 2.3 positive and negative prompt out. This is what the packaged build does, unchanged. |
 | **Conversation mode** | A chat with a character you wrote, on the same local model. See [Conversation mode](#conversation-mode). |
+| **Image mode** | A prompt for a text-to-image model, or an instruction for one that edits. Same local model writes it. See [Image mode](#image-mode). |
 
-The two share the window, the display size and the one `llama-server` the
-application runs, and nothing else: a conversation cannot reach the prompt
-engine, which is what keeps the engine byte-identical to upstream. The mode is
-remembered, so the application reopens on the one you were using.
+The three share the window, the display size and the one `llama-server` the
+application runs, and nothing else: neither a conversation nor an image prompt
+can reach the prompt engine, which is what keeps that engine byte-identical to
+upstream. The mode is remembered, so the application reopens on the one you were
+using.
 
 ### Prompt mode
 
@@ -429,6 +431,129 @@ The conversation is trimmed from the front to fit the context window
 `llama-server` was started with. The character survives a long chat; the
 beginning of the chat does not.
 
+## Image mode
+
+The third thing **Settings → Mode** offers. A video prompt describes change over
+time — motion, beats, camera travel, speech, duration. An image prompt describes
+one instant, and is judged on composition, light and material. Roughly half the
+LTX engine's control surface has no image equivalent, so image mode is a second
+engine rather than the same one with different labels: `image_engine/`, written
+against the three profiles below, sharing no code with `prompt_engine/`.
+
+### The two tasks
+
+Chosen with **Task**, at the top of the page. They share the page and not the
+control set.
+
+| Task | What goes in | What comes out |
+| --- | --- | --- |
+| **Generate** | An intent — one line or many | A finished text-to-image prompt, and a negative prompt where the model has one |
+| **Edit** | A terse request — "swap the wooden door for a steel one" | A full editing instruction: the change, the intended result, and what must survive it |
+
+### The models, and why the page changes shape
+
+Three profiles, and they disagree in ways that are not cosmetic:
+
+| | FLUX.2 [klein] 9B | Krea 2 Turbo | Krea 2 RAW |
+| --- | --- | --- | --- |
+| Steps / CFG | 4 / 1.0 | 8 / 0.0 | 52 / 3.5 |
+| **Negative prompt** | none | none | real |
+| **Instruction editing** | native | experimental only | experimental only |
+| Reference images | 4 | 2 | 2 |
+| Hex colour binding | yes | no | no |
+| JSON prompts | yes | no benefit | no benefit |
+| Native edge | 1024 | 1536 | 1536 |
+
+Five things follow the **Image model** drop-down, live, and all five hide rather
+than grey out — a populated field the model discards gives a false sense of
+control, which is worse than the field not being there at all:
+
+- the **negative prompt** controls and pane, on the one profile with real
+  classifier-free guidance, and on no editing path at all;
+- the **hex swatch** option, which only FLUX binds to a named object;
+- the **JSON prompt shape**, offered only where it is parsed;
+- the **Edit task**, which moves to the model that edits natively rather than
+  letting you wait for a server to start and then be refused;
+- the number of **reference slots**, capped at what the model reads.
+
+The line beside **Seed** says the rest: the frame, the steps, the guidance, the
+word band and — in edit mode — the denoise the strength control resolves to.
+Those are what the image model itself has to be set to, and they change with the
+profile, so they are shown rather than left to be looked up.
+
+### Auto, Choose for me, Random
+
+Every drop-down carries the same three values above its options. They answer
+three different questions:
+
+| | Means | Consults the intent | States anything |
+| --- | --- | --- | --- |
+| **Auto** | "I don't care" | no | no — the facet is left out entirely |
+| **Choose for me** | "You decide, and tell me" | **yes** | yes |
+| **Random** | "Surprise me" | no | yes |
+
+**Choose for me** goes to the local model in one batched call, is validated
+against the list it was given, and falls back to keyword matching when the model
+is unavailable or answers unusably. What it settled on appears under the
+drop-down with where it came from — `model`, `heuristic`, `random` or nothing
+fitted — because a choice you cannot see is no better than Auto, and the value
+shown is what goes in the box next time.
+
+**Random** is drawn per control from the seed rather than from one shared
+sequence, so adding a control later does not shift every draw after it. A fixed
+seed reproduces last week's image; `-1` draws a fresh one each generation.
+
+### Editing
+
+Three things an edit instruction carries that a generation prompt never does,
+and all three are controls:
+
+- **Target element.** These models have no mask, so the description of what to
+  change does the work a mask would. "Remove the guy" fails when there are three
+  people.
+- **What must survive.** They change what they are told to change and drift on
+  anything left unmentioned, so preservation is stated rather than assumed —
+  this is the single biggest quality lever in edit mode. Identity, composition,
+  lighting and style are ticked by default.
+- **Physical consistency.** A new object needs the scene's light direction, its
+  perspective and a contact shadow, or it reads as a sticker.
+
+References are addressed by **number and role together** — "the background from
+image 2" — so each attached image has a role beside it. A request that looks like
+several changes at once is flagged rather than blocked: these models hold
+identity better across a chain of small edits than across one compound
+instruction, and the writer is told to write the most important one.
+
+Krea 2 does not ship with editing at all; Krea's own technical report lists it as
+future work, and the path that exists needs a third-party LoRA and a custom node
+pack. It is reachable through **Allow the experimental editing path**, which
+says what has to be installed before it will do anything.
+
+### What it deliberately does not have
+
+The LTX engine ships an `undress` control. It is **not** ported, and should not
+be added later: a control whose function is removing clothing from a depicted
+person is the core mechanic of nudify tooling, and the harm is the same whether
+what comes out is an image or a prompt that reliably produces one. Edit mode
+would make it worse still, because the input is a photograph of a real person.
+
+Full wardrobe, costume and period-dress banks are present, and **Change
+clothing** is one of the twenty edit operations, so ordinary garment changes work
+normally. Both sanitisers strip undressing directives arriving through the
+free-text boxes, and there are tests asserting both halves of that — the boundary
+holds, and it is not enforced by over-blocking.
+
+This is the one place where image mode deliberately lacks parity with video
+mode.
+
+### Reading further
+
+[`docs/IMAGE_PROMPT_MODE_SPEC.md`](docs/IMAGE_PROMPT_MODE_SPEC.md) is the
+engine's specification — the model facts and where they came from, the two
+sanitisers and why they are not interchangeable, and the list of constants to
+re-verify against current model cards. `python tools/image_engine_demo.py` walks
+through every behaviour with a stub writer, so it needs no server.
+
 ## Requirements
 
 - Windows x64
@@ -477,7 +602,7 @@ What changed, and only this:
 | Changing device | Re-run setup | That, or Settings → What runs the model, which swaps the llama.cpp build and keeps the model that is installed |
 | Changing model | Re-run setup, downloading another pinned quantization | That, or Settings → Which model runs — any `.gguf` on the machine, read where it is, with its vision projector optional |
 | Freeing the memory | Close the application | That, or Settings → Unload the model from memory |
-| What the window does | Writes prompts | That, or — on Settings → Mode — a chat with characters you write or import, on the same model |
+| What the window does | Writes prompts | That, or — on Settings → Mode — a chat with characters you write or import, or a prompt for a text-to-image model, both on the same local model |
 | Motion | One way of writing it | Default is that way exactly; **Inertia** and **Flow** are opt-in |
 | Seed | A number | A number, or `-1` for a fresh one each generation |
 | Speech | Whatever the intent quotes | That, or up to 10× more written in the same voice — opt-in |
@@ -503,34 +628,45 @@ nothing else — the file is checked against the same pinned hash a download is,
 and lands at the same path, so everything downstream of setup cannot tell the
 two apart.
 
-Conversation mode adds no fifth change, because it is not on the path a prompt
-takes. It imports nothing from `prompt_engine`, writes its own system message
-from the character and the persona, and reaches the model through the same
-`InferenceService` and `LlamaClient` prompt mode uses. A prompt generated with
-the mode drop-down set either way is the same prompt.
+Conversation mode and image mode add no fifth change, because neither is on the
+path a prompt takes. Both import nothing from `prompt_engine` — image mode has
+its own engine, in `image_engine/`, and two tests walk the AST of every module
+in it to assert that no import ever crosses — and both reach the model through
+the same `InferenceService` and `LlamaClient` prompt mode uses. A prompt
+generated with the mode set any of the three ways is the same prompt.
 
 ## Tests
 
 ```
-python -m pytest tests/        # 701 passed
+python -m pytest tests/        # 938 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
-- `test_prompt_engine.py` (44) — the adapter seam, the motion presets, speech
-  expansion and the UI option sources
-- `test_touch_ui.py` (59) — target sizes, drag-to-scroll, the sliders and the
+- `test_install_flow.py` (139) — install-root discovery, GPU sizing, the CPU
+  and mixed devices, manifest resolution, console setup, supplying a model from
+  disk, changing device without re-downloading the model, and the installer's
+  interpreter and environment checks
+- `test_image_engine.py` + `test_selection_quality.py` (157) — the image engine
+  as delivered: the two import-wall tests that guard LTX parity, profile
+  invariants, seeded randomness, Choose-for-me and its local fallback, geometry
+  across every profile and ratio, both system prompts, edit mode, the two
+  sanitisers, negative gating, and a standing 28-case benchmark for the
+  fallback's quality. Stdlib only — no Qt, no server, no network
+- `test_touch_ui.py` (72) — target sizes, drag-to-scroll, the sliders and the
   five display sizes, the menu-bar mode switch and the View toggles, the
   runtime device menu and unloading, the transcript's layout and its sticky
   bottom, and conversation mode driven end to end against a scripted server,
   measured on a real window built offscreen
+- `test_prompt_engine.py` (44) — the adapter seam, the motion presets, speech
+  expansion and the UI option sources
 - `test_chat.py` (36) — the character format and its three imports, chat
   history and branching, and what a chat turn puts on the wire
+- `test_image_mode.py` (41) — the seam image mode adds: the client adapter's
+  message shape and its push-to-pull bridge, the controls being the engine's
+  own banks, the five things that follow the model drop-down, and both tasks
+  driven end to end against a scripted server
 - `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
   download resume and retry
-- `test_install_flow.py` (113) — install-root discovery, GPU sizing, the CPU
-  and mixed devices, manifest resolution, console setup, supplying a model from
-  disk, changing device without re-downloading the model, and the installer's
-  interpreter and environment checks
 
 Output-level parity against an upstream checkout is checked separately:
 
@@ -552,16 +688,24 @@ src/prompt_master/
   prompt_engine/           Vendored upstream engine, untouched
   prompt_engine/motion.py  The three motion settings — ours, applied at the seams
   prompt_engine/speech.py  The extra-speech pass over the intent — ours, before the brief
+  image_engine/            Image mode's engine — its own, sharing nothing with the above
+  image_engine/profiles.py Everything that differs between one image model and another
+  image_engine/options.py  Every image option bank, and the three sentinels
+  image_engine/edit.py     Instruction editing: the target, what survives, references
+  image_engine/sanitize.py The two sanitisers — generation and edit, not interchangeable
   provisioning/installer.py  Download, verify, extract, validate — one pipeline
   provisioning/importer.py   Installing a model you already have, instead
   inference/               llama-server process, streaming client, GPU detection
+  inference/image_client.py  That client in the shape the image engine wants
   chat/                    Conversation mode, below the window
   chat/characters.py       Characters in oobabooga's format, and the persona
   chat/history.py          Messages, their versions, branching, saved chats
   chat/prompt.py           What one chat turn puts on the wire
   chat/yamlish.py          The YAML subset a character file is written in
-  ui/                      Main window, chat page, character editor, setup wizard
+  ui/                      Main window, chat page, image page, character editor, setup wizard
   ui/touch.py              Fingertip sizing and drag-to-scroll, in one place
+docs/                      The image engine's specification
+tools/                     Upstream parity harnesses, and the image engine's demo
 installer_files/           Created by the installer (gitignored)
 user_data/                 Default install root (gitignored)
   characters/              Characters and their pictures — oobabooga's layout

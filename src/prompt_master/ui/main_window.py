@@ -20,15 +20,20 @@ from prompt_master.inference.service import InferenceService
 from prompt_master.provisioning import installer
 from prompt_master.ui import touch
 from prompt_master.ui.chat_page import ChatPage
+from prompt_master.ui.image_page import ImagePage
 from prompt_master.ui.model_chooser import ModelDialog
 from prompt_master.ui.setup_wizard import SetupWizard
 
-# The two things this application does, and the order they appear in the mode
-# drop-down. Prompt mode is first because it is what the app was, and what an
-# install that has no characters yet can do.
+# The three things this application does, and the order they appear in the mode
+# menu. Prompt mode is first because it is what the app was, and what an install
+# that has no characters yet can do. Image mode is last because it is the
+# newest, and because the video prompt is still what this application is for.
 PROMPT_MODE = "prompt"
 CONVERSATION_MODE = "conversation"
-MODES = ((PROMPT_MODE, "Prompt mode"), (CONVERSATION_MODE, "Conversation mode"))
+IMAGE_MODE = "image"
+MODES = ((PROMPT_MODE, "Prompt mode"), (CONVERSATION_MODE, "Conversation mode"),
+         (IMAGE_MODE, "Image mode"))
+MODE_KEYS = tuple(value for value, _label in MODES)
 
 
 class GenerationWorker(QObject):
@@ -103,19 +108,22 @@ class MainWindow(QMainWindow):
     the scale that multiplies them is a menu item, since a tablet held at arm's
     length and a desk monitor do not agree on how big "big enough" is.
 
-    The window holds two of these pages, chosen by the drop-down along the top:
-    prompt mode, described above, and conversation mode. They share the window,
-    the display size and the one llama-server the application runs, and nothing
-    else — a chat cannot reach the prompt engine, which is what keeps the engine
-    the byte-for-byte copy of upstream that ``PARITY_REPORT.md`` says it is.
+    The window holds three of these pages, chosen from the Settings menu:
+    prompt mode, described above, conversation mode, and image mode. They share
+    the window, the display size and the one llama-server the application runs,
+    and nothing else — neither a chat nor an image prompt can reach the prompt
+    engine, which is what keeps that engine the byte-for-byte copy of upstream
+    that ``PARITY_REPORT.md`` says it is.
     """
 
     def __init__(self, paths: AppPaths | None = None):
         super().__init__(); self.paths = paths or AppPaths.discover(); self.service = InferenceService(self.paths); self.thread = None; self.setWindowTitle("Prompt Master Standalone"); self.image_path: Path | None = None; self.engine = PromptEngine(); self.devices = None
         self.pages=QStackedWidget(); self.pages.addWidget(self.prompt_page())
         # The service is handed over as a callable rather than as itself: re-running
-        # setup replaces it, and the chat page must talk to the one running now.
+        # setup replaces it, and the other pages must talk to the one running now.
         self.chat=ChatPage(self.paths, lambda: self.service, self); self.pages.addWidget(self.chat)
+        # Image mode is built the first time it is opened — see ``image``.
+        self._image: ImagePage | None = None
         # After the pages, because the View menu switches parts of one of them on
         # and off and reads their current state to check its own boxes.
         self.build_menus()
@@ -136,8 +144,38 @@ class MainWindow(QMainWindow):
         column.addWidget(splitter,1); column.addLayout(self.action_bar())
         return page
 
+    @property
+    def image(self):
+        """Image mode, built the first time it is asked for.
+
+        The page is five hundred widgets: nineteen drop-downs each carrying its
+        three sentinels, eleven preservation targets, four reference slots and
+        two output panes. Setting a style sheet re-polishes every widget in the
+        application, so a page that has not been built is a page that costs
+        nothing — and a session that only ever writes video prompts never
+        builds it.
+
+        Everything in this window that reaches across to the page asks
+        ``self._image`` rather than this, precisely so that asking whether it is
+        generating does not build it in order to find out.
+        """
+        if self._image is None:
+            self._image = ImagePage(self.paths, lambda: self.service, self)
+            self._image.apply_metrics(touch.metrics(touch.SCALES[getattr(self, "scale_name", touch.DEFAULT_SCALE)]))
+            # Last into the stack, which is where MODES names it.
+            self.pages.addWidget(self._image)
+        return self._image
+
+    def tell_pages(self, note: str):
+        """Say the same thing on every page that exists to hear it."""
+        self.chat.set_status(note)
+        if self._image is not None: self._image.set_status(note)
+
     def select_mode(self, mode: str, remember: bool = True):
-        self.pages.setCurrentIndex(1 if mode == CONVERSATION_MODE else 0)
+        # The pages went into the stack in the order MODES names them, so the
+        # mode is its own index and adding a fourth needs nothing here.
+        if mode == IMAGE_MODE: self.image           # builds it, if this is the first time
+        self.pages.setCurrentIndex(MODE_KEYS.index(mode) if mode in MODE_KEYS else 0)
         for action in self.mode_actions.actions(): action.setChecked(action.data() == mode)
         if remember:
             settings=self.paths.data/touch.SETTINGS_FILE
@@ -194,7 +232,7 @@ class MainWindow(QMainWindow):
         # a menu was used.
         self.service.stop()
         note=f"Now running on {device.name} — the model loads again on your next generation."
-        self.refresh_status(note); self.chat.set_status(note)
+        self.refresh_status(note); self.tell_pages(note)
 
     def switch_warning(self, device, state) -> str:
         lines=[describe(device),"",
@@ -240,7 +278,7 @@ class MainWindow(QMainWindow):
         self.service.stop()
         note=(f"Now running {dialog.model_path().name} — it loads on your next generation."
               + ("" if state.get("mmproj") else " No vision projector: images cannot be sent to it."))
-        self.refresh_status(note); self.chat.set_status(note)
+        self.refresh_status(note); self.tell_pages(note)
 
     def unload_model(self):
         """Give the memory back now, rather than when the application closes."""
@@ -250,16 +288,17 @@ class MainWindow(QMainWindow):
         self.service.stop()
         note=("Model unloaded — it loads again on your next generation." if was_running
               else "No model was loaded.")
-        self.refresh_status(note); self.chat.set_status(note)
+        self.refresh_status(note); self.tell_pages(note)
 
     def busy(self) -> bool:
-        """Whether either page is mid-generation."""
-        return bool(self.thread and self.thread.isRunning()) or self.chat.busy()
+        """Whether any page is mid-generation."""
+        return (bool(self.thread and self.thread.isRunning()) or self.chat.busy()
+                or (self._image is not None and self._image.busy()))
 
     def remembered_mode(self) -> str:
         try: mode=read_json(self.paths.data/touch.SETTINGS_FILE).get("mode")
         except (OSError,ValueError): return PROMPT_MODE
-        return mode if mode in (PROMPT_MODE,CONVERSATION_MODE) else PROMPT_MODE
+        return mode if mode in MODE_KEYS else PROMPT_MODE
 
     def build_menus(self):
         """Settings chooses what the window is doing; View, how much of it shows."""
@@ -447,9 +486,11 @@ class MainWindow(QMainWindow):
         for edit in (self.positive,self.negative): edit.setMinimumHeight(m["target"]*3)
         self.generate_button.setMinimumWidth(m["target"]*4)
         for box in self.findChildren(QComboBox): box.setMaxVisibleItems(8)
-        # Conversation mode is sized by the same choice; it holds the numbers
-        # itself because a bubble's picture and avatar are measured from them.
+        # The other two pages are sized by the same choice; each holds the
+        # numbers itself, because a bubble's picture and an image page's output
+        # boxes are measured from them.
         if hasattr(self,"chat"): self.chat.apply_metrics(m)
+        if getattr(self,"_image",None) is not None: self._image.apply_metrics(m)
         if remember: touch.save_scale(self.paths,name)
 
     def fill_screen(self):
@@ -590,7 +631,11 @@ class MainWindow(QMainWindow):
     def open_setup(self):
         self.service.stop(); wizard=SetupWizard(self.paths,self)
         if wizard.exec() and wizard.completed:
-            self.paths=wizard.paths; self.service=InferenceService(self.paths); self.chat.rebind(self.paths); self.refresh_status()
+            self.paths=wizard.paths; self.service=InferenceService(self.paths); self.chat.rebind(self.paths)
+            if self._image is not None: self._image.rebind(self.paths)
+            self.refresh_status()
     def closeEvent(self,event):
         if self.thread and self.thread.isRunning(): self.thread.quit(); self.thread.wait(3000)
-        self.chat.shutdown(); self.service.stop(); event.accept()
+        self.chat.shutdown()
+        if self._image is not None: self._image.shutdown()
+        self.service.stop(); event.accept()

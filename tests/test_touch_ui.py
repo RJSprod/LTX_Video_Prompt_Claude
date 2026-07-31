@@ -75,9 +75,13 @@ def test_every_control_is_at_least_a_fingertip_tall(qt, window):
 
 def test_each_page_has_the_biggest_button_on_the_action_it_is_for(qt, window):
     """The button pressed most is the one that should never be hunted for, and
-    there is now one of those per page: Generate in prompt mode, Send in
+    there is one of those per page: Generate in prompt mode, Send in
     conversation mode. Each has to win on its own page rather than in the
-    window, because only one page is ever on screen."""
+    window, because only one page is ever on screen.
+
+    Image mode's Generate is held to the same rule by ``test_image_mode.py``,
+    where the page is built anyway — building it here would leave five hundred
+    more widgets alive for every window the rest of this suite constructs."""
     for page, primary in ((window.pages.widget(0), window.generate_button),
                           (window.chat, window.chat.send_button)):
         others = [b for b in page.findChildren(qt.QPushButton) if b is not primary]
@@ -350,15 +354,18 @@ def chat_window(qt, tmp_path):
 
 def test_the_mode_lives_in_the_menu_bar_and_is_remembered(qt, chat_window, tmp_path):
     """Settings → Mode, not a control taking a row off the top of the window."""
-    from prompt_master.ui.main_window import CONVERSATION_MODE, PROMPT_MODE, MainWindow
+    from prompt_master.ui.main_window import (CONVERSATION_MODE, IMAGE_MODE, PROMPT_MODE,
+                                              MainWindow)
 
     assert not hasattr(chat_window, "mode_selector"), "the mode is a menu item now"
     chosen = {action.data(): action for action in chat_window.mode_actions.actions()}
-    assert set(chosen) == {PROMPT_MODE, CONVERSATION_MODE}
+    assert set(chosen) == {PROMPT_MODE, CONVERSATION_MODE, IMAGE_MODE}
     assert chosen[CONVERSATION_MODE].isChecked() and not chosen[PROMPT_MODE].isChecked()
 
     chosen[PROMPT_MODE].trigger()
     assert chat_window.pages.currentWidget() is chat_window.pages.widget(0)
+    chosen[IMAGE_MODE].trigger()
+    assert chat_window.pages.currentWidget() is chat_window.image
     chosen[CONVERSATION_MODE].trigger()
     assert chat_window.pages.currentWidget() is chat_window.chat
 
@@ -367,6 +374,30 @@ def test_the_mode_lives_in_the_menu_bar_and_is_remembered(qt, chat_window, tmp_p
         assert reopened.pages.currentWidget() is reopened.chat
         checked = [a.data() for a in reopened.mode_actions.actions() if a.isChecked()]
         assert checked == [CONVERSATION_MODE]
+    finally:
+        reopened.close()
+
+
+def test_image_mode_is_a_page_of_its_own_and_is_remembered(qt, window, tmp_path):
+    """The third page. It shares the window, the display size and the one
+    llama-server, and nothing else — including, deliberately, the engine.
+
+    It is also built when it is first opened rather than with the window: it is
+    some five hundred widgets, and every one of them is re-polished each time
+    the display size changes.
+    """
+    from prompt_master.ui.main_window import IMAGE_MODE, MainWindow
+
+    assert window._image is None, "image mode is built on demand, not with the window"
+    window.select_mode(IMAGE_MODE)
+    assert window.pages.currentWidget() is window.image
+    assert window.image.generate_button.isEnabled()
+
+    reopened = MainWindow(AppPaths(tmp_path))
+    try:
+        assert reopened.pages.currentWidget() is reopened.image
+        checked = [a.data() for a in reopened.mode_actions.actions() if a.isChecked()]
+        assert checked == [IMAGE_MODE]
     finally:
         reopened.close()
 
