@@ -16,7 +16,7 @@ import pytest
 from prompt_master.chat import prompt, yamlish
 from prompt_master.chat.characters import (Character, CharacterStore, Persona, load_persona,
                                            read_card, safe_stem, save_persona)
-from prompt_master.chat.history import ASSISTANT, USER, ChatStore, Message
+from prompt_master.chat.history import ASSISTANT, USER, ChatStore, Conversation, Message
 from prompt_master.core.paths import AppPaths
 
 
@@ -296,6 +296,42 @@ def test_chats_are_listed_newest_first_and_deleted_by_name(chats):
     assert [row.title for row in chats.listing("Ada")] == ["older"]
 
 
+def test_the_start_of_a_reply_is_kept_with_the_chat(chats):
+    """It is written into one conversation, so it belongs to that conversation
+    and to no other — including the next one with the same character."""
+    conversation = chats.new("Ada")
+    conversation.response_prefix = "It's always been red"
+    chats.save(conversation)
+
+    assert chats.load("Ada", conversation.identifier).response_prefix == "It's always been red"
+    assert chats.new("Ada").response_prefix == ""        # a new chat starts with none
+
+
+def test_a_chat_written_before_there_were_starts_simply_has_none(chats):
+    written = chats.new("Ada").to_dict()
+    del written["response_prefix"]
+    assert Conversation.from_dict(written).response_prefix == ""
+    assert Conversation.from_dict({"id": "x", "character": "Ada",
+                                   "response_prefix": None}).response_prefix == ""
+
+
+def test_a_branch_carries_the_start_into_the_copy(chats):
+    """A branch carries on from a point in the chat, and the start the replies
+    were being given is part of what that point is."""
+    conversation = chats.new("Ada")
+    conversation.append(USER, "one")
+    conversation.append(ASSISTANT, "two")
+    conversation.response_prefix = "It's always been red"
+    chats.save(conversation)
+
+    branched = chats.branch(conversation, 1)
+    assert branched.response_prefix == "It's always been red"
+    # And the two are separate from then on.
+    branched.response_prefix = "It's always been blue"
+    chats.save(branched)
+    assert chats.load("Ada", conversation.identifier).response_prefix == "It's always been red"
+
+
 def test_two_characters_do_not_share_a_chat_list(chats):
     chats.save(chats.new("Ada"))
     assert chats.listing("Ada") and chats.listing("Chiharu") == []
@@ -348,6 +384,28 @@ def test_an_instruction_is_the_last_turn_and_is_not_stored():
                          instruction=prompt.continue_instruction(Character(name="Ada")))
     assert built[-1]["role"] == USER and "Continue Ada's last message" in built[-1]["content"]
     assert len(history) == 2                     # the instruction went nowhere near it
+
+
+def test_a_started_reply_goes_out_as_the_assistant_turn_it_already_is():
+    """The start is on the wire as the opening of the reply, and the instruction
+    that follows asks for the rest of it. That shape is what a continuation
+    uses, because llama-server closes an assistant turn it is given rather than
+    writing on from it."""
+    history = _messages((USER, "What colour is the sky"),
+                        (ASSISTANT, "It's always been red"))
+    built = prompt.build(Character(name="Ada"), Persona(), history,
+                         instruction=prompt.prefix_instruction(Character(name="Ada")))
+
+    assert [message["role"] for message in built] == ["system", USER, ASSISTANT, USER]
+    assert built[-2]["content"] == "It's always been red"
+    instruction = built[-1]["content"]
+    assert "already been started" in instruction
+    assert "Carry straight on" in instruction and "Ada's voice" in instruction
+    # A start is written precisely because the character would not have chosen
+    # it, so being told to continue is not enough on its own.
+    for held in ("accept whatever", "even where you would have said something else",
+                 "do not contradict or walk it back", "Do not repeat it"):
+        assert held.casefold() in instruction.casefold()
 
 
 def test_a_message_with_a_picture_takes_the_multimodal_shape():
