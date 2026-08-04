@@ -373,8 +373,10 @@ def test_the_frame_rows_are_the_ones_the_mode_actually_has(qt, h3_window):
     from prompt_master.prompt_engine import minimax_h3 as h3
 
     page = h3_window.h3
+    # L2VA is the one that catches a wrong assumption: it has a picture, and
+    # that picture is the last frame.
     for value, first, last in ((h3.T2VA, False, False), (h3.I2VA, True, False),
-                               (h3.FL2VA, True, True)):
+                               (h3.FL2VA, True, True), (h3.L2VA, False, True)):
         page.mode.setCurrentIndex(page.mode.findData(value))
         assert page.first_row.isVisibleTo(page) is first
         assert page.last_row.isVisibleTo(page) is last
@@ -388,7 +390,8 @@ def test_the_h3_controls_carry_the_engines_own_keys_into_the_request(qt, h3_wind
     for box, value in ((page.mode, h3.T2VA), (page.shots, "3"), (page.style, "claymation"),
                        (page.camera, "push_in"), (page.amplitude, "large"),
                        (page.speed, "slow"), (page.cut, "fade"), (page.language, "Japanese"),
-                       (page.talk, "steady"), (page.music, "score")):
+                       (page.talk, "steady"), (page.music, "score"),
+                       (page.soundscape_mode, "silence")):
         box.setCurrentIndex(box.findData(value))
     page.seconds.setValue(12.0)
     page.speakers.setValue(2)
@@ -399,6 +402,7 @@ def test_the_h3_controls_carry_the_engines_own_keys_into_the_request(qt, h3_wind
     assert (asked.camera, asked.amplitude, asked.speed) == ("push_in", "large", "slow")
     assert (asked.cut, asked.language, asked.talk, asked.music) == ("fade", "Japanese",
                                                                     "steady", "score")
+    assert asked.ambience == "silence"
     assert (asked.seconds, asked.speakers, asked.seed) == (12.0, 2, 4242)
     # The values are the engine's keys, so the engine recognises every one.
     assert h3.build_system(asked)
@@ -427,12 +431,19 @@ def test_the_talk_caption_says_what_the_dials_add_up_to(qt, h3_window):
     assert "(S1)…(S2)" in page.talk_note.text()
 
 
-def test_the_score_box_is_only_live_when_there_is_a_score(qt, h3_window):
+def test_a_box_feeding_a_field_that_will_be_N_A_says_so(qt, h3_window):
+    """Either sound field can be the token, and a box whose contents are going
+    into a field that will read N/A is a box worth greying out."""
     page = h3_window.h3
     page.music.setCurrentIndex(page.music.findData("off"))
     assert not page.music_brief.isEnabled()
     page.music.setCurrentIndex(page.music.findData("score"))
     assert page.music_brief.isEnabled()
+
+    page.soundscape_mode.setCurrentIndex(page.soundscape_mode.findData("silence"))
+    assert not page.ambience.isEnabled()
+    page.soundscape_mode.setCurrentIndex(page.soundscape_mode.findData("scene"))
+    assert page.ambience.isEnabled()
 
 
 def test_h3_will_not_generate_without_an_intent_or_without_its_frames(qt, h3_window, monkeypatch):
@@ -452,6 +463,12 @@ def test_h3_will_not_generate_without_an_intent_or_without_its_frames(qt, h3_win
     assert said[-1] == "First frame required"
     assert page.thread is None
 
+    # L2VA wants only the last one, so that is what it asks for.
+    page.mode.setCurrentIndex(page.mode.findData(h3.L2VA))
+    page.generate()
+    assert said[-1] == "Last frame required"
+    assert page.thread is None
+
 
 def test_a_brief_is_streamed_then_replaced_by_the_one_that_was_assembled(qt, h3_window):
     """Watching it write and reading what it wrote are different needs: the raw
@@ -469,6 +486,7 @@ def test_a_brief_is_streamed_then_replaced_by_the_one_that_was_assembled(qt, h3_
     page.intent.setPlainText("a courier runs up a wet stairwell")
     page.mode.setCurrentIndex(page.mode.findData(h3.I2VA))
     page.mode.setCurrentIndex(page.mode.findData(h3.T2VA))
+    page.music.setCurrentIndex(page.music.findData("score"))
     page.seconds.setValue(10.0)
     page.seed.setValue(77)
 
@@ -476,7 +494,7 @@ def test_a_brief_is_streamed_then_replaced_by_the_one_that_was_assembled(qt, h3_
     _finish(qt, page)
 
     written = page.prompt.toPlainText()
-    assert written.startswith(f"{h3.DESCRIPTION}:")           # T2VA: no alignment line
+    assert written.startswith(f"{h3.DESCRIPTION}:")           # T2VA: no instruction line
     assert f"{h3.SOUNDSCAPE}: Rain drums" in written
     assert f"{h3.MUSIC}: Low strings" in written
     assert f"{h3.CHARACTER_LIMIT}" in page.count.text()
@@ -511,6 +529,44 @@ def test_a_brief_that_breaks_a_rule_is_shown_with_the_rule_it_broke(qt, h3_windo
     # never rewrite.
     assert "[Shot 2] At 00:40.000" in page.prompt.toPlainText()
     assert h3.DESCRIPTION in page.prompt.toPlainText()
+
+
+def test_an_anchored_brief_gets_its_instruction_line_from_the_shots_that_came_back(
+        qt, h3_window, tmp_path):
+    """The guide's ``N`` is the real final shot, so the line cannot be written
+    until the brief has been. Here the writer used two, and the line says two."""
+    from PIL import Image
+    from prompt_master.prompt_engine import minimax_h3 as h3
+
+    page = h3_window.h3
+    service = _ScriptedService([
+        "integrated_multimodal_description: [Shot 1] Live-action, cinematic, a cyclist "
+        "under a closed umbrella.\n"
+        "[Shot 2] At 00:04.000, the camera cuts to the canopy opening above her.\n\n"
+        "overall_soundscape: Rain falls steadily on the pavement.\n\n"
+        "non_diegetic_music: N/A"])
+    page.service_provider = lambda: service
+    picture = tmp_path / "frame.png"
+    Image.new("RGB", (16, 16), "navy").save(picture)
+    page.intent.setPlainText("a cyclist opens an umbrella in the rain")
+    page.mode.setCurrentIndex(page.mode.findData(h3.FL2VA))
+    page.first_path = picture
+    page.last_path = picture
+    page.shots.setCurrentIndex(page.shots.findData("2"))
+    page.seconds.setValue(8.0)
+
+    page.generate()
+    _finish(qt, page)
+
+    written = page.prompt.toPlainText()
+    assert written.splitlines()[0] == (
+        "How the reference pictures align with the target video — Picture 1 (from Shot 1) "
+        "aligns with the 0.00-second mark of the target video; Picture 2 (from Shot 2) "
+        "aligns with the 8.00-second mark of the target video.")
+    assert written.splitlines()[1] == ""
+    assert service.vision_asked == [True]
+    assert [part["type"] for part in service.scripted.calls[0]["messages"][1]["content"]] == [
+        "image_url", "image_url", "text"]
 
 
 def test_clearing_h3_takes_the_frames_and_the_checks_with_it(qt, h3_window, tmp_path):
@@ -1756,6 +1812,34 @@ def test_an_image_is_refused_before_a_generation_starts_when_nothing_can_see_it(
     model_window.generate()
 
     assert model_window.thread is None, "nothing was started"
+    assert refused and "no vision projector" in refused[0]
+
+
+def test_an_h3_anchor_frame_is_refused_the_same_way(qt, model_window, monkeypatch, tmp_path):
+    """Same policy on the other prompt page, and it has to be asked about the
+    right frame: L2VA has no first frame and still puts a picture on the wire."""
+    from PIL import Image
+    from prompt_master.prompt_engine import minimax_h3 as h3
+    from prompt_master.ui import h3_page, main_window as module
+
+    refused = []
+    monkeypatch.setattr(h3_page.QMessageBox, "critical",
+                        lambda _self, _title, text, *a, **k: refused.append(text))
+    monkeypatch.setattr(module, "ModelDialog",
+                        _Picked(model_window.paths.root / "models" / "Other-Q6_K_P.gguf"))
+    monkeypatch.setattr(model_window.service, "stop", lambda: None)
+    model_window.choose_model()
+
+    picture = tmp_path / "last.png"
+    Image.new("RGB", (32, 32), (10, 10, 10)).save(picture)
+    page = model_window.h3
+    page.intent.setPlainText("a glass tips off the edge of a table")
+    page.mode.setCurrentIndex(page.mode.findData(h3.L2VA))
+    page.last_path = picture
+
+    page.generate()
+
+    assert page.thread is None, "nothing was started"
     assert refused and "no vision projector" in refused[0]
 
 

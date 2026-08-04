@@ -145,7 +145,8 @@ medium law, which is prompt behavior.
 
 `prompt_engine/minimax_h3.py` writes prompts for MiniMax-H3 and is **not** part
 of the port. It is this repository's own code, written to MiniMax's published
-`VIDEO_PROMPT_WRITING_GUIDE_base_en.md`, and it exists as a separate module
+*Video Prompt Writing Guide (T2VA / I2VA / FL2VA / L2VA)*, and it exists as a
+separate module
 rather than as a mode inside `brain.py` for the reason this whole report is
 about: every string upstream carries is pinned, and a second model's laws living
 next to them is a change that would not show up until a prompt came out

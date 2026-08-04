@@ -2,13 +2,16 @@
 
 Two things are being held here, and they are not the same thing.
 
-The first is that the brief this tab produces obeys
-``VIDEO_PROMPT_WRITING_GUIDE_base_en``: the three fields in their order, the
-alignment line first with exactly one blank line under it, times to two
-decimals, ``[Shot 1]`` without a timestamp and every later shot with a strictly
-increasing one, speech inside ``<d>[Language] … </d>``, a soundscape that does
-not repeat the dialogue, a score described by its instruments. The assertions
-below are those rules, one each.
+The first is that the brief this mode produces obeys the *Video Prompt Writing
+Guide (T2VA / I2VA / FL2VA / L2VA)*: the three fields in their order, each
+mode's instruction line in the guide's own wording — down to where it brackets
+``<Picture 1>`` and where it does not — naming the real final shot and the
+duration to two decimals; ``[Shot 1]`` without a timestamp and every later shot
+with a strictly increasing one; camera motion as an action with the guide's
+amplitude and speed phrases; speech inside ``<d>[Language] … </d>`` with stable
+IDs; a soundscape that does not repeat the dialogue; a score described by its
+instruments; and ``N/A`` — the token, not a sentence — wherever a sound field
+has nothing to say. The assertions below are those rules, one each.
 
 The second is that H3 mode cannot reach the LTX engine. ``PARITY_REPORT.md``
 rests on ``prompt_engine.upstream`` being byte-for-byte what was ported, and a
@@ -36,7 +39,9 @@ def request(**overrides) -> h3.H3Request:
 
 
 def brief_fields(description="[Shot 1] A stairwell.", soundscape="Rain on a skylight.",
-                 music="Low strings hold under it.") -> dict[str, str]:
+                 music=h3.NOT_APPLICABLE) -> dict[str, str]:
+    """A well-formed set of fields for the default request, which asks for no
+    score — so the score field is the token the guide gives for that."""
     return {h3.DESCRIPTION: description, h3.SOUNDSCAPE: soundscape, h3.MUSIC: music}
 
 
@@ -67,73 +72,160 @@ def test_the_ltx_engine_never_hears_about_h3():
     assert guilty == []
 
 
-# ── the shape of a finished brief ────────────────────────────────────────────
+# ── the four tasks ───────────────────────────────────────────────────────────
 
-def test_a_text_to_video_brief_is_the_three_fields_and_nothing_before_them():
+def test_the_guides_four_modes_are_all_offered():
+    assert [value for value, _ in h3.MODES] == [h3.T2VA, h3.I2VA, h3.FL2VA, h3.L2VA]
+
+
+def test_which_frames_each_mode_anchors_to():
+    """L2VA is the one that catches a wrong assumption: it has a picture, and
+    that picture is the *last* frame, so "has a first frame" is not the same
+    question as "has a picture"."""
+    assert not h3.anchored(h3.T2VA)
+    assert (h3.needs_first_frame(h3.I2VA), h3.needs_last_frame(h3.I2VA)) == (True, False)
+    assert (h3.needs_first_frame(h3.FL2VA), h3.needs_last_frame(h3.FL2VA)) == (True, True)
+    assert (h3.needs_first_frame(h3.L2VA), h3.needs_last_frame(h3.L2VA)) == (False, True)
+    assert h3.anchored(h3.L2VA)
+
+
+# ── the instruction line, in the guide's own wording ─────────────────────────
+
+def test_a_text_to_video_brief_has_no_instruction_and_starts_at_the_first_field():
     built = h3.assemble(brief_fields(), request(mode=h3.T2VA))
+    assert h3.instruction(request(mode=h3.T2VA)) == ""
     assert built.startswith(f"{h3.DESCRIPTION}:")
-    assert h3.alignment(request(mode=h3.T2VA)) == ""
+
+
+def test_the_first_frame_instruction_is_the_guides_wording():
+    assert h3.instruction(request(mode=h3.I2VA)) == (
+        "For the target video, at 0.00 seconds into the target video, "
+        "<Picture 1> (from [Shot 1]) is fully referenced.")
+
+
+def test_the_first_and_last_frame_instruction_is_the_guides_wording():
+    """Reproduced from the guide's Case 3, including that FL2VA alone writes
+    ``Picture 1 (from Shot 1)`` bare where the other two bracket both."""
+    assert h3.instruction(request(mode=h3.FL2VA, seconds=8.0), final_shot=1) == (
+        "How the reference pictures align with the target video — Picture 1 (from Shot 1) "
+        "aligns with the 0.00-second mark of the target video; Picture 2 (from Shot 1) "
+        "aligns with the 8.00-second mark of the target video.")
+
+
+def test_the_last_frame_instruction_is_the_guides_wording():
+    """The guide's Case 4."""
+    assert h3.instruction(request(mode=h3.L2VA, seconds=6.0), final_shot=1) == (
+        "How the reference pictures align with the target video — <Picture 1> "
+        "(from [Shot 1]) aligns with the 6.00-second mark of the target video.")
+
+
+def test_the_instruction_writes_its_duration_to_exactly_two_decimals():
+    for seconds, mark in ((8.0, "8.00-second"), (12.5, "12.50-second"), (6.0, "6.00-second")):
+        assert mark in h3.instruction(request(mode=h3.L2VA, seconds=seconds))
+
+
+def test_the_instruction_names_the_shot_the_writer_actually_ended_on():
+    """The guide's ``N`` is the index of the *actual* final shot, so the line is
+    built from the brief that came back rather than from what was asked for."""
+    asked = request(mode=h3.FL2VA, seconds=8.0, shots="2")
+    fields = brief_fields("[Shot 1] A cyclist under a closed umbrella.\n"
+                          "[Shot 2] At 00:04.000, the camera cuts to the canopy opening.")
+    assert "Picture 2 (from Shot 2)" in h3.assemble(fields, asked)
+    single = brief_fields("[Shot 1] A cyclist, one continuous move to the canopy.")
+    assert "Picture 2 (from Shot 1)" in h3.assemble(single, request(mode=h3.FL2VA, seconds=8.0))
+
+
+def test_an_anchored_brief_puts_the_instruction_first_with_one_blank_line_under_it():
+    lines = h3.assemble(brief_fields(), request(mode=h3.I2VA)).splitlines()
+    assert lines[0].startswith("For the target video,")
+    assert lines[1] == ""
+    assert lines[2].startswith(f"{h3.DESCRIPTION}:")
 
 
 def test_the_fields_keep_the_guides_order_whatever_order_they_arrived_in():
-    scrambled = {h3.MUSIC: "Strings.", h3.DESCRIPTION: "[Shot 1] A room.",
+    scrambled = {h3.MUSIC: h3.NOT_APPLICABLE, h3.DESCRIPTION: "[Shot 1] A room.",
                  h3.SOUNDSCAPE: "Rain."}
     built = h3.assemble(scrambled, request())
     assert [line.split(":")[0] for line in built.splitlines() if ":" in line][:3] == list(h3.FIELDS)
 
 
-def test_a_first_frame_brief_opens_with_one_alignment_line_and_one_blank_line():
-    built = h3.assemble(brief_fields(), request(mode=h3.I2VA))
-    lines = built.splitlines()
-    assert lines[0] == ("For the target video, at 0.00 seconds into the target video, "
-                        "<Picture 1> (from [Shot 1]) is fully referenced.")
-    assert lines[1] == ""
-    assert lines[2].startswith(f"{h3.DESCRIPTION}:")
+# ── N/A is a value, not a way out ────────────────────────────────────────────
 
-
-def test_the_alignment_line_writes_its_times_to_exactly_two_decimals():
-    line = h3.alignment(request(mode=h3.FL2VA, seconds=12.0, shots="3"))
-    assert "at 0.00 seconds" in line
-    assert "at 12.00 seconds" in line
-    assert "12.000 seconds" not in line
-
-
-def test_a_pinned_shot_count_numbers_the_last_frames_shot_and_auto_names_it():
-    assert "<Picture 2> (from [Shot 3])" in h3.alignment(request(mode=h3.FL2VA, shots="3"))
-    assert "<Picture 2> (from the final shot)" in h3.alignment(request(mode=h3.FL2VA, shots="auto"))
-
-
-def test_a_missing_score_is_answered_rather_than_dropped():
-    """The format is three fields. Two of them is not a shorter brief."""
+def test_no_score_is_the_token_rather_than_a_sentence_about_there_being_none():
     built = h3.assemble({h3.DESCRIPTION: "[Shot 1] A room.", h3.SOUNDSCAPE: "Rain."},
                         request(music="off"))
-    assert h3.NO_MUSIC in built
+    assert f"{h3.MUSIC}: {h3.NOT_APPLICABLE}" in built
     assert built.count(f"{h3.MUSIC}:") == 1
+
+
+def test_complete_silence_is_the_one_case_that_takes_the_token_in_the_soundscape():
+    silent = request(ambience="silence")
+    built = h3.assemble({h3.DESCRIPTION: "[Shot 1] A room."}, silent)
+    assert f"{h3.SOUNDSCAPE}: {h3.NOT_APPLICABLE}" in built
+    assert h3.NOT_APPLICABLE in h3.build_system(silent)
+
+
+def test_a_soundscape_of_N_A_that_nobody_asked_for_is_flagged():
+    fields = brief_fields(soundscape=h3.NOT_APPLICABLE)
+    notes = h3.checks("", fields, request(ambience="scene"))
+    assert any("only when complete silence" in note for note in notes)
+
+
+def test_silence_that_was_asked_for_and_then_described_anyway_is_flagged():
+    fields = brief_fields(soundscape="Rain taps the skylight.")
+    notes = h3.checks("", fields, request(ambience="silence"))
+    assert any("should be N/A" in note for note in notes)
+
+
+def test_a_score_that_was_asked_for_and_came_back_N_A_is_flagged():
+    fields = brief_fields(music=h3.NOT_APPLICABLE)
+    notes = h3.checks("", fields, request(music="score"))
+    assert any("should not be N/A" in note for note in notes)
+
+
+def test_a_score_nobody_asked_for_is_flagged():
+    fields = brief_fields(music="Low strings hold under the climb.")
+    notes = h3.checks("", fields, request(music="off"))
+    assert any("should be N/A" in note for note in notes)
+
+
+def test_the_token_is_never_measured_in_sentences():
+    fields = brief_fields(soundscape=h3.NOT_APPLICABLE, music=h3.NOT_APPLICABLE)
+    notes = h3.checks("", fields, request(ambience="silence", music="off"))
+    assert not [note for note in notes if "sentences" in note]
 
 
 # ── budgets ──────────────────────────────────────────────────────────────────
 
-def test_timecode_is_the_forms_the_guide_uses():
+def test_timecode_is_the_form_the_guide_uses():
     assert h3.timecode(0) == "00:00.000"
-    assert h3.timecode(3) == "00:03.000"
-    assert h3.timecode(8.5) == "00:08.500"
+    assert h3.timecode(3.5) == "00:03.500"
+    assert h3.timecode(5) == "00:05.000"
     assert h3.timecode(63.25) == "01:03.250"
+
+
+def test_the_two_interpolating_modes_default_to_a_single_shot():
+    """The guide's instruction, not a preference: one shot is what lets the
+    model interpolate continuously towards the frame it has to land on."""
+    assert h3.shot_range(request(mode=h3.FL2VA, seconds=15)) == (1, 1)
+    assert h3.shot_range(request(mode=h3.L2VA, seconds=15)) == (1, 1)
+    # Unless more were explicitly specified, which pinning a number is.
+    assert h3.shot_range(request(mode=h3.FL2VA, shots="3")) == (3, 3)
 
 
 def test_a_pinned_shot_count_is_exact_and_auto_grows_with_the_duration():
     assert h3.shot_range(request(shots="2")) == (2, 2)
     assert h3.shot_range(request(shots="auto", seconds=5)) == (1, 2)
     assert h3.shot_range(request(shots="auto", seconds=15)) == (2, 4)
-    short = h3.shot_range(request(shots="auto", seconds=6))
-    long = h3.shot_range(request(shots="auto", seconds=14))
-    assert long[1] > short[1]
 
 
-def test_the_word_budget_grows_with_the_duration_and_never_collapses():
-    low, high = h3.word_budget(10)
-    assert low < high
-    assert h3.word_budget(15)[1] > high
-    assert h3.word_budget(0)[0] >= 90
+def test_the_word_budget_matches_the_scale_of_the_guides_own_cases():
+    """The four cases run roughly 75 to 95 words for six to ten seconds. A brief
+    three times that length is not a richer specification, it is prose."""
+    for seconds, observed in ((6, 95), (8, 90), (10, 75)):
+        low, high = h3.word_budget(seconds)
+        assert low <= observed <= high, f"{observed} words at {seconds}s is outside {low}-{high}"
+    assert h3.word_budget(15)[1] > h3.word_budget(5)[1]
 
 
 def test_the_duration_is_held_to_the_five_to_fifteen_seconds_h3_accepts():
@@ -143,8 +235,6 @@ def test_the_duration_is_held_to_the_five_to_fifteen_seconds_h3_accepts():
 
 
 def test_speech_needs_a_voice_to_be_assigned_to():
-    """A talk budget with nobody to speak is a disagreement, and the count wins:
-    a line has to belong to an ID, and there is no ID to give it."""
     assert h3.spoken_lines(request(speakers=0, talk="dense")) == 0
     assert h3.spoken_lines(request(speakers=2, talk="none")) == 0
     assert h3.spoken_lines(request(speakers=2, talk="sparse")) >= 1
@@ -162,9 +252,9 @@ def test_the_token_ceiling_clears_the_longest_brief_the_budget_allows():
 def test_labelled_text_is_read_field_by_field():
     fields = h3.parse("integrated_multimodal_description: [Shot 1] A room.\n\n"
                       "overall_soundscape: Rain.\n\n"
-                      "non_diegetic_music: Strings.")
+                      "non_diegetic_music: N/A")
     assert fields == {h3.DESCRIPTION: "[Shot 1] A room.", h3.SOUNDSCAPE: "Rain.",
-                      h3.MUSIC: "Strings."}
+                      h3.MUSIC: "N/A"}
 
 
 @pytest.mark.parametrize("label", [
@@ -176,11 +266,25 @@ def test_a_label_survives_whatever_the_writer_decorated_it_with(label):
     assert h3.parse(f"{label}\n[Shot 1] A room.").get(h3.DESCRIPTION) == "[Shot 1] A room."
 
 
+@pytest.mark.parametrize("written", [
+    "For the target video, at 0.00 seconds into the target video, <Picture 1> "
+    "(from [Shot 1]) is fully referenced.",
+    "How the reference pictures align with the target video — Picture 1 (from Shot 1) "
+    "aligns with the 0.00-second mark of the target video; Picture 2 (from Shot 1) "
+    "aligns with the 8.00-second mark of the target video.",
+])
+def test_an_instruction_line_the_writer_wrote_itself_is_dropped(written):
+    """It is added afterwards with the real final-shot number in it, and two of
+    them is worse than none."""
+    fields = h3.parse(f"{written}\n\nintegrated_multimodal_description: [Shot 1] A room.")
+    assert fields == {h3.DESCRIPTION: "[Shot 1] A room."}
+
+
 def test_a_json_object_is_read_as_the_object_it_is():
     fields = h3.parse('{"integrated_multimodal_description": "[Shot 1] A room.", '
-                      '"overall_soundscape": "Rain.", "non_diegetic_music": "Strings."}')
+                      '"overall_soundscape": "Rain.", "non_diegetic_music": "N/A"}')
     assert fields[h3.DESCRIPTION] == "[Shot 1] A room."
-    assert fields[h3.MUSIC] == "Strings."
+    assert fields[h3.MUSIC] == "N/A"
 
 
 def test_a_fence_and_a_reasoning_leak_are_stripped_before_anything_is_read():
@@ -190,8 +294,6 @@ def test_a_fence_and_a_reasoning_leak_are_stripped_before_anything_is_read():
 
 
 def test_prose_that_ignored_the_format_is_kept_as_the_description():
-    """Nothing is thrown away for being the wrong shape — it is put where the
-    checks below will notice what is missing from it."""
     assert h3.parse("[Shot 1] A room, and nobody labelled anything.") == {
         h3.DESCRIPTION: "[Shot 1] A room, and nobody labelled anything."}
 
@@ -206,7 +308,7 @@ def test_nothing_at_all_reads_as_nothing_at_all():
 def clean() -> tuple[str, dict, h3.H3Request]:
     asked = request(seconds=12.0, shots="3")
     fields = brief_fields(
-        "[Shot 1] Cinematic live-action, a courier at the foot of a stairwell.\n"
+        "[Shot 1] Live-action, cinematic, a courier at the foot of a stairwell.\n"
         "[Shot 2] At 00:04.000, the camera cuts to the landing.\n"
         "[Shot 3] At 00:08.500, the shot cuts to a door swinging open.")
     return h3.assemble(fields, asked), fields, asked
@@ -269,17 +371,16 @@ def test_a_missing_field_is_flagged_by_name():
 def test_a_brief_over_the_api_limit_is_flagged_with_its_length():
     asked = request()
     fields = brief_fields("[Shot 1] " + ("a very wet stairwell, " * 700))
-    brief = h3.assemble(fields, asked)
-    notes = h3.checks(brief, fields, asked)
+    notes = h3.checks(h3.assemble(fields, asked), fields, asked)
     assert any(str(h3.CHARACTER_LIMIT) in note for note in notes)
 
 
 def test_the_sound_fields_are_held_to_their_sentence_counts():
-    asked = request()
-    long_ambience = brief_fields(soundscape="A. B. C. D. E.")
-    assert any("1 to 4" in note for note in h3.checks("", long_ambience, asked))
-    long_score = brief_fields(music="A. B. C. D.")
-    assert any("1 to 3" in note for note in h3.checks("", long_score, asked))
+    asked = request(music="score")
+    assert any("1 to 4" in note for note in
+               h3.checks("", brief_fields(soundscape="A. B. C. D. E.", music="Strings."), asked))
+    assert any("1 to 3" in note for note in
+               h3.checks("", brief_fields(music="A. B. C. D."), asked))
 
 
 def test_speech_that_was_asked_for_and_never_written_is_flagged():
@@ -304,6 +405,22 @@ def test_speech_written_without_the_language_tag_is_flagged():
     assert any("[Japanese]" in note for note in notes)
 
 
+def test_a_line_carried_across_a_cut_has_to_be_marked_on_both_sides():
+    asked = request(shots="2")
+    fields = brief_fields("[Shot 1] She begins the sentence, <scenetrans>\n"
+                          "[Shot 2] At 00:04.000, the camera cuts to the hall.")
+    notes = h3.checks(h3.assemble(fields, asked), fields, asked)
+    assert any("<scenetrans>" in note for note in notes)
+
+
+def test_a_line_marked_on_both_sides_passes():
+    asked = request(shots="2", seconds=10.0)
+    fields = brief_fields(
+        "[Shot 1] She begins, <scenetrans> and the line continues seamlessly across the cut.\n"
+        "[Shot 2] At 00:04.000, the camera cuts to the hall, <scenetrans> carrying it over.")
+    assert h3.checks(h3.assemble(fields, asked), fields, asked) == []
+
+
 def test_well_formed_speech_passes():
     asked = request(seconds=10.0, shots="1", speakers=1, talk="sparse")
     fields = brief_fields("[Shot 1] The courier (S1) says: <d>[English] Almost there.</d>")
@@ -318,24 +435,37 @@ def test_the_output_contract_names_the_three_fields_in_order():
     assert positions == sorted(positions)
 
 
-def test_a_frame_anchored_brief_is_told_not_to_write_its_own_alignment_line():
-    """It is added afterwards, and two of them is worse than none."""
-    assert "alignment or reference line of your own" in h3.build_system(request(mode=h3.I2VA))
-    assert "alignment or reference line of your own" not in h3.build_system(request(mode=h3.T2VA))
+def test_an_anchored_brief_is_told_not_to_write_its_own_instruction_line():
+    for mode in (h3.I2VA, h3.FL2VA, h3.L2VA):
+        assert "reference or alignment line of your own" in h3.build_system(request(mode=mode))
+    assert "reference or alignment line of your own" not in h3.build_system(request(mode=h3.T2VA))
 
 
 def test_the_speech_syntax_appears_only_when_somebody_speaks():
     silent = h3.build_system(request(speakers=0))
     spoken = h3.build_system(request(speakers=2, talk="steady", language="Spanish"))
-    # The silent brief still names the tag, to forbid it. What it must not carry
-    # is the syntax — the IDs, the example line, the identity rules.
     assert "Nobody speaks" in silent
     assert "(S1,S2)" not in silent and "stable ID" not in silent
     assert "(S1,S2)" in spoken
     assert "<d>[Spanish]" in spoken
 
 
-def test_a_deliberate_transition_is_written_and_a_straight_cut_offers_the_alternates():
+def test_the_speech_block_carries_the_voiceover_and_continuity_rules():
+    spoken = h3.build_system(request(speakers=1, talk="sparse", shots="3"))
+    assert "says in an off-screen voiceover" in spoken
+    assert "lips remain" in spoken
+    assert "<scenetrans>" in spoken and "<cutoff>" in spoken
+
+
+def test_the_rule_for_a_line_crossing_a_cut_is_absent_where_there_is_no_cut():
+    """A single-shot brief has nothing to cross, and a paragraph about crossing
+    it is a paragraph the writer has to read past."""
+    single = h3.build_system(request(speakers=1, talk="sparse", shots="1"))
+    assert "<scenetrans>" not in single
+    assert "<cutoff>" in single                       # the end of the video is still an end
+
+
+def test_a_deliberate_transition_is_written_and_an_ordinary_cut_offers_the_alternates():
     dissolve = h3.build_system(request(shots="3", cut="cross_dissolve"))
     assert "the shot cross-dissolves to" in dissolve
     straight = h3.build_system(request(shots="3", cut="cut"))
@@ -345,26 +475,53 @@ def test_a_deliberate_transition_is_written_and_a_straight_cut_offers_the_altern
 
 def test_a_single_shot_brief_is_not_given_the_cutting_rules_at_all():
     system = h3.build_system(request(shots="1"))
-    assert "[Shot 2] At 00:03.000" not in system
+    assert "[Shot 2] At 00:03.500" not in system
+
+
+def test_the_interpolating_modes_are_told_there_are_no_cuts():
+    system = h3.build_system(request(mode=h3.FL2VA))
+    assert "no cuts and no timestamps" in system
+
+
+def test_the_camera_table_is_the_guides_own_and_names_what_each_move_does():
+    system = h3.build_system(request())
+    for name, meaning in h3.CAMERA_MOVES:
+        assert f"{name} — {meaning}" in system
+    assert "with small amplitude" in system and "at slow speed" in system
 
 
 def test_the_camera_is_asked_for_as_an_action_and_only_marked_when_unusual():
     plain = h3.build_system(request(camera="push_in"))
     assert "Camera: Push In." in plain
     marked = h3.build_system(request(camera="push_in", amplitude="large", speed="slow"))
-    assert "Camera: Push In, large amplitude, slow." in marked
+    assert "Camera: Push In with large amplitude at slow speed." in marked
 
 
 def test_the_style_is_asked_for_at_the_start_of_the_first_shot():
     assert "Style: claymation." in h3.build_system(request(style="claymation"))
-    assert "Style:" not in h3.build_system(request(style="auto"))
+    assert "Style: Live-action, cinematic." in h3.build_system(request(style="live_action_cinematic"))
+
+
+def test_an_unnamed_style_comes_from_the_text_or_from_the_picture():
+    """The guide splits this: keyframe tasks derive the style from the reference
+    image; T2VA selects it from the user's text."""
+    assert "Style:" not in h3.build_system(request(mode=h3.T2VA, style="auto"))
+    assert "take it from the attached picture" in h3.build_system(request(mode=h3.I2VA,
+                                                                          style="auto"))
 
 
 def test_the_score_block_says_what_to_write_when_there_is_no_score():
-    assert h3.NO_MUSIC in h3.build_system(request(music="off"))
+    off = h3.build_system(request(music="off"))
+    assert f"Write exactly: {h3.NOT_APPLICABLE}" in off
     scored = h3.build_system(request(music="score", music_brief="low strings"))
     assert "low strings" in scored
     assert "never name a song" in scored
+
+
+def test_the_sound_fields_are_told_not_to_repeat_each_other():
+    system = h3.build_system(request())
+    assert "a sound described twice is asked for twice" in system
+    assert "radio, television" in system or "radio, a television" in system
 
 
 def test_the_cast_and_the_on_screen_text_appear_only_when_given():
@@ -376,17 +533,22 @@ def test_the_cast_and_the_on_screen_text_appear_only_when_given():
     assert "FLOOR 12" in full
 
 
-def test_each_mode_gets_the_law_about_the_frames_it_actually_has():
-    assert "THE FIRST FRAME" in h3.build_system(request(mode=h3.I2VA))
-    assert "THE FIRST AND LAST FRAMES" in h3.build_system(request(mode=h3.FL2VA))
-    text_only = h3.build_system(request(mode=h3.T2VA))
-    assert "THE FIRST FRAME" not in text_only
+def test_each_mode_gets_the_law_and_the_structure_the_guide_gives_it():
+    i2va = h3.build_system(request(mode=h3.I2VA))
+    assert "first-frame anchor → action onset → continuous development" in i2va
+    fl2va = h3.build_system(request(mode=h3.FL2VA))
+    assert "first-frame state → observable intermediate changes" in fl2va
+    l2va = h3.build_system(request(mode=h3.L2VA))
+    assert "plausible preceding state → explicit action and transition path" in l2va
+    assert "does not belong to [Shot 1]" in l2va
+    assert "THE FIRST FRAME" not in h3.build_system(request(mode=h3.T2VA))
 
 
 def test_the_user_turn_carries_the_intent_and_says_what_the_pictures_are():
     assert "a courier runs up a wet stairwell" in h3.build_user(request())
     assert "first frame" in h3.build_user(request(mode=h3.I2VA))
     assert "first and the last frame" in h3.build_user(request(mode=h3.FL2VA))
+    assert "last frame" in h3.build_user(request(mode=h3.L2VA))
 
 
 # ── the frames on the wire ───────────────────────────────────────────────────
@@ -397,7 +559,7 @@ def test_a_text_only_request_sends_plain_text():
     assert isinstance(turns[1]["content"], str)
 
 
-def test_the_frames_go_first_and_in_order():
+def test_the_frames_go_first_and_in_picture_order():
     turns = h3.messages(request(mode=h3.FL2VA, first_frame="data:image/jpeg;base64,AAA",
                                 last_frame="data:image/jpeg;base64,BBB"))
     parts = turns[1]["content"]
@@ -406,17 +568,29 @@ def test_the_frames_go_first_and_in_order():
     assert parts[1]["image_url"]["url"].endswith("BBB")
 
 
+def test_l2va_sends_one_picture_and_it_is_the_last_frame():
+    """<Picture 1> in L2VA is the *end* of the video, so the last-frame slot is
+    what fills it and a first frame is neither wanted nor sent."""
+    turns = h3.messages(request(mode=h3.L2VA, last_frame="data:image/jpeg;base64,BBB",
+                                first_frame="data:image/jpeg;base64,AAA"))
+    parts = turns[1]["content"]
+    assert [part["type"] for part in parts] == ["image_url", "text"]
+    assert parts[0]["image_url"]["url"].endswith("BBB")
+
+
 def test_a_mode_that_needs_a_frame_refuses_to_go_without_one():
     with pytest.raises(h3.VisionUnavailable):
         h3.messages(request(mode=h3.I2VA))
     with pytest.raises(h3.VisionUnavailable):
         h3.messages(request(mode=h3.FL2VA, first_frame="data:image/jpeg;base64,AAA"))
+    with pytest.raises(h3.VisionUnavailable):
+        h3.messages(request(mode=h3.L2VA))
 
 
 def test_a_frame_is_never_quietly_dropped_when_nothing_can_see_it():
-    """The alignment line at the top of the brief states that the picture is the
-    first frame. Sending it to a model that cannot see the picture makes that
-    line a false statement about a video nobody chose."""
+    """The instruction line at the top of the brief states that the picture is a
+    frame of the video. Sending it to a model that cannot see the picture makes
+    that line a false statement about a video nobody chose."""
     with pytest.raises(h3.VisionUnavailable):
         h3.messages(request(mode=h3.I2VA, first_frame="data:image/jpeg;base64,AAA"),
                     vision_available=False)
@@ -426,7 +600,7 @@ def test_a_frame_is_never_quietly_dropped_when_nothing_can_see_it():
 
 def test_every_option_list_is_pairs_of_key_and_label():
     for options in (h3.MODES, h3.STYLES, h3.CAMERAS, h3.AMPLITUDES, h3.SPEEDS, h3.CUTS,
-                    h3.SHOTS, h3.LANGUAGES, h3.TALK, h3.MUSIC_MODES):
+                    h3.SHOTS, h3.LANGUAGES, h3.TALK, h3.MUSIC_MODES, h3.SOUNDSCAPES):
         assert options
         assert all(isinstance(value, str) and isinstance(label, str) and value
                    for value, label in options)
@@ -435,8 +609,14 @@ def test_every_option_list_is_pairs_of_key_and_label():
 
 
 def test_the_camera_list_is_h3s_own_vocabulary_and_nothing_invented():
+    """Twenty moves: each side of the paired ones, plus the four that stand
+    alone. Nothing added, nothing renamed."""
     labels = [label for value, label in h3.CAMERAS if value != "auto"]
-    assert labels == list(h3.CAMERA_MOVES)
+    assert labels == list(h3.CAMERA_NAMES)
+    assert len(h3.CAMERA_NAMES) == 20
+    for name in ("Zoom In", "Zoom Out", "Pedestal Down", "Arc Shot", "POV",
+                 "Roll Counterclockwise"):
+        assert name in labels
 
 
 def test_every_cut_has_a_phrase_and_every_style_that_is_not_auto_has_one_too():
@@ -446,3 +626,10 @@ def test_every_cut_has_a_phrase_and_every_style_that_is_not_auto_has_one_too():
 
 def test_every_talk_setting_has_a_rate():
     assert set(value for value, _ in h3.TALK) == set(h3.TALK_RATE)
+
+
+def test_the_amplitude_and_speed_defaults_are_the_ones_left_unwritten():
+    assert "medium" not in h3.AMPLITUDE_PHRASES
+    assert "normal" not in h3.SPEED_PHRASES
+    assert h3.AMPLITUDE_PHRASES["small"] == "with small amplitude"
+    assert h3.SPEED_PHRASES["fast"] == "at fast speed"

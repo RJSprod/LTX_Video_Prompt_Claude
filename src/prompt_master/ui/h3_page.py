@@ -15,15 +15,17 @@ That pane is where a negative prompt would have been, and it earns the space:
 an H3 brief is a specification, and a specification is worth proof-reading.
 
 *The frames are anchors, not a hint.* Prompt mode attaches one optional still.
-Here the mode says how many frames there are — none, a first, or a first and a
-last — and the rows for them appear and disappear with it, because an attached
-last frame means nothing in a mode that has no last frame.
+Here the H3 mode says which frames there are — none, a first, a first and a
+last, or a last alone — and the rows for them appear and disappear with it,
+because an attached last frame means nothing in a mode that has no last frame.
 
 *The prompt is assembled, not just streamed.* The model writes three fields;
 this page shows them arriving raw, then replaces them with the brief
-``minimax_h3.assemble`` built — alignment line, blank line, fields in order.
-Watching it write and reading what it wrote are different needs, and the second
-one is the one that gets copied.
+``minimax_h3.assemble`` built — instruction line, blank line, fields in order.
+The instruction cannot be written before the brief is: it names the real final
+shot number, which is whatever the writer used. Watching it write and reading
+what it wrote are different needs, and the second one is the one that gets
+copied.
 """
 
 from __future__ import annotations
@@ -70,7 +72,7 @@ class H3Worker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            frames = h3.needs_first_frame(self.request.mode)
+            frames = h3.anchored(self.request.mode)
             self.status.emit("Starting llama-server…")
             client = self.service.client(frames)
             # After the client, so a projector that failed to load is reported
@@ -229,6 +231,7 @@ class H3Page(QWidget):
         self.talk.currentIndexChanged.connect(lambda _index: self.describe_talk())
         self.describe_talk()
 
+        self.soundscape_mode = touch.combo(h3.SOUNDSCAPES, "scene")
         self.music = touch.combo(h3.MUSIC_MODES, "off")
         self.music_brief = QPlainTextEdit()
         self.music_brief.setPlaceholderText("Instrumentation, tempo, rhythm, how it changes.")
@@ -236,8 +239,9 @@ class H3Page(QWidget):
         self.ambience = QPlainTextEdit()
         self.ambience.setPlaceholderText("Ambience to build from: rain, traffic, a room tone.")
         touch.flickable(self.ambience)
-        self.music.currentIndexChanged.connect(lambda _index: self.follow_music())
-        self.follow_music()
+        for box in (self.music, self.soundscape_mode):
+            box.currentIndexChanged.connect(lambda _index: self.follow_sound())
+        self.follow_sound()
 
         self.cast = QPlainTextEdit()
         self.cast.setPlaceholderText("Name = description, one per line. Keeps a face the same across shots.")
@@ -257,8 +261,9 @@ class H3Page(QWidget):
             ("Voices", [("Speaking characters", touch.stepper(self.speakers)),
                         ("How much talking", self.talk), ("Language", self.language),
                         (None, self.talk_note, 2), ("On-screen text", self.on_screen)]),
-            ("Sound", [("Non-diegetic music", self.music), ("The score", self.music_brief),
-                       ("Ambience", self.ambience)]),
+            ("Sound", [("Soundscape", self.soundscape_mode),
+                       ("Non-diegetic music", self.music),
+                       ("Ambience", self.ambience), ("The score", self.music_brief)]),
             ("Continuity", [("Cast", self.cast), ("Notes", self.notes)]),
         ]
 
@@ -348,10 +353,11 @@ class H3Page(QWidget):
         self.first_row.setVisible(h3.needs_first_frame(mode))
         self.last_row.setVisible(h3.needs_last_frame(mode))
 
-    def follow_music(self) -> None:
-        """The score box is only worth filling in when there is a score."""
-        scored = touch.chosen(self.music, "off") != "off"
-        self.music_brief.setEnabled(scored)
+    def follow_sound(self) -> None:
+        """Either sound field can be N/A, and a box that feeds one that will be
+        N/A is a box whose contents are going nowhere. So it says so."""
+        self.music_brief.setEnabled(touch.chosen(self.music, "off") != "off")
+        self.ambience.setEnabled(touch.chosen(self.soundscape_mode, "scene") != "silence")
 
     def describe_talk(self) -> None:
         # Built from the three controls it depends on rather than from the whole
@@ -382,6 +388,19 @@ class H3Page(QWidget):
         label.setText(f"{which.title()} frame: {path.name}")
         label.setToolTip(filename)
         getattr(self, f"{which}_remove").setEnabled(True)
+
+    def frame_wanted(self, mode: str) -> str:
+        """Which frame this H3 mode needs and has not been given, or ``""``.
+
+        The engine asks the same question of a built request, over encoded
+        pictures. This asks it of the two file paths, before anything has been
+        read off the disk — the point of the guard is to stop before the work.
+        """
+        if h3.needs_first_frame(mode) and self.first_path is None:
+            return "first"
+        if h3.needs_last_frame(mode) and self.last_path is None:
+            return "last"
+        return ""
 
     def remove_frame(self, which: str) -> None:
         setattr(self, f"{which}_path", None)
@@ -420,6 +439,7 @@ class H3Page(QWidget):
             talk=touch.chosen(self.talk, "none"),
             on_screen_text=self.on_screen.toPlainText(),
             soundscape=self.ambience.toPlainText(),
+            ambience=touch.chosen(self.soundscape_mode, "scene"),
             music=touch.chosen(self.music, "off"),
             music_brief=self.music_brief.toPlainText(),
             cast=self.cast.toPlainText(),
@@ -438,23 +458,19 @@ class H3Page(QWidget):
         if self.thread is not None and self.thread.isRunning():
             return
         mode = touch.chosen(self.mode, h3.T2VA)
-        if h3.needs_first_frame(mode) and self.first_path is None:
-            QMessageBox.warning(self, "First frame required",
-                                "This mode starts from a picture. Attach a first frame, or "
-                                "switch to text to video.")
-            return
-        if h3.needs_last_frame(mode) and self.last_path is None:
-            QMessageBox.warning(self, "Last frame required",
-                                "First-and-last-frame mode needs both. Attach a last frame, or "
-                                "switch to first frame only.")
+        wanted = self.frame_wanted(mode)
+        if wanted:
+            QMessageBox.warning(
+                self, f"{wanted.title()} frame required",
+                f"This H3 mode is anchored to a {wanted} frame. Attach one, or choose an H3 "
+                "mode that does not need it.")
             return
         service = self.service_provider()
         # Asked while the frames are still attached and there is a choice to
         # make about them, rather than left to fail on the wire. Only on an
         # install that finished: an unconfigured one has a better answer of its
         # own, and service.client is what gives it.
-        if (h3.needs_first_frame(mode) and self.paths.configured
-                and not service.vision_ready()):
+        if h3.anchored(mode) and self.paths.configured and not service.vision_ready():
             QMessageBox.critical(self, "No vision projector",
                                  "The model running has no vision projector, so the anchor "
                                  "frames cannot be sent to it.\n\nChoose one under Settings → "

@@ -146,7 +146,7 @@ with a card in mixed mode — with `--gpu`, or the first card without it.
 | Mode | What it is |
 | --- | --- |
 | **Prompt mode — LTX-Video** | Everything below — an intent in, an LTX-Video 2.3 positive and negative prompt out. This is what the packaged build does, unchanged. |
-| **Prompt mode — MiniMax-H3** | The same job for a different model: an intent in, a MiniMax-H3 base-mode brief out, written to MiniMax's own prompt guide. See [MiniMax-H3 mode](#minimax-h3-mode). |
+| **Prompt mode — MiniMax-H3** | The same job for a different model: an intent in, a MiniMax-H3 brief out, written to MiniMax's own prompt guide. See [MiniMax-H3 mode](#minimax-h3-mode). |
 | **Conversation mode** | A chat with a character you wrote, on the same local model. See [Conversation mode](#conversation-mode). |
 
 The three share the window, the display size and the one `llama-server` the
@@ -224,51 +224,63 @@ generation this application produced before the presets existed — which
 
 The same two panes and the same Generate button, writing for a different video
 model. H3 generates picture and sound together, and its prompt is not a
-paragraph of description — it is a short specification, in a format MiniMax
-publishes as `docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md` beside the weights.
-This mode writes *base mode*: a text brief, optionally anchored to a first frame
-or to a first and a last frame.
+paragraph of description — it is a short specification, in the format MiniMax
+publishes as the *Video Prompt Writing Guide (T2VA / I2VA / FL2VA / L2VA)*
+beside the weights.
 
 A finished brief is three named fields, always in this order:
 
 | Field | What goes in it |
 | --- | --- |
-| `integrated_multimodal_description` | The timeline. Shots, composition, appearance, action, camera, and every sound whose source is in the scene — including all dialogue and singing. |
+| `integrated_multimodal_description` | The timeline, and the main body of the prompt. Shots, composition, appearance, action, camera, and every sound whose source is in the scene — dialogue, singing, a radio, a phone. |
 | `overall_soundscape` | One paragraph, one to four sentences: ambience, the sound of physical action, non-verbal human sound. Never a repeat of the dialogue. |
-| `non_diegetic_music` | One to three sentences of score — instrumentation, tempo, rhythm, how the dynamics move. No mood words, and never a song or an artist by name. |
+| `non_diegetic_music` | One to three sentences of score — instrumentation, speed, rhythm, how the dynamics change. No mood words, and never a song or an artist by name. |
+
+Either sound field can be exactly `N/A`, and the guide is strict about when:
+`non_diegetic_music: N/A` whenever there is no score, and
+`overall_soundscape: N/A` only when complete silence was actually asked for.
+The controls set both, and the checks flag a brief that put the token in the
+wrong place.
 
 **What the controls do.**
 
-- **H3 mode** — text only (T2VA), first frame (I2VA), or first and last frame
-  (FL2VA). The rows for attaching frames appear and disappear with it, because
-  an attached last frame means nothing in a mode with no last frame. In the two
-  frame modes the brief opens with the alignment line the guide requires, and
-  the application writes that line itself rather than asking the model for it:
-  it is mechanical, it has one correct answer, and its times have to carry
-  exactly two decimals.
-- **Duration** — 5 to 15 seconds, which is what the H3 surface takes. It sets
-  the word budget and bounds every cut time in the brief.
+- **H3 mode** — the guide's four tasks: text only (T2VA), first frame (I2VA),
+  first and last frame (FL2VA), or last frame alone (L2VA). The rows for
+  attaching frames appear and disappear with it, and L2VA's single picture is
+  the *last* frame — it is still `<Picture 1>`, and the opening is inferred back
+  from it. Each anchored mode gets its own recommended structure and its own
+  instruction line, in the guide's exact wording.
+- **The instruction line** is written by the application rather than asked for.
+  It has one correct answer, its duration carries exactly two decimals, and it
+  names `[Shot N]` — *the actual final shot* — so it is assembled after the
+  brief comes back, from the shot numbers the writer really used.
+- **Duration** — 5 to 15 seconds. It sets the word budget, bounds every cut time
+  in the brief, and is the `S.SS` in the instruction line.
 - **Shots** — pinned, or left to the beat. `[Shot 1]` never carries a timestamp;
-  every later shot opens `[Shot 2] At 00:04.000, the camera cuts to …` at a
-  strictly increasing time inside the duration. A cut has to bring new
-  information — if only the distance changes, the model is told to move the
-  camera instead of cutting.
-- **Camera move** — H3's own vocabulary, from Push In to Roll Counterclockwise,
-  written into the sentence as an action rather than stuck on the end as a
-  label. Amplitude and speed are written only when they are not the ordinary
-  case, which is what the guide asks for.
-- **Transitions** — a straight cut uses the guide's five interchangeable
+  every later shot opens `[Shot 2] At 00:03.500, the camera cuts to …` at a
+  strictly increasing time inside the duration. A cut has to introduce new
+  information — if only the distance or a slight angle changes, the model is
+  told to move the camera instead. FL2VA and L2VA default to a **single shot**,
+  because that is what lets the model interpolate continuously towards the frame
+  it has to land on; pinning a number is the explicit request for more.
+- **Camera move** — H3's own table, each move carried into the prompt with what
+  it means, because "Pedestal Up" and "Tilt Up" are different instructions to a
+  camera and the same guess to a writer given only the label. Written into the
+  sentence as an action, with `with small amplitude` / `at slow speed` added
+  only when they mean something: medium amplitude and normal speed are omitted.
+- **Transitions** — an ordinary cut uses the guide's five interchangeable
   phrasings, varied across the brief. Choosing cross-dissolve, fade or wipe is
   the explicit request the guide says those need.
 - **Voices** — speaking characters, how much talking, and the language. Speech
-  has a syntax rather than a style: a stable `(S1)`, `(S2)` per voice, who is
-  speaking and how they sound written outside the tag, and only the language tag
-  and the words inside it —
-  `The courier (S1) says: <d>[English] Almost there.</d>`. The caption under the
-  controls says what the three dials add up to in spoken lines.
-- **Sound** — ambience to build from, and whether there is a score at all. With
-  no score the third field is answered rather than dropped, because the format
-  is three fields.
+  has a syntax rather than a style: a stable `(S1)`, `(S2)` per voice and
+  `(S1,S2)` for two at once, who is speaking and how they sound written outside
+  the tag, and only the language tag and the words inside it —
+  `The courier (S1) says: <d>[English] Almost there.</d>`. Voiceover uses the
+  exact phrase and states that the lips stay closed; a line crossing a cut is
+  marked `<scenetrans>` on both sides, and one the video cuts off is `<cutoff>`.
+  The caption under the controls says what the three dials add up to in lines.
+- **Sound** — whether the soundscape is the scene's own or complete silence,
+  whether there is a score, and free text to build either from.
 - **Continuity** — a cast written as `Name = description`, so a face stays the
   same across a cut, and free notes the brief has to obey.
 
@@ -276,7 +288,8 @@ A finished brief is three named fields, always in this order:
 prompt would be holds the proof-reading instead: the character count against the
 7,000 the API accepts, and every rule the finished brief broke — a first shot
 that grew a timestamp, cut times that go backwards or run past the end, a
-soundscape that ran to eight sentences, an unclosed `<d>`, a missing field.
+soundscape that ran to eight sentences, an `N/A` where a sound was asked for, an
+odd number of `<scenetrans>` markers, an unclosed `<d>`, a missing field.
 Nothing is ever repaired silently. A brief that breaks a rule on purpose is
 still yours to keep, and a quiet correction is how you end up copying a prompt
 nobody chose.
@@ -601,7 +614,7 @@ mode the menu has been set to.
 ## Tests
 
 ```
-python -m pytest tests/        # 816 passed
+python -m pytest tests/        # 842 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
@@ -609,16 +622,18 @@ python -m pytest tests/        # 816 passed
   and mixed devices, manifest resolution, console setup, supplying a model from
   disk, changing device without re-downloading the model, and the installer's
   interpreter and environment checks
-- `test_touch_ui.py` (89) — target sizes, drag-to-scroll, the sliders and the
+- `test_touch_ui.py` (91) — target sizes, drag-to-scroll, the sliders and the
   five display sizes, the menu-bar mode switch and the View toggles, the
   runtime device menu and unloading, the transcript's layout and its sticky
   bottom, and both conversation mode and MiniMax-H3 mode driven end to end
   against a scripted server, measured on a real window built offscreen
-- `test_minimax_h3.py` (55) — the H3 brief against MiniMax's guide: the field
-  order, the alignment line and its two decimals, the shot and cut-time rules,
-  the speech syntax, the sentence counts on the two sound fields, reading back
-  a writer that answered in JSON or in prose, and the imports that prove the
-  H3 engine and the LTX engine cannot reach each other
+- `test_minimax_h3.py` (79) — the H3 brief against MiniMax's guide: the field
+  order, all four tasks and the three instruction wordings verbatim, the real
+  final-shot number and the two-decimal duration in them, the shot and cut-time
+  rules, the camera table, the speech syntax and its continuity markers, `N/A`
+  in both directions on the two sound fields, reading back a writer that
+  answered in JSON or in prose, and the imports that prove the H3 engine and the
+  LTX engine cannot reach each other
 - `test_prompt_engine.py` (44) — the adapter seam, the motion presets, speech
   expansion and the UI option sources
 - `test_chat.py` (40) — the character format and its three imports, chat

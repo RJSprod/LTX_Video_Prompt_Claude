@@ -7,12 +7,11 @@ different shape, obeying different laws, and the only honest way to have both is
 two engines that never share a line. Nothing here imports ``upstream``, and
 nothing in ``upstream`` knows this file exists.
 
-**Where the rules come from.** MiniMax publishes
-``docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md`` with the H3 weights, and *base
-mode* — no reference material, just a text brief and up to two anchor frames —
-is what this module writes. The guide is specific in a way most prompt advice is
-not, and the specifics are the reason this is a mode of its own rather than a style
-preset on the existing one:
+**Where the rules come from.** MiniMax publishes ``Video Prompt Writing Guide
+(T2VA / I2VA / FL2VA / L2VA)`` with the H3 weights, and that guide is what this
+module implements. It is specific in a way most prompt advice is not, and the
+specifics are the reason this is a mode of its own rather than a style preset on
+the existing one:
 
 * An H3 prompt is **three named fields**, always in the same order:
   ``integrated_multimodal_description``, ``overall_soundscape``,
@@ -21,29 +20,38 @@ preset on the existing one:
 * The description is a **timeline**, not a paragraph. ``[Shot 1]`` opens it and
   carries no timestamp; every later shot opens with ``[Shot N] At MM:SS.mmm,``
   and a cut phrase, at a strictly increasing time inside the duration.
-* Sound is **directed, not mentioned**. Dialogue, singing and diegetic audio
-  belong on the timeline with the picture; ambience belongs in the soundscape;
-  score belongs in the music field, described by instrumentation rather than by
-  mood. Saying the same sound twice is a fault, not emphasis.
+* Sound is **directed, not mentioned**. Dialogue, singing and any audio with a
+  source in the scene — a radio, a television, a phone — belong on the timeline
+  with the picture; ambience belongs in the soundscape; score belongs in the
+  music field, described by instrumentation rather than by mood. Saying the same
+  sound twice is a fault, not emphasis. Either sound field may be exactly
+  ``N/A``, and nothing else stands in for it.
 * Speech has a **syntax**: a stable ``(S1)`` per voice, the speaker and delivery
   written outside the tag, and only a language tag and the words themselves
-  inside ``<d>…</d>``, preserved to the punctuation mark.
-* With an anchor frame, one **alignment line comes first**, then a blank line,
-  then the fields — and the times in it are written to exactly two decimals.
+  inside ``<d>…</d>``, preserved to the punctuation mark. A line that crosses a
+  cut is marked ``<scenetrans>`` on both sides; one the video cuts off is marked
+  ``<cutoff>``.
+* Three of the four modes open with an **instruction line**, then one blank
+  line, then the fields. Each mode has its own wording, and the guide's wording
+  is reproduced here verbatim — including where it brackets ``<Picture 1>`` and
+  where it does not.
 
 **What is written here and what is written by the model.** Everything mechanical
-is assembled in this file: the alignment line, the field labels, their order,
-the blank line after the alignment. Those are the parts a language model gets
+is assembled in this file: the instruction line, the field labels, their order,
+the blank line after the instruction. Those are the parts a language model gets
 subtly wrong on a bad day, and they are also the parts with one correct answer,
-so there is no reason to ask. The model is asked only for prose, and is asked
-for it one field at a time under the laws above.
+so there is no reason to ask. One of them cannot be settled before the writing,
+though — the instruction names ``[Shot N]``, *the actual final shot* — so the
+line is built after the brief comes back, from the shot numbers the writer
+actually used.
 
 **Checks, not enforcement.** ``checks()`` re-reads the finished brief and says
 what looks wrong — a first shot that grew a timestamp, cut times that go
-backwards or run past the end, a soundscape that ran to eight sentences, a brief
-over the 7,000-character limit the API takes. It never rewrites: a brief that
-breaks a rule on purpose is still the writer's to keep, and a silent correction
-is how you end up with a prompt nobody chose.
+backwards or run past the end, a soundscape that ran to eight sentences, an
+``N/A`` where a sound was asked for, a brief over the 7,000-character limit the
+API takes. It never rewrites: a brief that breaks a rule on purpose is still the
+writer's to keep, and a silent correction is how you end up with a prompt nobody
+chose.
 """
 
 from __future__ import annotations
@@ -61,6 +69,11 @@ SOUNDSCAPE = "overall_soundscape"
 MUSIC = "non_diegetic_music"
 FIELDS = (DESCRIPTION, SOUNDSCAPE, MUSIC)
 
+# What a sound field says when there is no sound to describe. The guide gives
+# this exact token for both of them, so it is a value rather than a sentence:
+# "there is no music" is prose about silence, and N/A is silence.
+NOT_APPLICABLE = "N/A"
+
 # What the product surface accepts: 5-15 seconds at 24 FPS, and a prompt of at
 # most 7,000 characters. The duration bounds are the spin box's range; the
 # character limit is a check rather than a truncation, because a brief three
@@ -70,73 +83,94 @@ FPS = 24
 CHARACTER_LIMIT = 7000
 
 # ── modes ────────────────────────────────────────────────────────────────────
-# The guide's three base-mode shapes. Each is the T2VA body plus, for the two
-# frame-anchored ones, an instruction line and a rule about where the picture
-# goes in time.
+# The guide's four tasks. Each is the T2VA body plus, for the three anchored
+# ones, an instruction line and a rule about where the picture sits in time.
 
-T2VA, I2VA, FL2VA = "t2va", "i2va", "fl2va"
+T2VA, I2VA, FL2VA, L2VA = "t2va", "i2va", "fl2va", "l2va"
 
 MODES: list[tuple[str, str]] = [
     (T2VA, "Text to video — no frames (T2VA)"),
     (I2VA, "First frame (I2VA)"),
     (FL2VA, "First and last frame (FL2VA)"),
+    (L2VA, "Last frame (L2VA)"),
 ]
 
 # ── look ─────────────────────────────────────────────────────────────────────
-# The guide names these as the common styles and asks for one of them at the
-# start of [Shot 1], alongside the opening composition.
+# The guide's own list of common styles, spelled the way it spells them — its
+# example opens "[Shot 1] Live-action, cinematic, …", and two of these are
+# tokens that combine, so the combination is offered as well.
 
 STYLES: list[tuple[str, str]] = [
-    ("auto", "From the intent"),
-    ("cinematic", "Cinematic live-action"),
-    ("animation_2d", "2D animation"),
+    ("auto", "From the intent, or from the picture"),
+    ("live_action_cinematic", "Live-action, cinematic"),
+    ("cinematic", "Cinematic"),
+    ("live_action", "Live-action"),
+    ("animation_2d", "2D-animated"),
     ("cg_3d", "3D CG"),
     ("claymation", "Claymation"),
-    ("watercolor", "Watercolour"),
+    ("watercolor", "Watercolor"),
     ("vintage_film", "Vintage film"),
 ]
 
 STYLE_PHRASES: dict[str, str] = {
-    "cinematic": "cinematic live-action",
+    "live_action_cinematic": "Live-action, cinematic",
+    "cinematic": "Cinematic",
+    "live_action": "Live-action",
     "animation_2d": "2D-animated",
     "cg_3d": "3D CG",
     "claymation": "claymation",
-    "watercolor": "watercolour",
+    "watercolor": "watercolor",
     "vintage_film": "vintage film",
 }
 
-# H3's camera vocabulary, verbatim. The guide asks for these as English actions
-# inside the shot — "the camera pushes in slowly toward her hands" — never
-# stacked as labels after the sentence, which is why the UI offers the move and
-# the prompt asks for it to be written rather than pasted.
-CAMERA_MOVES: tuple[str, ...] = (
-    "Zoom In", "Zoom Out", "Push In", "Pull Out", "Pan Left", "Pan Right",
-    "Truck Left", "Truck Right", "Tilt Up", "Tilt Down", "Pedestal Up",
-    "Pedestal Down", "Arc Shot", "Tracking Shot", "Static Shot",
-    "Shake Slightly", "Shake Strongly", "POV", "Roll Clockwise",
-    "Roll Counterclockwise",
+# H3's camera vocabulary and what each move means, transcribed from the guide's
+# own table. The descriptions travel into the prompt with the names: "Pedestal
+# Up" and "Tilt Up" are different instructions to a camera and the same guess to
+# a writer that was only given the label.
+CAMERA_MOVES: tuple[tuple[str, str], ...] = (
+    ("Zoom In / Zoom Out", "the focal length changes while the camera body stays still"),
+    ("Push In / Pull Out", "the camera moves forward / backward"),
+    ("Pan Left / Pan Right", "the camera stays in place while the lens pivots horizontally"),
+    ("Truck Left / Truck Right", "the camera translates horizontally"),
+    ("Tilt Up / Tilt Down", "the camera stays in place while the lens pivots vertically"),
+    ("Pedestal Up / Pedestal Down", "the entire camera moves upward / downward"),
+    ("Arc Shot", "the camera moves in an arc around the subject"),
+    ("Tracking Shot", "the camera follows a moving subject"),
+    ("Static Shot", "camera position and lens remain still"),
+    ("Shake Slightly / Shake Strongly", "slight / strong camera shake"),
+    ("POV", "the subject's point of view"),
+    ("Roll Clockwise / Roll Counterclockwise", "the camera rolls around the lens axis"),
+)
+
+# One entry per move a shot can actually be given, which is each side of the
+# paired ones taken on its own.
+CAMERA_NAMES: tuple[str, ...] = tuple(
+    part.strip() for name, _ in CAMERA_MOVES for part in name.split("/")
 )
 
 CAMERAS: list[tuple[str, str]] = (
     [("auto", "From the intent")]
-    + [(move.lower().replace(" ", "_"), move) for move in CAMERA_MOVES]
+    + [(name.lower().replace(" ", "_"), name) for name in CAMERA_NAMES]
 )
 
-# Amplitude and speed are written only when they are not the default, because
-# the guide says so: medium amplitude and normal speed are the unmarked case,
-# and writing them spends words saying nothing.
+# The guide's exact expressions, and its rule for leaving them out: medium
+# amplitude and normal speed are the unmarked case, and writing them spends
+# words saying nothing.
 AMPLITUDES: list[tuple[str, str]] = [
     ("medium", "Medium — left unwritten"), ("small", "Small"), ("large", "Large"),
 ]
+AMPLITUDE_PHRASES: dict[str, str] = {"small": "with small amplitude",
+                                     "large": "with large amplitude"}
 SPEEDS: list[tuple[str, str]] = [
     ("normal", "Normal — left unwritten"), ("slow", "Slow"), ("fast", "Fast"),
 ]
+SPEED_PHRASES: dict[str, str] = {"slow": "at slow speed", "fast": "at fast speed"}
 
-# Straight cuts are the default and the guide gives five interchangeable
-# phrasings for them. The other three are named as things to use only when they
-# were actually asked for — choosing one here is that request.
+# Ordinary cuts are the default and the guide gives five interchangeable
+# phrasings for them. The other three are named as things to use only when the
+# user explicitly requested them — choosing one here is that request.
 CUTS: list[tuple[str, str]] = [
-    ("cut", "Straight cut"),
+    ("cut", "Ordinary cut"),
     ("cross_dissolve", "Cross-dissolve"),
     ("fade", "Fade"),
     ("wipe", "Wipe"),
@@ -149,8 +183,6 @@ CUT_PHRASES: dict[str, str] = {
     "wipe": "the shot wipes to",
 }
 
-# The guide's own alternates for a straight cut, offered to the writer so a
-# four-shot brief does not open every shot with the same five words.
 CUT_ALTERNATES = (
     "the camera cuts to", "the shot cuts to", "the shot transitions to",
     "the shot changes to", "the shot switches to",
@@ -158,7 +190,8 @@ CUT_ALTERNATES = (
 
 # A 5-15 second clip does not hold many shots, and the guide is explicit that a
 # cut has to earn itself with new information — a closer look at the same thing
-# is a camera move, not a cut. "Auto" leaves the count to the beat.
+# is a camera move, not a cut. "Auto" leaves the count to the beat, except in
+# the two modes that interpolate towards a frame, where the guide asks for one.
 SHOTS: list[tuple[str, str]] = (
     [("auto", "As many as the beat needs")]
     + [(str(n), "1 shot" if n == 1 else f"{n} shots") for n in range(1, 7)]
@@ -176,8 +209,8 @@ LANGUAGES: list[tuple[str, str]] = [
     )
 ]
 
-# How much of the clip is spoken over. The guide asks for lines proportional to
-# the duration rather than as many as will fit, so this is a budget, and
+# How much of the clip is spoken over. The guide's own cases carry one or two
+# lines in six to ten seconds, so this is a budget rather than a licence, and
 # ``spoken_lines`` turns it into a number the brief is written against.
 TALK: list[tuple[str, str]] = [
     ("none", "None — nobody speaks"),
@@ -186,25 +219,23 @@ TALK: list[tuple[str, str]] = [
     ("dense", "Dense — talking throughout"),
 ]
 
-# Lines per second, by density. A line is a sentence or two of speech, which at
-# an ordinary delivery is about two seconds of screen time — so "dense" is one
-# line every two and a bit seconds, and there is no setting that fills a ten
-# second clip with fifteen of them.
 TALK_RATE: dict[str, float] = {"none": 0.0, "sparse": 0.14, "steady": 0.28, "dense": 0.45}
 
 MAX_SPEAKERS = 6
 
-# ── music ────────────────────────────────────────────────────────────────────
+# ── sound ────────────────────────────────────────────────────────────────────
 
-MUSIC_MODES: list[tuple[str, str]] = [
-    ("off", "None — the scene's own sound only"),
-    ("score", "Scored — music only the audience hears"),
+SOUNDSCAPES: list[tuple[str, str]] = [
+    ("scene", "The sound the scene makes"),
+    # The guide allows N/A here only when complete silence was actually asked
+    # for, so asking for it is what this option is.
+    ("silence", "Complete silence — N/A"),
 ]
 
-# What ``non_diegetic_music`` says when there is no score. The field is part of
-# the format, so it is answered rather than dropped, and answered in the terms
-# the guide uses for that field.
-NO_MUSIC = "There is no non-diegetic music; the audience hears only the scene's own sound."
+MUSIC_MODES: list[tuple[str, str]] = [
+    ("off", "None — N/A"),
+    ("score", "Scored — music only the audience hears"),
+]
 
 # The writer pass. Cooler than the LTX engine's 0.85, and for a reason particular
 # to this format: an H3 brief is a specification — timestamps, IDs, tags, a fixed
@@ -236,8 +267,10 @@ class H3Request:
     talk: str = "none"
     # Words that must appear on screen, reproduced exactly and in quotes.
     on_screen_text: str = ""
-    # Free notes folded into the two sound fields.
+    # Free notes folded into the soundscape, and the switch that replaces it
+    # with N/A outright.
     soundscape: str = ""
+    ambience: str = "scene"
     music: str = "off"
     music_brief: str = ""
     # "Name = description" lines, the way LTX mode's lexicon reads, so a
@@ -245,6 +278,8 @@ class H3Request:
     cast: str = ""
     notes: str = ""
     # Anchor frames, already reduced to a JPEG data URL by imaging.preprocess.
+    # L2VA has one picture and it is the last frame, so the two fields are named
+    # for where they sit in the video rather than for their picture number.
     first_frame: str | None = None
     last_frame: str | None = None
     seed: int = 7
@@ -255,25 +290,74 @@ class VisionUnavailable(RuntimeError):
 
     Same policy as LTX prompt mode: a frame-anchored brief whose frame was never
     seen is not a slightly worse brief, it is a brief about a different video,
-    and the alignment line at the top of it would be a false statement. So the
+    and the instruction line at the top of it would be a false statement. So the
     request stops here rather than quietly becoming a T2VA one.
     """
+
+
+# ── what each mode needs ─────────────────────────────────────────────────────
+
+def needs_first_frame(mode: str) -> bool:
+    """Whether a picture anchors 0.00 seconds. Not L2VA: its one picture is the
+    last frame, and the opening is inferred rather than given."""
+    return (mode or T2VA).strip().lower() in (I2VA, FL2VA)
+
+
+def needs_last_frame(mode: str) -> bool:
+    return (mode or T2VA).strip().lower() in (FL2VA, L2VA)
+
+
+def anchored(mode: str) -> bool:
+    """Whether this mode puts a picture on the wire at all — which is the
+    question the vision projector has to be asked about, and it is not the same
+    question as "does it have a first frame": L2VA has only a last one."""
+    return needs_first_frame(mode) or needs_last_frame(mode)
+
+
+def frames(request: H3Request) -> list[str]:
+    """The anchor frames in picture order, which is the order H3 numbers them.
+
+    For FL2VA that is first then last; for L2VA the single picture is the last
+    frame and is still ``<Picture 1>``.
+    """
+    found: list[str] = []
+    if needs_first_frame(request.mode) and request.first_frame:
+        found.append(request.first_frame)
+    if needs_last_frame(request.mode) and request.last_frame:
+        found.append(request.last_frame)
+    return found
+
+
+def missing_frame(request: H3Request) -> str:
+    """Which frame this mode needs and has not been given, or ``""``."""
+    if needs_first_frame(request.mode) and not request.first_frame:
+        return "first"
+    if needs_last_frame(request.mode) and not request.last_frame:
+        return "last"
+    return ""
 
 
 # ── budgets ──────────────────────────────────────────────────────────────────
 
 def shot_range(request: H3Request) -> tuple[int, int]:
-    """How many shots to write. A pinned count is exact; auto scales with time.
+    """How many shots to write. A pinned count is exact; auto follows the mode.
 
-    Auto is deliberately narrow. Five seconds is one or two shots however it is
-    cut, and fifteen seconds is not eight — the guide's test for a cut is that
-    it brings new information, and a clip this short runs out of new information
-    long before it runs out of seconds.
+    FL2VA and L2VA default to one. That is the guide's instruction rather than a
+    preference: a single shot is what lets the model interpolate continuously
+    towards the frame it has to land on, and it asks for more only when more
+    were explicitly specified — which pinning a number here is.
+
+    For the two modes with no frame to land on, auto stays narrow. Five seconds
+    is one or two shots however it is cut, and fifteen is not eight: the test for
+    a cut is that it brings new information, and a clip this short runs out of
+    new information long before it runs out of seconds.
     """
     pinned = (request.shots or "auto").strip().lower()
     if pinned.isdigit():
         count = max(1, min(6, int(pinned)))
         return count, count
+    if (request.mode or T2VA).strip().lower() in (FL2VA, L2VA):
+        return 1, 1
     seconds = clamp_seconds(request.seconds)
     if seconds < 7:
         return 1, 2
@@ -285,13 +369,15 @@ def shot_range(request: H3Request) -> tuple[int, int]:
 def word_budget(seconds: float) -> tuple[int, int]:
     """Words for the description, from the duration it has to cover.
 
-    A shot brief is dense — composition, appearance, action, camera, sound, and
-    the speech itself — but H3 reads a timeline, and a timeline padded past the
-    events it describes stops being one. Roughly 24 to 38 words per second lands
-    a ten-second brief at 240-380 words, which is a full page and no more.
+    Calibrated against the guide's own four cases, which run 75 to 95 words for
+    six to ten seconds of video — roughly 7 to 16 words a second. An H3 brief is
+    a specification, not an essay: every clause has to name something visible or
+    audible, and the way to fail that test is to keep writing after the events
+    have all been described. The band is wide because the cases are: the same 90
+    words describe a busy eight seconds and a still ten.
     """
     seconds = clamp_seconds(seconds)
-    return max(90, round(seconds * 24)), max(150, round(seconds * 38))
+    return max(60, round(seconds * 7)), max(110, round(seconds * 16))
 
 
 def spoken_lines(request: H3Request) -> int:
@@ -316,9 +402,7 @@ def max_tokens(request: H3Request) -> int:
     mid-timestamp, which is worse than a brief that stopped early on its own.
     """
     _, high = word_budget(request.seconds)
-    # Two tokens a word for the description, plus the two sound fields, plus the
-    # labels and the punctuation that a specification is full of.
-    return int(high * 2 + 500)
+    return int(high * 3 + 500)
 
 
 def sampling() -> tuple[float, float]:
@@ -342,58 +426,64 @@ def timecode(seconds: float) -> str:
     return f"{int(minutes):02d}:{remainder:06.3f}"
 
 
-def needs_first_frame(mode: str) -> bool:
-    return (mode or T2VA).strip().lower() in (I2VA, FL2VA)
+def instruction(request: H3Request, final_shot: int = 1) -> str:
+    """The line a frame-anchored brief opens with, or ``""`` for T2VA.
 
+    Three wordings, reproduced from the guide exactly as it prints them —
+    including the inconsistency between them, where FL2VA writes ``Picture 1
+    (from Shot 1)`` bare and the other two bracket both. These are templates the
+    model was trained on, not prose to improve.
 
-def needs_last_frame(mode: str) -> bool:
-    return (mode or T2VA).strip().lower() == FL2VA
-
-
-def alignment(request: H3Request) -> str:
-    """The instruction line a frame-anchored brief opens with, or ``""``.
-
-    The guide is exact about three things here and all three are mechanical, so
-    none of them is left to the writer: it is the first line, exactly one blank
-    line separates it from the fields, and every time in it carries two decimal
-    places — ``0.00``, not ``0`` and not ``0.000``.
+    ``final_shot`` is the guide's ``N``: the index of the *actual* final shot,
+    which is why this is called after the brief comes back rather than before it
+    is asked for. The times are the guide's ``S.SS`` — the effective duration to
+    exactly two decimal places.
     """
     mode = (request.mode or T2VA).strip().lower()
+    seconds = clamp_seconds(request.seconds)
     if mode == I2VA:
         return ("For the target video, at 0.00 seconds into the target video, "
                 "<Picture 1> (from [Shot 1]) is fully referenced.")
     if mode == FL2VA:
-        low, high = shot_range(request)
-        # The last picture belongs to the last shot, which only has a number
-        # when the count was pinned. When it was not, it is named rather than
-        # numbered — a wrong number is worse than no number.
-        last = f"[Shot {high}]" if low == high else "the final shot"
-        return ("For the target video, at 0.00 seconds into the target video, "
-                "<Picture 1> (from [Shot 1]) is fully referenced, and at "
-                f"{clamp_seconds(request.seconds):.2f} seconds into the target video, "
-                f"<Picture 2> (from {last}) is fully referenced.")
+        return ("How the reference pictures align with the target video — Picture 1 "
+                "(from Shot 1) aligns with the 0.00-second mark of the target video; "
+                f"Picture 2 (from Shot {final_shot}) aligns with the {seconds:.2f}-second "
+                "mark of the target video.")
+    if mode == L2VA:
+        return ("How the reference pictures align with the target video — <Picture 1> "
+                f"(from [Shot {final_shot}]) aligns with the {seconds:.2f}-second mark of "
+                "the target video.")
     return ""
 
 
+def final_shot(description: str) -> int:
+    """The number of the last ``[Shot N]`` the writer actually used."""
+    marks = shot_marks(description)
+    return marks[-1][0] if marks else 1
+
+
 def assemble(fields: dict[str, str], request: H3Request) -> str:
-    """The finished brief: alignment line, blank line, the three fields in order.
+    """The finished brief: instruction line, blank line, the three fields in order.
 
     Missing fields are answered rather than skipped. The format is three fields,
     and a brief with two of them is not a shorter brief — it is one H3 will read
-    the wrong way round.
+    the wrong way round. Where there is nothing to say, the guide's answer is the
+    token ``N/A``, so that is what goes in.
     """
     described = (fields.get(DESCRIPTION) or "").strip()
     ambience = (fields.get(SOUNDSCAPE) or "").strip()
     score = (fields.get(MUSIC) or "").strip()
-    if not score:
-        score = NO_MUSIC if (request.music or "off").strip().lower() == "off" else ""
+    if not ambience and (request.ambience or "scene").strip().lower() == "silence":
+        ambience = NOT_APPLICABLE
+    if not score and (request.music or "off").strip().lower() == "off":
+        score = NOT_APPLICABLE
 
     body = "\n\n".join(
         f"{label}: {text}"
         for label, text in ((DESCRIPTION, described), (SOUNDSCAPE, ambience), (MUSIC, score))
         if text
     )
-    opener = alignment(request)
+    opener = instruction(request, final_shot(described))
     return f"{opener}\n\n{body}" if opener else body
 
 
@@ -415,6 +505,14 @@ _LABEL = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# An instruction line the writer produced anyway, in any of its three wordings.
+# Stripped rather than kept: the one this module assembles carries the real
+# final-shot number, and two of them is worse than none.
+_INSTRUCTION = re.compile(
+    r"^\s*(For the target video,.*?referenced\.|How the reference pictures align.*?video\.)\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def parse(raw: str) -> dict[str, str]:
     """Pull the three fields out of whatever the writer actually returned.
@@ -426,6 +524,7 @@ def parse(raw: str) -> dict[str, str]:
     """
     text = _THINK.sub("", raw or "").strip()
     text = _FENCE.sub("", text).strip()
+    text = _INSTRUCTION.sub("", text).strip()
     if not text:
         return {}
 
@@ -492,6 +591,10 @@ def sentence_count(text: str) -> int:
     return len(_SENTENCE.findall(body)) if body else 0
 
 
+def _is_na(text: str) -> bool:
+    return (text or "").strip().rstrip(".").upper() == "N/A"
+
+
 def checks(brief: str, fields: dict[str, str], request: H3Request) -> list[str]:
     """What looks wrong with the finished brief, in the guide's own terms.
 
@@ -532,14 +635,48 @@ def checks(brief: str, fields: dict[str, str], request: H3Request) -> list[str]:
                 notes.append(f"[Shot {number}] cuts at {timecode(at)}, at or past the {seconds:g} s end.")
             previous = max(previous, at)
 
-    ambience = sentence_count(fields.get(SOUNDSCAPE, ""))
-    if ambience and not 1 <= ambience <= 4:
-        notes.append(f"overall_soundscape runs to {ambience} sentences — the guide asks for 1 to 4.")
+    notes += _sound_checks(fields, request)
+    notes += _speech_checks(described, request)
+    return notes
 
-    score = sentence_count(fields.get(MUSIC, ""))
-    if score and not 1 <= score <= 3:
-        notes.append(f"non_diegetic_music runs to {score} sentences — the guide asks for 1 to 3.")
 
+def _sound_checks(fields: dict[str, str], request: H3Request) -> list[str]:
+    """The two sound fields: their sentence counts, and where N/A is allowed.
+
+    N/A is a value the guide gives rather than a way out of writing one, so it
+    is checked in both directions — present where nothing was asked for, and
+    absent where silence was.
+    """
+    notes: list[str] = []
+    ambience = fields.get(SOUNDSCAPE, "")
+    silent = (request.ambience or "scene").strip().lower() == "silence"
+    if _is_na(ambience):
+        if not silent:
+            notes.append("overall_soundscape is N/A, which the guide allows only when "
+                         "complete silence was asked for.")
+    elif ambience:
+        if silent:
+            notes.append("Complete silence was asked for, so overall_soundscape should be N/A.")
+        count = sentence_count(ambience)
+        if not 1 <= count <= 4:
+            notes.append(f"overall_soundscape runs to {count} sentences — the guide asks for 1 to 4.")
+
+    score = fields.get(MUSIC, "")
+    scored = (request.music or "off").strip().lower() != "off"
+    if _is_na(score):
+        if scored:
+            notes.append("A score was asked for, so non_diegetic_music should not be N/A.")
+    elif score:
+        if not scored:
+            notes.append("No score was asked for, so non_diegetic_music should be N/A.")
+        count = sentence_count(score)
+        if not 1 <= count <= 3:
+            notes.append(f"non_diegetic_music runs to {count} sentences — the guide asks for 1 to 3.")
+    return notes
+
+
+def _speech_checks(described: str, request: H3Request) -> list[str]:
+    notes: list[str] = []
     if spoken_lines(request):
         if "<d>" not in described:
             notes.append("Speech was asked for but no <d> tag was written.")
@@ -549,6 +686,11 @@ def checks(brief: str, fields: dict[str, str], request: H3Request) -> list[str]:
             notes.append(f"No [{request.language}] tag inside the spoken content.")
         if not re.search(r"\(S\d", described):
             notes.append("No speaker ID — every voice needs a stable (S1), (S2), …")
+    # A line carried across a cut is marked at both connecting points, so an odd
+    # number of markers means one side of the join is unmarked.
+    if described.count("<scenetrans>") % 2:
+        notes.append("<scenetrans> appears an odd number of times — a line crossing a cut is "
+                     "marked at both connecting points.")
     return notes
 
 
@@ -562,19 +704,22 @@ def _law_format(request: H3Request) -> str:
         "OUTPUT FORMAT — EXACTLY THIS, NOTHING ELSE",
         "Write three fields, in this order, each label on its own line followed by its text:",
         "",
-        f"{DESCRIPTION}: <text>",
+        f"{DESCRIPTION}: [Shot 1] …",
         "",
-        f"{SOUNDSCAPE}: <text>",
+        f"{SOUNDSCAPE}: …",
         "",
-        f"{MUSIC}: <text>",
+        f"{MUSIC}: …",
         "",
         "No preamble, no explanation, no markdown, no code fence, no headings, no bullet "
-        "lists, and no fourth field. Write plain prose after each label.",
+        "lists, and no fourth field. Write plain prose after each label. Either sound field "
+        f"may be exactly {NOT_APPLICABLE} where the rules below allow it, and nothing else "
+        "stands in for that.",
     ]
     if mode != T2VA:
         lines.append(
-            "Do not write an alignment or reference line of your own — one is added above "
-            "your first field after you are done. Start at the first label."
+            "Do not write a reference or alignment line of your own — one is added above your "
+            "first field after you are done, and it names the real final shot number. Start "
+            "at the first label."
         )
     return "\n".join(lines)
 
@@ -587,55 +732,80 @@ def _law_description(request: H3Request) -> str:
     count = (f"exactly {low} shot" + ("" if low == 1 else "s")) if low == high \
         else f"{low} to {high} shots"
     cut = (request.cut or "cut").strip().lower()
+    mode = (request.mode or T2VA).strip().lower()
 
     lines = [
         f"{DESCRIPTION} — THE TIMELINE",
-        f"This is a {seconds:g}-second video at {FPS} FPS. Describe it along its timeline, "
-        f"in {words_low}-{words_high} words, as {count}.",
+        f"This is a {seconds:g}-second video at {FPS} FPS. It is the main body of the prompt. "
+        f"Write it along its timeline, in {words_low}-{words_high} words, as {count}.",
         "",
-        "[Shot 1] opens the field and carries NO timestamp. At its start, state the overall "
-        "style and the opening composition, then the subject's appearance and position, the "
-        "environment and its light, what moves, and how the camera moves.",
+        "Every detail must correspond to something visible or audible: visual style, initial "
+        "composition, subject appearance and position, the scene and its key props, actions "
+        "and reactions, shot changes, spoken language, and synchronised diegetic sound. "
+        "Nothing about what the video means, is about, or makes anyone feel.",
+        "",
+        "At the beginning of [Shot 1], state the overall style and the initial composition. "
+        "[Shot 1] carries NO timestamp:",
+        "    [Shot 1] Live-action, cinematic, a medium-wide shot frames …",
     ]
     if low != 1 or high != 1:
         alternates = ", ".join(f'"{phrase}"' for phrase in CUT_ALTERNATES)
         lines += [
             "",
-            "Every later shot opens exactly like this:",
-            "    [Shot 2] At 00:03.000, the camera cuts to …",
-            "The time is MM:SS.mmm, is strictly later than the shot before it, and falls "
-            f"inside the {seconds:g} seconds. Never repeat a time and never go backwards.",
+            "Every later shot uses the next number and opens with a strictly increasing cut "
+            "time inside the video duration:",
+            "    [Shot 2] At 00:03.500, the camera cuts to …",
+            "The time is MM:SS.mmm. Never repeat one and never go backwards.",
         ]
         if cut == "cut":
-            lines.append(f"For the cut phrase use any of: {alternates}. Vary them.")
+            lines.append(f"For ordinary cuts use any of: {alternates}. Vary them.")
         else:
             lines.append(
-                f'Use "{CUT_PHRASES[cut]}" for the transitions, as asked for — this is one '
-                "of the deliberate transitions, so it is written rather than a straight cut."
+                f'Use "{CUT_PHRASES[cut]}" for the transitions. The guide reserves this for '
+                "when the user asks for it, and the user has asked for it."
             )
         lines += [
             "",
-            "A cut must bring new information — a new subject, a new space, a new state, a "
-            "new viewpoint, a new moment in time. If all that changes is the distance or a "
-            "small angle on the same thing, do not cut: move the camera instead.",
+            "A cut must introduce new information about the subject, the space, the state, "
+            "the viewpoint or the time. If only the distance or a slight angle needs to "
+            "change, prefer camera motion.",
         ]
+    elif mode in (FL2VA, L2VA):
+        lines += [
+            "",
+            "One shot, so that the motion between the anchor frames is continuous. There are "
+            "no cuts and no timestamps anywhere in this brief.",
+        ]
+
+    table = "\n".join(f"    {name} — {meaning}" for name, meaning in CAMERA_MOVES)
     lines += [
         "",
-        "CAMERA. Name the move in H3's own vocabulary — " + ", ".join(CAMERA_MOVES) + " — but "
-        "write it as an English action inside the sentence, never as a label stuck on the end. "
-        'Write "the camera pushes in slowly toward the folded letter in her hands", not '
-        '"…her hands. (Push In, slow)". Give amplitude and speed only when they are not the '
-        "ordinary case: medium amplitude and normal speed are left unwritten.",
+        "CAMERA MOTION — MOTION TYPE + AMPLITUDE + SPEED",
+        table,
+        "Amplitude: \"with small amplitude\" or \"with large amplitude\". Speed: \"at slow "
+        "speed\" or \"at fast speed\". Add either only when it means something — medium "
+        "amplitude and normal speed are usually omitted.",
+        "Write the motion as a natural English action inside the shot, never stacked as "
+        "labels at the end of a sentence:",
+        "    The camera pushes in with small amplitude at slow speed toward the folded "
+        "letter in her hands.",
+        "    The camera pans right with large amplitude at fast speed, revealing the open "
+        "doorway.",
+        "    The camera holds a static shot as the runner exits the frame.",
         "",
-        "SOUND ON THE TIMELINE. Dialogue, singing and any sound whose source is in the scene "
-        "belong here, placed at the moment they happen, tied to the action that makes them. "
-        "Ambience and score do not belong here — they have fields of their own below.",
+        "SOUND ON THE TIMELINE. Dialogue, singing and every sound whose source is in the "
+        "scene belong here, at the moment they happen, tied to the action that makes them — "
+        "including a radio, a television, a phone or an instrument playing in the shot. "
+        "Ambience and score do not belong here; they have fields of their own below.",
     ]
     if request.on_screen_text.strip():
         lines += [
             "",
-            "ON-SCREEN TEXT. Reproduce these words exactly, inside English double quotation "
-            "marks, and say where and when they appear: " + request.on_screen_text.strip(),
+            "ON-SCREEN TEXT. Any banner, sign, label, subtitle or neon text actually visible "
+            "on screen goes in English double quotation marks, preserved verbatim and "
+            "untranslated, with where and when it appears:",
+            "    A red neon sign reading \"营业中\" glows above the doorway.",
+            "The text: " + request.on_screen_text.strip(),
         ]
     return "\n".join(lines)
 
@@ -649,80 +819,125 @@ def _law_speech(request: H3Request) -> str:
                 f"{SOUNDSCAPE}.")
     language = (request.language or "English").strip() or "English"
     people = request.speakers
+    _, most_shots = shot_range(request)
+    # The rule for a line that crosses a cut is only worth a paragraph in a
+    # brief that can have one. A single-shot brief has no cut to cross.
+    crossing = ([
+        "",
+        "When one line of dialogue or lyric crosses a cut, write <scenetrans> at the "
+        "connecting point in BOTH parts and say the audio continues across it — \"continues "
+        "seamlessly across the cut\", \"continues uninterrupted into the next shot\", "
+        "\"carries over from the previous shot\", \"remains audible across the transition\".",
+    ] if most_shots > 1 else [])
     return "\n".join([
         "SPEECH — A SYNTAX, NOT A STYLE",
         f"{people} speaking character{'' if people == 1 else 's'}, about {lines} spoken "
         f"line{'' if lines == 1 else 's'} across the clip. Keep the lines short enough to be "
         "said in the seconds they are given.",
         "",
-        "Give every voice a stable ID: (S1), (S2), … kept the same in every shot. A character "
-        "who never makes a sound gets no ID. Two voices at once share one: (S1,S2).",
+        "Subjects who speak, sing, or produce an off-screen human voice use stable IDs: (S1), "
+        "(S2), … kept the same across shots. Characters who never vocalise receive no ID. "
+        "When several already-numbered speakers speak or sing together, use a compound ID: "
+        "(S1,S2).",
         "",
-        "Who is speaking, what they look like and how they say it go OUTSIDE the tag. Inside "
-        "the tag goes the language tag and the words, and nothing else:",
-        f'    The young woman with a quiet, breathy voice (S1) says: <d>[{language}] I get off '
-        "at the next station.</d>",
+        "When a speaker first appears, establish a stable identity from the visual and audio "
+        "context — character type, age, gender, whether they are on screen, pitch, timbre, "
+        "speaking rate, accent. The identifying phrase, the ID, the action and the delivery "
+        "go OUTSIDE <d>. Inside <d>, only the language tag and the actual spoken content:",
+        f"    The young woman with a quiet, breathy voice (S1) says: <d>[{language}] I get "
+        "off at the next station.</d>",
+        f"    The two children (S1,S2) shout together, <d>[{language}] Wait for us!</d>",
+        "Preserve every original word and punctuation mark verbatim; never translate or "
+        "rewrite them.",
         "",
-        "The first time a voice speaks, establish it outside the tag — apparent age, gender, "
-        "pitch, timbre, speaking rate, accent. Off screen, write that they say it in an "
-        "off-screen voiceover, and say what their mouth is doing. Reproduce any words the "
-        "brief already quotes exactly, to the punctuation mark: never translate, never "
-        f"paraphrase, never tidy them. The language tag is [{language}].",
+        "For a voiceover use the exact phrase \"says in an off-screen voiceover\", and "
+        "immediately after the <d> block state that the on-screen character's lips remain "
+        "closed:",
+        f"    The man (S1) says in an off-screen voiceover: <d>[{language}] I still remember "
+        "that road.</d> while his lips remain completely closed.",
+    ] + crossing + [
+        "",
+        "Use <cutoff> when speech is truncated by the end of the video.",
     ])
 
 
 def _law_sound(request: H3Request) -> str:
     """The two sound fields, and the rule that keeps them apart."""
     music = (request.music or "off").strip().lower()
-    lines = [
-        f"{SOUNDSCAPE} — 1 TO 4 SENTENCES, ONE PARAGRAPH",
-        "Summarise the ambient sound, the sound of physical action, and non-verbal human "
-        "sound across the whole video: wind, rain, traffic, footsteps, fabric, impacts, "
-        "breathing, laughter, panting. Tie a sound to the thing that makes it, so it lands "
-        'on the frame — "a pop as the cork clears the bottle", not "a pop".',
-        "Do not repeat dialogue, singing or in-scene music here. They are already on the "
-        "timeline, and a sound described twice is asked for twice.",
-        "",
-        f"{MUSIC} — 1 TO 3 SENTENCES",
-    ]
-    if music == "off":
-        lines.append(f"There is no score. Write exactly this and nothing more: {NO_MUSIC}")
+    silent = (request.ambience or "scene").strip().lower() == "silence"
+    lines = [f"{SOUNDSCAPE} — 1 TO 4 SENTENCES, ONE PARAGRAPH"]
+    if silent:
+        lines.append("Complete silence was asked for throughout the video, which is the one "
+                     f"case that takes the token. Write exactly: {NOT_APPLICABLE}")
     else:
         lines += [
-            "Music only the audience hears — the characters cannot. Describe instrumentation, "
-            "tempo, rhythm and how the dynamics change across the clip. No mood words, no "
-            "explaining what the music makes the viewer feel, and never name a song, an "
-            "artist or a band.",
+            "One continuous paragraph summarising the ambient sound, the sound of physical "
+            "action, and non-verbal human sound across the full video: wind, rain, traffic, "
+            "footsteps, fabric movement, impacts, breathing, laughter, panting. Tie a sound "
+            "to the thing that makes it, so it lands on the frame.",
+            "Do not repeat dialogue, singing or diegetic music here — they already belong to "
+            "the multimodal description, and a sound described twice is asked for twice.",
+            "    Steady rain taps against the café windows while low room ambience continues "
+            "underneath. The entrance bell rings once, followed by wet footsteps and the soft "
+            "scrape of a chair.",
+        ]
+        if request.soundscape.strip():
+            lines.append("The sound to build it from: " + request.soundscape.strip())
+
+    lines += ["", f"{MUSIC} — 1 TO 3 SENTENCES"]
+    if music == "off":
+        lines.append(f"There is no non-diegetic music. Write exactly: {NOT_APPLICABLE}")
+    else:
+        lines += [
+            "Background music the characters cannot hear and only the audience can. Focus on "
+            "instrumentation, speed, rhythm and dynamic changes. Do not use abstract mood "
+            "words, do not explain the emotional function of the score, and never name a "
+            "song, an artist or a band. Singing, instruments, radio, television or phone "
+            "music audible to the characters are diegetic events and belong in the "
+            "description instead.",
+            "    Sparse piano notes at a slow tempo, joined by sustained low strings that "
+            "gradually increase in volume before fading out.",
         ]
         if request.music_brief.strip():
             lines.append("The score is: " + request.music_brief.strip())
-    if request.soundscape.strip():
-        lines += ["", "The sound to build the ambience from: " + request.soundscape.strip()]
     return "\n".join(lines)
 
 
 def _law_frames(request: H3Request) -> str:
-    """What the anchor frames mean, for the two modes that have them."""
+    """What the anchor frames mean, for the three modes that have them."""
     mode = (request.mode or T2VA).strip().lower()
     seconds = clamp_seconds(request.seconds)
     if mode == I2VA:
         return "\n".join([
-            "THE FIRST FRAME",
-            "The attached picture IS the video at 0.00 seconds, and it belongs to [Shot 1]. "
-            "Open by describing what is actually in it — the subject, their appearance and "
-            "position, the space, the light — and then develop forward from it. Everything "
-            "after 0.00 seconds is a path away from that frame: nothing in [Shot 1]'s opening "
-            "composition may contradict it.",
+            "THE FIRST FRAME — BEGIN FROM THE IMAGE AND DEVELOP FORWARD",
+            "The attached picture IS the video at 0.00 seconds and belongs to [Shot 1]. First "
+            "establish the style, the subjects, the composition and the scene anchors that "
+            "are actually in it, then describe the next action. Character identity, clothing, "
+            "colours, key objects and spatial relationships stay consistent with it.",
+            "Structure: first-frame anchor → action onset → continuous development → result "
+            "or reaction.",
         ])
     if mode == FL2VA:
         return "\n".join([
-            "THE FIRST AND LAST FRAMES",
-            "The first picture IS the video at 0.00 seconds and belongs to [Shot 1]. The "
-            f"second IS the video at {seconds:.2f} seconds and belongs to the final shot. "
-            "Describe both from what is actually in them, and write one continuous path "
-            "between them: the first-frame state, then the changes that can be seen "
-            "happening, then those differences narrowing, then the last-frame state. The "
-            "video must be able to arrive at the second picture without a jump.",
+            "THE FIRST AND LAST FRAMES — DESCRIBE THE PATH BETWEEN THEM",
+            "The first picture is the opening and the second is the ending. Do not describe "
+            "the two stills one after the other; supply the motion path that connects them — "
+            "how the subject moves, how poses change, how objects are handled, how the "
+            "composition evolves, how the scene or the lighting transitions. The last frame "
+            f"must be reached by the final shot at the {seconds:.2f}-second end of the video.",
+            "Structure: first-frame state → observable intermediate changes → progressively "
+            "narrowing differences → last-frame state.",
+        ])
+    if mode == L2VA:
+        return "\n".join([
+            "THE LAST FRAME — INFER THE OPENING AND LAND ON THE IMAGE",
+            "The attached picture IS the final frame of the video and belongs to the last "
+            "shot. It does not belong to [Shot 1]. Infer a plausible earlier state from the "
+            "brief and from that frame, then describe how the characters, the objects, the "
+            "camera and the scene gradually approach it, landing on its exact composition, "
+            f"positions and lighting at the {seconds:.2f}-second end.",
+            "Structure: plausible preceding state → explicit action and transition path → "
+            "gradual convergence in the final shot → last-frame landing.",
         ])
     return ""
 
@@ -747,6 +962,7 @@ def build_system(request: H3Request) -> str:
     then the sound. A block is absent when its setting is off — a brief with
     nobody speaking should not carry a page about speaker IDs.
     """
+    mode = (request.mode or T2VA).strip().lower()
     style = STYLE_PHRASES.get((request.style or "auto").strip().lower(), "")
     camera = dict(CAMERAS).get((request.camera or "auto").strip().lower(), "")
     amplitude = (request.amplitude or "medium").strip().lower()
@@ -754,7 +970,7 @@ def build_system(request: H3Request) -> str:
 
     blocks = [
         "You write prompts for MiniMax-H3, a video model that generates picture and sound "
-        "together. You are writing the finished prompt itself, in H3's base-mode format — not "
+        "together. You are writing the finished prompt itself, in H3's own format — not "
         "advice about one, and not a description of what you would write.",
         _law_format(request),
         _law_description(request),
@@ -766,23 +982,25 @@ def build_system(request: H3Request) -> str:
 
     asked: list[str] = []
     if style:
-        asked.append(f"Style: {style}. Say so at the start of [Shot 1].")
+        asked.append(f"Style: {style}. State it at the start of [Shot 1].")
+    elif mode != T2VA:
+        # The guide splits this: keyframe tasks take the style from the picture,
+        # T2VA takes it from the user's text.
+        asked.append("Style: take it from the attached picture and name it at the start of "
+                     "[Shot 1].")
     if camera and camera != "From the intent":
         move = camera
-        if amplitude != "medium":
-            move += f", {amplitude} amplitude"
-        if speed != "normal":
-            move += f", {speed}"
-        asked.append(f"Camera: {move}. Write it as an action, in the sentence.")
+        if amplitude in AMPLITUDE_PHRASES:
+            move += f" {AMPLITUDE_PHRASES[amplitude]}"
+        if speed in SPEED_PHRASES:
+            move += f" {SPEED_PHRASES[speed]}"
+        asked.append(f"Camera: {move}. Write it as an action, inside the sentence.")
     if request.notes.strip():
         asked.append("Also: " + request.notes.strip())
     if asked:
         blocks.append("WHAT WAS ASKED FOR\n" + "\n".join(asked))
 
-    blocks.append(
-        "Write the fields now. Every sentence describes something that can be seen or heard; "
-        "nothing describes what the video is about, how it feels, or what it means."
-    )
+    blocks.append("Write the fields now.")
     return "\n\n".join(block for block in blocks if block)
 
 
@@ -796,34 +1014,32 @@ def build_user(request: H3Request) -> str:
     elif mode == FL2VA:
         lines.append("The two attached pictures are the first and the last frame of the "
                      "video, in that order.")
+    elif mode == L2VA:
+        lines.append("The attached picture is the last frame of the video.")
     lines.append(f"Video to write: {intent}")
     return "\n\n".join(lines)
 
 
 def messages(request: H3Request, *, vision_available: bool = True) -> list[dict]:
-    """The chat turns, with the anchor frames attached in first-then-last order.
+    """The chat turns, with the anchor frames attached in picture order.
 
     Raises ``VisionUnavailable`` rather than dropping a frame the model cannot
     be shown, for the reason on that class.
     """
-    frames = []
-    if needs_first_frame(request.mode):
-        if not request.first_frame:
-            raise VisionUnavailable("This mode needs a first frame, and none is attached.")
-        frames.append(request.first_frame)
-    if needs_last_frame(request.mode):
-        if not request.last_frame:
-            raise VisionUnavailable("This mode needs a last frame, and none is attached.")
-        frames.append(request.last_frame)
-    if frames and not vision_available:
+    wanted = missing_frame(request)
+    if wanted:
+        raise VisionUnavailable(f"This mode needs a {wanted} frame, and none is attached.")
+    attached = frames(request)
+    if attached and not vision_available:
         raise VisionUnavailable(
             "The model running has no vision projector, so the anchor frames cannot be sent "
             "to it. Choose a model with one under Settings, or switch to text to video."
         )
 
     user = build_user(request)
-    if frames:
-        content: list[dict] = [{"type": "image_url", "image_url": {"url": url}} for url in frames]
+    if attached:
+        content: list[dict] = [{"type": "image_url", "image_url": {"url": url}}
+                               for url in attached]
         content.append({"type": "text", "text": user})
         turn: dict = {"role": "user", "content": content}
     else:
