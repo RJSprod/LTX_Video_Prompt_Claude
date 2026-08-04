@@ -141,6 +141,27 @@ medium law, which is prompt behavior.
 
 `brain.py` does not import `imaging` at all, so no prompt text can be affected.
 
+## The second engine
+
+`prompt_engine/minimax_h3.py` writes prompts for MiniMax-H3 and is **not** part
+of the port. It is this repository's own code, written to MiniMax's published
+`VIDEO_PROMPT_WRITING_GUIDE_base_en.md`, and it exists as a separate module
+rather than as a mode inside `brain.py` for the reason this whole report is
+about: every string upstream carries is pinned, and a second model's laws living
+next to them is a change that would not show up until a prompt came out
+different.
+
+The isolation is asserted rather than intended. `tests/test_minimax_h3.py`:
+
+* parses `minimax_h3.py` and fails on any import naming `upstream` or `adapter`;
+* scans every module under `prompt_engine/upstream/` and fails if one of them
+  mentions MiniMax at all.
+
+`tools/check_upstream_sync.py` and `tools/compare_upstream_engine.py` read only
+`prompt_engine/upstream`, so neither their file manifests nor the 307-config
+comparison is affected by the new module. The counts in this report are the LTX
+engine's and remain what they were.
+
 ## Verification commands
 
 ```bash

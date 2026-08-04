@@ -20,15 +20,25 @@ from prompt_master.inference.service import InferenceService
 from prompt_master.provisioning import installer
 from prompt_master.ui import touch
 from prompt_master.ui.chat_page import ChatPage
+from prompt_master.ui.h3_page import H3Page
 from prompt_master.ui.model_chooser import ModelDialog
 from prompt_master.ui.setup_wizard import SetupWizard
 
-# The two things this application does, and the order they appear in the mode
-# drop-down. Prompt mode is first because it is what the app was, and what an
-# install that has no characters yet can do.
+# The three things this application does, and the order they appear in the mode
+# menu. Prompt mode is first because it is what the app was, and what an install
+# that has no characters yet can do. MiniMax-H3 mode is beside it rather than
+# under it: it is the same job — writing a prompt for a video model — for a
+# different model, with its own engine and its own format.
 PROMPT_MODE = "prompt"
+H3_MODE = "minimax_h3"
 CONVERSATION_MODE = "conversation"
-MODES = ((PROMPT_MODE, "Prompt mode"), (CONVERSATION_MODE, "Conversation mode"))
+MODES = ((PROMPT_MODE, "Prompt mode — LTX-Video"),
+         (H3_MODE, "Prompt mode — MiniMax-H3"),
+         (CONVERSATION_MODE, "Conversation mode"))
+
+# Where each mode's page sits in the stack. One table rather than a chain of
+# conditionals, so adding a fourth mode is a row here and a page there.
+PAGES = {PROMPT_MODE: 0, H3_MODE: 1, CONVERSATION_MODE: 2}
 
 
 class GenerationWorker(QObject):
@@ -114,7 +124,8 @@ class MainWindow(QMainWindow):
         super().__init__(); self.paths = paths or AppPaths.discover(); self.service = InferenceService(self.paths); self.thread = None; self.setWindowTitle("Prompt Master Standalone"); self.image_path: Path | None = None; self.engine = PromptEngine(); self.devices = None
         self.pages=QStackedWidget(); self.pages.addWidget(self.prompt_page())
         # The service is handed over as a callable rather than as itself: re-running
-        # setup replaces it, and the chat page must talk to the one running now.
+        # setup replaces it, and the other pages must talk to the one running now.
+        self.h3=H3Page(self.paths, lambda: self.service, self); self.pages.addWidget(self.h3)
         self.chat=ChatPage(self.paths, lambda: self.service, self); self.pages.addWidget(self.chat)
         # After the pages, because the View menu switches parts of one of them on
         # and off and reads their current state to check its own boxes.
@@ -137,7 +148,7 @@ class MainWindow(QMainWindow):
         return page
 
     def select_mode(self, mode: str, remember: bool = True):
-        self.pages.setCurrentIndex(1 if mode == CONVERSATION_MODE else 0)
+        self.pages.setCurrentIndex(PAGES.get(mode, PAGES[PROMPT_MODE]))
         for action in self.mode_actions.actions(): action.setChecked(action.data() == mode)
         if remember:
             settings=self.paths.data/touch.SETTINGS_FILE
@@ -253,13 +264,14 @@ class MainWindow(QMainWindow):
         self.refresh_status(note); self.chat.set_status(note)
 
     def busy(self) -> bool:
-        """Whether either page is mid-generation."""
-        return bool(self.thread and self.thread.isRunning()) or self.chat.busy()
+        """Whether any page is mid-generation."""
+        return (bool(self.thread and self.thread.isRunning())
+                or self.h3.busy() or self.chat.busy())
 
     def remembered_mode(self) -> str:
         try: mode=read_json(self.paths.data/touch.SETTINGS_FILE).get("mode")
         except (OSError,ValueError): return PROMPT_MODE
-        return mode if mode in (PROMPT_MODE,CONVERSATION_MODE) else PROMPT_MODE
+        return mode if mode in PAGES else PROMPT_MODE
 
     def build_menus(self):
         """Settings chooses what the window is doing; View, how much of it shows."""
@@ -447,8 +459,9 @@ class MainWindow(QMainWindow):
         for edit in (self.positive,self.negative): edit.setMinimumHeight(m["target"]*3)
         self.generate_button.setMinimumWidth(m["target"]*4)
         for box in self.findChildren(QComboBox): box.setMaxVisibleItems(8)
-        # Conversation mode is sized by the same choice; it holds the numbers
-        # itself because a bubble's picture and avatar are measured from them.
+        # The other two pages are sized by the same choice and hold the numbers
+        # themselves — a bubble's picture and avatar are measured from them.
+        if hasattr(self,"h3"): self.h3.apply_metrics(m)
         if hasattr(self,"chat"): self.chat.apply_metrics(m)
         if remember: touch.save_scale(self.paths,name)
 
@@ -465,12 +478,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def combo(options, default=None):
         """Label is shown, upstream key is carried as item data — never the label."""
-        box=QComboBox()
-        for value,label in options: box.addItem(label,value)
-        if default is not None:
-            index=box.findData(default)
-            if index >= 0: box.setCurrentIndex(index)
-        return touch.touchable_popup(box)
+        return touch.combo(options,default)
 
     @staticmethod
     def grouped_combo(groups, default=None):
@@ -489,8 +497,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def chosen(box, fallback=""):
-        value=box.currentData()
-        return fallback if value is None else value
+        return touch.chosen(box,fallback)
 
     def browse_image(self):
         filename,_=QFileDialog.getOpenFileName(self,"Reference image","","Images (*.png *.jpg *.jpeg *.webp)")
@@ -585,12 +592,16 @@ class MainWindow(QMainWindow):
         # chosen rather than of every install, so the bar says which it is.
         model=state.get('quantization','not configured')
         if state.get('runtime') and not self.service.vision_ready(): model=f"{model}, no vision"
-        self.status.setText(f"Device: {device} · Model: {model} · Server: {'running' if self.service.process.running else 'stopped'} · Generation: idle"
-                            + (f" · {note}" if note else ""))
+        line=(f"Device: {device} · Model: {model} · Server: {'running' if self.service.process.running else 'stopped'} · Generation: idle"
+              + (f" · {note}" if note else ""))
+        self.status.setText(line)
+        # H3 mode runs on the same server and the same weights, so it says the
+        # same thing about them rather than keeping a second account of it.
+        if hasattr(self,"h3"): self.h3.set_status(line)
     def open_setup(self):
         self.service.stop(); wizard=SetupWizard(self.paths,self)
         if wizard.exec() and wizard.completed:
-            self.paths=wizard.paths; self.service=InferenceService(self.paths); self.chat.rebind(self.paths); self.refresh_status()
+            self.paths=wizard.paths; self.service=InferenceService(self.paths); self.h3.rebind(self.paths); self.chat.rebind(self.paths); self.refresh_status()
     def closeEvent(self,event):
         if self.thread and self.thread.isRunning(): self.thread.quit(); self.thread.wait(3000)
-        self.chat.shutdown(); self.service.stop(); event.accept()
+        self.h3.shutdown(); self.chat.shutdown(); self.service.stop(); event.accept()

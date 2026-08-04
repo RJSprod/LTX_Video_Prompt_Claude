@@ -145,15 +145,19 @@ with a card in mixed mode — with `--gpu`, or the first card without it.
 
 | Mode | What it is |
 | --- | --- |
-| **Prompt mode** | Everything below — an intent in, an LTX-Video 2.3 positive and negative prompt out. This is what the packaged build does, unchanged. |
+| **Prompt mode — LTX-Video** | Everything below — an intent in, an LTX-Video 2.3 positive and negative prompt out. This is what the packaged build does, unchanged. |
+| **Prompt mode — MiniMax-H3** | The same job for a different model: an intent in, a MiniMax-H3 base-mode brief out, written to MiniMax's own prompt guide. See [MiniMax-H3 mode](#minimax-h3-mode). |
 | **Conversation mode** | A chat with a character you wrote, on the same local model. See [Conversation mode](#conversation-mode). |
 
-The two share the window, the display size and the one `llama-server` the
-application runs, and nothing else: a conversation cannot reach the prompt
-engine, which is what keeps the engine byte-identical to upstream. The mode is
-remembered, so the application reopens on the one you were using.
+The three share the window, the display size and the one `llama-server` the
+application runs, and nothing else. A conversation cannot reach either prompt
+engine, and the two prompt engines cannot reach each other: the LTX engine is a
+byte-for-byte port that `tools/check_upstream_sync.py` pins, so H3's rules live
+in a separate module that imports none of it, and `tests/test_minimax_h3.py`
+reads the imports to hold that. The mode is remembered, so the application
+reopens on the one you were using.
 
-### Prompt mode
+### Prompt mode — LTX-Video
 
 Type what you want in **Intent**, set whichever controls matter, and press
 **Generate**. The positive prompt streams in as the model writes it; the
@@ -215,6 +219,67 @@ pass. The smart-negative pass keeps upstream's own numbers. Default appends
 nothing and adds nothing, so a default generation is byte-for-byte the
 generation this application produced before the presets existed — which
 `tests/test_prompt_engine.py` asserts against `brain.build_system` directly.
+
+### MiniMax-H3 mode
+
+The same two panes and the same Generate button, writing for a different video
+model. H3 generates picture and sound together, and its prompt is not a
+paragraph of description — it is a short specification, in a format MiniMax
+publishes as `docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md` beside the weights.
+This mode writes *base mode*: a text brief, optionally anchored to a first frame
+or to a first and a last frame.
+
+A finished brief is three named fields, always in this order:
+
+| Field | What goes in it |
+| --- | --- |
+| `integrated_multimodal_description` | The timeline. Shots, composition, appearance, action, camera, and every sound whose source is in the scene — including all dialogue and singing. |
+| `overall_soundscape` | One paragraph, one to four sentences: ambience, the sound of physical action, non-verbal human sound. Never a repeat of the dialogue. |
+| `non_diegetic_music` | One to three sentences of score — instrumentation, tempo, rhythm, how the dynamics move. No mood words, and never a song or an artist by name. |
+
+**What the controls do.**
+
+- **H3 mode** — text only (T2VA), first frame (I2VA), or first and last frame
+  (FL2VA). The rows for attaching frames appear and disappear with it, because
+  an attached last frame means nothing in a mode with no last frame. In the two
+  frame modes the brief opens with the alignment line the guide requires, and
+  the application writes that line itself rather than asking the model for it:
+  it is mechanical, it has one correct answer, and its times have to carry
+  exactly two decimals.
+- **Duration** — 5 to 15 seconds, which is what the H3 surface takes. It sets
+  the word budget and bounds every cut time in the brief.
+- **Shots** — pinned, or left to the beat. `[Shot 1]` never carries a timestamp;
+  every later shot opens `[Shot 2] At 00:04.000, the camera cuts to …` at a
+  strictly increasing time inside the duration. A cut has to bring new
+  information — if only the distance changes, the model is told to move the
+  camera instead of cutting.
+- **Camera move** — H3's own vocabulary, from Push In to Roll Counterclockwise,
+  written into the sentence as an action rather than stuck on the end as a
+  label. Amplitude and speed are written only when they are not the ordinary
+  case, which is what the guide asks for.
+- **Transitions** — a straight cut uses the guide's five interchangeable
+  phrasings, varied across the brief. Choosing cross-dissolve, fade or wipe is
+  the explicit request the guide says those need.
+- **Voices** — speaking characters, how much talking, and the language. Speech
+  has a syntax rather than a style: a stable `(S1)`, `(S2)` per voice, who is
+  speaking and how they sound written outside the tag, and only the language tag
+  and the words inside it —
+  `The courier (S1) says: <d>[English] Almost there.</d>`. The caption under the
+  controls says what the three dials add up to in spoken lines.
+- **Sound** — ambience to build from, and whether there is a score at all. With
+  no score the third field is answered rather than dropped, because the format
+  is three fields.
+- **Continuity** — a cast written as `Name = description`, so a face stays the
+  same across a cut, and free notes the brief has to obey.
+
+**Checks, under the brief.** H3 takes one prompt, so the pane where a negative
+prompt would be holds the proof-reading instead: the character count against the
+7,000 the API accepts, and every rule the finished brief broke — a first shot
+that grew a timestamp, cut times that go backwards or run past the end, a
+soundscape that ran to eight sentences, an unclosed `<d>`, a missing field.
+Nothing is ever repaired silently. A brief that breaks a rule on purpose is
+still yours to keep, and a quiet correction is how you end up copying a prompt
+nobody chose.
 
 ### On a touch screen
 
@@ -524,34 +589,42 @@ nothing else — the file is checked against the same pinned hash a download is,
 and lands at the same path, so everything downstream of setup cannot tell the
 two apart.
 
-Conversation mode adds no fifth change, because it is not on the path a prompt
-takes. It imports nothing from `prompt_engine`, writes its own system message
-from the character and the persona, and reaches the model through the same
-`InferenceService` and `LlamaClient` prompt mode uses. A prompt generated with
-the mode drop-down set either way is the same prompt.
+Conversation mode and MiniMax-H3 mode add no fifth change, because neither is on
+the path an LTX prompt takes. Conversation mode imports nothing from
+`prompt_engine` at all; H3 mode lives in `prompt_engine/minimax_h3.py` and
+imports nothing from `prompt_engine.upstream` or the adapter, which
+`tests/test_minimax_h3.py` asserts by reading its imports. Both write their own
+messages and reach the model through the same `InferenceService` and
+`LlamaClient` LTX prompt mode uses. An LTX prompt is the same prompt whichever
+mode the menu has been set to.
 
 ## Tests
 
 ```
-python -m pytest tests/        # 701 passed
+python -m pytest tests/        # 816 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
-- `test_prompt_engine.py` (44) — the adapter seam, the motion presets, speech
-  expansion and the UI option sources
-- `test_touch_ui.py` (59) — target sizes, drag-to-scroll, the sliders and the
-  five display sizes, the menu-bar mode switch and the View toggles, the
-  runtime device menu and unloading, the transcript's layout and its sticky
-  bottom, and conversation mode driven end to end against a scripted server,
-  measured on a real window built offscreen
-- `test_chat.py` (36) — the character format and its three imports, chat
-  history and branching, and what a chat turn puts on the wire
-- `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
-  download resume and retry
-- `test_install_flow.py` (113) — install-root discovery, GPU sizing, the CPU
+- `test_install_flow.py` (139) — install-root discovery, GPU sizing, the CPU
   and mixed devices, manifest resolution, console setup, supplying a model from
   disk, changing device without re-downloading the model, and the installer's
   interpreter and environment checks
+- `test_touch_ui.py` (89) — target sizes, drag-to-scroll, the sliders and the
+  five display sizes, the menu-bar mode switch and the View toggles, the
+  runtime device menu and unloading, the transcript's layout and its sticky
+  bottom, and both conversation mode and MiniMax-H3 mode driven end to end
+  against a scripted server, measured on a real window built offscreen
+- `test_minimax_h3.py` (55) — the H3 brief against MiniMax's guide: the field
+  order, the alignment line and its two decimals, the shot and cut-time rules,
+  the speech syntax, the sentence counts on the two sound fields, reading back
+  a writer that answered in JSON or in prose, and the imports that prove the
+  H3 engine and the LTX engine cannot reach each other
+- `test_prompt_engine.py` (44) — the adapter seam, the motion presets, speech
+  expansion and the UI option sources
+- `test_chat.py` (40) — the character format and its three imports, chat
+  history and branching, and what a chat turn puts on the wire
+- `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
+  download resume and retry
 
 Output-level parity against an upstream checkout is checked separately:
 
@@ -573,6 +646,7 @@ src/prompt_master/
   prompt_engine/           Vendored upstream engine, untouched
   prompt_engine/motion.py  The three motion settings — ours, applied at the seams
   prompt_engine/speech.py  The extra-speech pass over the intent — ours, before the brief
+  prompt_engine/minimax_h3.py  The H3 engine — ours, written to MiniMax's guide, importing none of the above
   provisioning/installer.py  Download, verify, extract, validate — one pipeline
   provisioning/importer.py   Installing a model you already have, instead
   inference/               llama-server process, streaming client, GPU detection
@@ -582,6 +656,7 @@ src/prompt_master/
   chat/prompt.py           What one chat turn puts on the wire
   chat/yamlish.py          The YAML subset a character file is written in
   ui/                      Main window, chat page, character editor, setup wizard
+  ui/h3_page.py            MiniMax-H3 mode: the same two panes, checks where the negative was
   ui/touch.py              Fingertip sizing and drag-to-scroll, in one place
 installer_files/           Created by the installer (gitignored)
 user_data/                 Default install root (gitignored)

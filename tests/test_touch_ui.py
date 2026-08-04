@@ -75,15 +75,17 @@ def test_every_control_is_at_least_a_fingertip_tall(qt, window):
 
 def test_each_page_has_the_biggest_button_on_the_action_it_is_for(qt, window):
     """The button pressed most is the one that should never be hunted for, and
-    there is now one of those per page: Generate in prompt mode, Send in
+    there is now one of those per page: Generate in either prompt mode, Send in
     conversation mode. Each has to win on its own page rather than in the
     window, because only one page is ever on screen."""
     for page, primary in ((window.pages.widget(0), window.generate_button),
+                          (window.h3, window.h3.generate_button),
                           (window.chat, window.chat.send_button)):
         others = [b for b in page.findChildren(qt.QPushButton) if b is not primary]
         assert primary.objectName() == "primary"
         assert primary.sizeHint().height() > max(button.sizeHint().height() for button in others)
     assert window.generate_button.minimumWidth() >= 4 * FINGERTIP
+    assert window.h3.generate_button.minimumWidth() >= 4 * FINGERTIP
     assert window.chat.send_button.minimumWidth() >= 3 * FINGERTIP
 
 
@@ -121,8 +123,11 @@ def test_the_areas_that_scroll_are_all_flickable(qt, window):
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QScroller
 
+    page = window.h3
     scrollable = [window.intent, window.lexicon, window.negative_extra,
-                  window.positive, window.negative]
+                  window.positive, window.negative,
+                  page.intent, page.on_screen, page.music_brief, page.ambience,
+                  page.cast, page.notes, page.prompt, page.report]
     scrollable += window.findChildren(qt.QScrollArea)
     for widget in scrollable:
         viewport = widget.viewport()
@@ -329,6 +334,205 @@ def test_attaching_an_image_switches_the_mode_and_names_the_file(qt, window, tmp
     assert window.request().video_mode == "t2v"
 
 
+# ── MiniMax-H3 mode ──────────────────────────────────────────────────────────
+# The engine's own rules are held by test_minimax_h3.py. What is held here is
+# the page: that its controls reach the request, that the rows on screen match
+# the mode chosen, and that a brief arriving from the model is assembled and
+# checked rather than shown raw.
+
+@pytest.fixture
+def h3_window(qt, tmp_path):
+    from prompt_master.ui.main_window import H3_MODE, MainWindow
+
+    paths = AppPaths(tmp_path)
+    paths.create_managed_dirs()
+    made = MainWindow(paths)
+    made.resize(1400, 900)
+    made.select_mode(H3_MODE)
+    yield made
+    made.close()
+
+
+def test_h3_mode_is_its_own_page_in_the_menu_and_is_remembered(qt, h3_window, tmp_path):
+    from prompt_master.ui.main_window import H3_MODE, MainWindow
+
+    assert h3_window.pages.currentWidget() is h3_window.h3
+    checked = [action.data() for action in h3_window.mode_actions.actions() if action.isChecked()]
+    assert checked == [H3_MODE]
+
+    reopened = MainWindow(AppPaths(tmp_path))
+    try:
+        assert reopened.pages.currentWidget() is reopened.h3
+    finally:
+        reopened.close()
+
+
+def test_the_frame_rows_are_the_ones_the_mode_actually_has(qt, h3_window):
+    """An attached last frame means nothing in a mode with no last frame, so the
+    row for it is not there to attach one into."""
+    from prompt_master.prompt_engine import minimax_h3 as h3
+
+    page = h3_window.h3
+    for value, first, last in ((h3.T2VA, False, False), (h3.I2VA, True, False),
+                               (h3.FL2VA, True, True)):
+        page.mode.setCurrentIndex(page.mode.findData(value))
+        assert page.first_row.isVisibleTo(page) is first
+        assert page.last_row.isVisibleTo(page) is last
+
+
+def test_the_h3_controls_carry_the_engines_own_keys_into_the_request(qt, h3_window):
+    from prompt_master.prompt_engine import minimax_h3 as h3
+
+    page = h3_window.h3
+    page.intent.setPlainText("a courier runs up a wet stairwell")
+    for box, value in ((page.mode, h3.T2VA), (page.shots, "3"), (page.style, "claymation"),
+                       (page.camera, "push_in"), (page.amplitude, "large"),
+                       (page.speed, "slow"), (page.cut, "fade"), (page.language, "Japanese"),
+                       (page.talk, "steady"), (page.music, "score")):
+        box.setCurrentIndex(box.findData(value))
+    page.seconds.setValue(12.0)
+    page.speakers.setValue(2)
+    page.seed.setValue(4242)
+
+    asked = page.request()
+    assert (asked.mode, asked.shots, asked.style) == (h3.T2VA, "3", "claymation")
+    assert (asked.camera, asked.amplitude, asked.speed) == ("push_in", "large", "slow")
+    assert (asked.cut, asked.language, asked.talk, asked.music) == ("fade", "Japanese",
+                                                                    "steady", "score")
+    assert (asked.seconds, asked.speakers, asked.seed) == (12.0, 2, 4242)
+    # The values are the engine's keys, so the engine recognises every one.
+    assert h3.build_system(asked)
+
+
+def test_the_h3_seed_of_minus_one_draws_a_new_one_for_every_generation(qt, h3_window):
+    from prompt_master.core.models import RANDOM_SEED
+
+    page = h3_window.h3
+    page.seed.setValue(RANDOM_SEED)
+    drawn = {page.request().seed for _ in range(12)}
+    assert page.seed.value() == RANDOM_SEED
+    assert all(seed >= 0 for seed in drawn) and len(drawn) > 8
+
+
+def test_the_talk_caption_says_what_the_dials_add_up_to(qt, h3_window):
+    """Three controls decide how much speech there is, and none of them says so
+    on its own — a spin box reading 2 does not mention lines or IDs."""
+    page = h3_window.h3
+    assert "Nobody speaks" in page.talk_note.text()
+
+    page.speakers.setValue(2)
+    page.talk.setCurrentIndex(page.talk.findData("steady"))
+    page.seconds.setValue(12.0)
+    assert "spoken line" in page.talk_note.text()
+    assert "(S1)…(S2)" in page.talk_note.text()
+
+
+def test_the_score_box_is_only_live_when_there_is_a_score(qt, h3_window):
+    page = h3_window.h3
+    page.music.setCurrentIndex(page.music.findData("off"))
+    assert not page.music_brief.isEnabled()
+    page.music.setCurrentIndex(page.music.findData("score"))
+    assert page.music_brief.isEnabled()
+
+
+def test_h3_will_not_generate_without_an_intent_or_without_its_frames(qt, h3_window, monkeypatch):
+    from prompt_master.prompt_engine import minimax_h3 as h3
+    from prompt_master.ui import h3_page
+
+    said = []
+    monkeypatch.setattr(h3_page.QMessageBox, "warning",
+                        lambda *args, **kwargs: said.append(args[1]))
+    page = h3_window.h3
+    page.generate()
+    assert said == ["Missing intent"]
+
+    page.intent.setPlainText("a courier runs up a wet stairwell")
+    page.mode.setCurrentIndex(page.mode.findData(h3.FL2VA))
+    page.generate()
+    assert said[-1] == "First frame required"
+    assert page.thread is None
+
+
+def test_a_brief_is_streamed_then_replaced_by_the_one_that_was_assembled(qt, h3_window):
+    """Watching it write and reading what it wrote are different needs: the raw
+    fields arrive as they come, and the assembled brief replaces them."""
+    from prompt_master.prompt_engine import minimax_h3 as h3
+
+    page = h3_window.h3
+    reply = ("integrated_multimodal_description: [Shot 1] Cinematic live-action, a courier "
+             "at the foot of a wet stairwell.\n"
+             "[Shot 2] At 00:04.000, the camera cuts to the landing above.\n\n"
+             "overall_soundscape: Rain drums on the skylight. Wet boots slap concrete.\n\n"
+             "non_diegetic_music: Low strings hold under the climb.")
+    service = _ScriptedService([reply])
+    page.service_provider = lambda: service
+    page.intent.setPlainText("a courier runs up a wet stairwell")
+    page.mode.setCurrentIndex(page.mode.findData(h3.I2VA))
+    page.mode.setCurrentIndex(page.mode.findData(h3.T2VA))
+    page.seconds.setValue(10.0)
+    page.seed.setValue(77)
+
+    page.generate()
+    _finish(qt, page)
+
+    written = page.prompt.toPlainText()
+    assert written.startswith(f"{h3.DESCRIPTION}:")           # T2VA: no alignment line
+    assert f"{h3.SOUNDSCAPE}: Rain drums" in written
+    assert f"{h3.MUSIC}: Low strings" in written
+    assert f"{h3.CHARACTER_LIMIT}" in page.count.text()
+    assert "Nothing to flag" in page.report.toPlainText()
+
+    sent = service.scripted.calls[0]
+    assert sent["seed"] == 77
+    assert sent["temperature"] == h3.TEMPERATURE
+    assert "a courier runs up a wet stairwell" in sent["messages"][-1]["content"]
+    assert service.vision_asked == [False]                    # no frames, no projector wanted
+
+
+def test_a_brief_that_breaks_a_rule_is_shown_with_the_rule_it_broke(qt, h3_window):
+    from prompt_master.prompt_engine import minimax_h3 as h3
+
+    page = h3_window.h3
+    service = _ScriptedService([
+        "integrated_multimodal_description: [Shot 1] At 00:00.000, a stairwell.\n"
+        "[Shot 2] At 00:40.000, the camera cuts to a landing.\n\n"
+        "overall_soundscape: Rain.\n\nnon_diegetic_music: Strings."])
+    page.service_provider = lambda: service
+    page.intent.setPlainText("a courier runs up a wet stairwell")
+    page.seconds.setValue(10.0)
+
+    page.generate()
+    _finish(qt, page)
+
+    report = page.report.toPlainText()
+    assert "first shot never does" in report
+    assert "past the 10 s end" in report
+    # The brief itself is left exactly as it came back: the checks report, they
+    # never rewrite.
+    assert "[Shot 2] At 00:40.000" in page.prompt.toPlainText()
+    assert h3.DESCRIPTION in page.prompt.toPlainText()
+
+
+def test_clearing_h3_takes_the_frames_and_the_checks_with_it(qt, h3_window, tmp_path):
+    from PIL import Image
+    from prompt_master.prompt_engine import minimax_h3 as h3
+
+    page = h3_window.h3
+    picture = tmp_path / "first.png"
+    Image.new("RGB", (8, 8), "red").save(picture)
+    page.mode.setCurrentIndex(page.mode.findData(h3.I2VA))
+    page.first_path = picture
+    page.first_label.setText(f"First frame: {picture.name}")
+    page.first_remove.setEnabled(True)
+    page.intent.setPlainText("a courier")
+    page.report.setPlainText("• something")
+
+    page.clear()
+    assert page.first_path is None and not page.first_remove.isEnabled()
+    assert page.intent.toPlainText() == "" and page.report.toPlainText() == ""
+    assert page.count.text() == ""
+
+
 # ── conversation mode ────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -352,9 +556,11 @@ def test_the_mode_lives_in_the_menu_bar_and_is_remembered(qt, chat_window, tmp_p
     """Settings → Mode, not a control taking a row off the top of the window."""
     from prompt_master.ui.main_window import CONVERSATION_MODE, PROMPT_MODE, MainWindow
 
+    from prompt_master.ui.main_window import H3_MODE
+
     assert not hasattr(chat_window, "mode_selector"), "the mode is a menu item now"
     chosen = {action.data(): action for action in chat_window.mode_actions.actions()}
-    assert set(chosen) == {PROMPT_MODE, CONVERSATION_MODE}
+    assert set(chosen) == {PROMPT_MODE, H3_MODE, CONVERSATION_MODE}
     assert chosen[CONVERSATION_MODE].isChecked() and not chosen[PROMPT_MODE].isChecked()
 
     chosen[PROMPT_MODE].trigger()

@@ -304,6 +304,30 @@ class TouchSlider(QSlider):
         super().mousePressEvent(event)
 
 
+def combo(options, default=None) -> QComboBox:
+    """A drop-down that shows labels and carries engine keys.
+
+    The two are never the same string and never allowed to become the same
+    string: the label is display text, the value is what the engine is handed,
+    and an engine does not recognise "RP British" as a key. Both pages build
+    every drop-down through here, so neither can quietly start passing labels.
+    """
+    box = QComboBox()
+    for value, label in options:
+        box.addItem(label, value)
+    if default is not None:
+        index = box.findData(default)
+        if index >= 0:
+            box.setCurrentIndex(index)
+    return touchable_popup(box)
+
+
+def chosen(box: QComboBox, fallback: str = "") -> str:
+    """The value behind the selected row, never its label."""
+    value = box.currentData()
+    return fallback if value is None else value
+
+
 def touchable_popup(box: QComboBox) -> QComboBox:
     """A drop-down whose rows are finger-sized and whose list flicks.
 
