@@ -691,6 +691,212 @@ def test_an_attached_picture_is_sent_with_the_message_and_asks_for_vision(qt, ch
     assert page.attachment is None                            # cleared after sending
 
 
+# ── the start of the reply ───────────────────────────────────────────────────
+
+def _holding_layout(root, widget):
+    """The layout that directly holds ``widget``, anywhere under ``root``.
+
+    ``QLayout.indexOf`` does not recurse, and the two buttons under test sit in
+    a column nested two deep in the page's own.
+    """
+    pending = [root]
+    while pending:
+        layout = pending.pop()
+        for index in range(layout.count()):
+            item = layout.itemAt(index)
+            if item.widget() is widget:
+                return layout
+            if item.layout() is not None:
+                pending.append(item.layout())
+    return None
+
+
+def test_the_response_button_sits_under_attach_and_folds_a_box_out(qt, chat_window):
+    from prompt_master.ui import chat_page as module
+
+    page = chat_window.chat
+    assert page.prefix_button.text() == module.PREFIX_BUTTON
+    assert not page.prefix_panel.isVisibleTo(page)
+
+    # Directly under Attach…, in the column beside the input box.
+    stack = _holding_layout(page.layout(), page.attach_button)
+    assert stack is not None, "the Attach… button was not found in the layout"
+    assert stack.indexOf(page.prefix_button) == stack.indexOf(page.attach_button) + 1
+
+    page.prefix_button.setChecked(True)
+    assert page.prefix_panel.isVisibleTo(page)
+    page.prefix_button.setChecked(False)
+    assert not page.prefix_panel.isVisibleTo(page)
+
+
+def test_a_reply_begins_with_the_start_and_the_model_carries_on(qt, chat_window):
+    """The start is not asked for, it is written in — so the reply begins with
+    it whatever the model does, and what comes back is joined onto it."""
+    page = chat_window.chat
+    service = _ScriptedService(["and it always will be."])
+    page.service_provider = lambda: service
+    page.prefix_button.setChecked(True)
+    page.prefix_edit.setPlainText("It's always been red")
+
+    page.input.setPlainText("What colour is the sky")
+    page.send()
+    _finish(qt, page)
+
+    assert page.conversation.messages[-1].text == "It's always been red and it always will be."
+    saved = page.chats.load("Ada", page.conversation.identifier)
+    assert saved.messages[-1].text == "It's always been red and it always will be."
+
+    sent = service.scripted.calls[0]["messages"]
+    assert sent[-2] == {"role": "assistant", "content": "It's always been red"}
+    assert sent[-1]["role"] == "user" and "already been started" in sent[-1]["content"]
+
+
+def test_the_start_survives_sending_regenerating_and_reopening_the_chat(qt, chat_window):
+    """"Never auto-cleared" is the whole of the feature: it is used until it is
+    taken away, not once."""
+    from prompt_master.ui import chat_page as module
+
+    page = chat_window.chat
+    service = _ScriptedService(["one.", "two.", "three."])
+    page.service_provider = lambda: service
+    page.prefix_button.setChecked(True)
+    page.prefix_edit.setPlainText("It's always been red")
+    identifier = page.conversation.identifier
+
+    page.input.setPlainText("What colour is the sky")
+    page.send()
+    _finish(qt, page)
+    assert page.conversation.response_prefix == "It's always been red"
+
+    page.regenerate(page._last("assistant"))            # and again on a regenerate
+    _finish(qt, page)
+    assert page.conversation.messages[-1].versions == ["It's always been red one.",
+                                                       "It's always been red two."]
+
+    page.input.setPlainText("and the sea")              # and on the message after that
+    page.send()
+    _finish(qt, page)
+    assert page.conversation.messages[-1].text == "It's always been red three."
+
+    # And on reopening the chat, from the file rather than from the box.
+    page.new_chat()
+    assert page.prefix_edit.toPlainText() == "", "a new chat starts with none"
+    assert page.prefix_button.text() == module.PREFIX_BUTTON
+    page.open_chat(identifier)
+    assert page.prefix_edit.toPlainText() == "It's always been red"
+    assert page.prefix_button.text() == module.PREFIX_BUTTON_SET
+
+
+def test_the_start_is_the_chats_own_and_a_branch_takes_it_along(qt, chat_window):
+    page = chat_window.chat
+    page.prefix_button.setChecked(True)
+    page.prefix_edit.setPlainText("It's always been red")
+    first = page.conversation.identifier
+    page.conversation.append("user", "one")
+    page.save()
+
+    page.branch(1)
+    assert page.conversation.identifier != first
+    assert page.prefix_edit.toPlainText() == "It's always been red"
+
+    page.prefix_edit.setPlainText("It's always been blue")
+    page.persist_prefix()
+    assert page.chats.load("Ada", first).response_prefix == "It's always been red"
+
+
+def test_clearing_is_the_one_thing_that_takes_the_start_away(qt, chat_window):
+    from prompt_master.ui import chat_page as module
+
+    page = chat_window.chat
+    service = _ScriptedService(["The model's own opening."])
+    page.service_provider = lambda: service
+    page.prefix_button.setChecked(True)
+    page.prefix_edit.setPlainText("It's always been red")
+    assert page.prefix_button.text() == module.PREFIX_BUTTON_SET
+    assert page.prefix_clear_button.isEnabled()
+
+    page.prefix_clear_button.click()
+
+    assert page.prefix_edit.toPlainText() == ""
+    assert page.conversation.response_prefix == ""
+    assert page.prefix_button.text() == module.PREFIX_BUTTON
+    assert not page.prefix_clear_button.isEnabled()
+    assert page.chats.load("Ada", page.conversation.identifier).response_prefix == ""
+
+    page.input.setPlainText("What colour is the sky")
+    page.send()
+    _finish(qt, page)
+    assert page.conversation.messages[-1].text == "The model's own opening."
+    # Nothing is asked of the model beyond the conversation itself again.
+    assert service.scripted.calls[0]["messages"][-1]["content"] == "What colour is the sky"
+
+
+def test_the_start_has_its_placeholders_filled_in(qt, chat_window):
+    from prompt_master.chat.characters import Persona
+
+    page = chat_window.chat
+    service = _ScriptedService([" — and I always have."])
+    page.service_provider = lambda: service
+    page.persona = Persona(name="Rashan", description="A director.")
+    page.prefix_button.setChecked(True)
+    page.prefix_edit.setPlainText("Listen, {{user}} — {{char}} is telling you")
+
+    page.input.setPlainText("hello")
+    page.send()
+    _finish(qt, page)
+
+    assert page.conversation.messages[-1].text.startswith(
+        "Listen, Rashan — Ada is telling you")
+    # The box keeps what was typed; only the wire sees it filled in.
+    assert page.prefix_edit.toPlainText() == "Listen, {{user}} — {{char}} is telling you"
+
+
+def test_a_failed_generation_does_not_leave_the_start_sitting_there(qt, chat_window):
+    """A bubble holding nothing but the start it was handed is as empty as one
+    holding nothing at all, and is no more use to look at."""
+    class _Broken:
+        def client(self, needs_vision=False):
+            raise RuntimeError("llama-server is not running")
+
+    page = chat_window.chat
+    page.prefix_button.setChecked(True)
+    page.prefix_edit.setPlainText("It's always been red")
+    page.service_provider = _Broken
+
+    page.input.setPlainText("What colour is the sky")
+    page.send()
+    _finish(qt, page)
+
+    assert [message.text for message in page.conversation.messages] == [
+        "Hello You.", "What colour is the sky"]
+    assert "llama-server is not running" in page.status.text()
+    assert page.conversation.response_prefix == "It's always been red"   # still in force
+
+
+def test_a_failed_regenerate_leaves_the_reply_it_was_replacing(qt, chat_window):
+    """The version a regenerate starts holds only the start, so dropping it has
+    to put the reply that was showing back rather than delete the message."""
+    page = chat_window.chat
+    service = _ScriptedService(["first try"])
+    page.service_provider = lambda: service
+    page.input.setPlainText("hello")
+    page.send()
+    _finish(qt, page)
+
+    page.prefix_edit.setPlainText("It's always been red")
+
+    class _Broken:
+        def client(self, needs_vision=False):
+            raise RuntimeError("llama-server is not running")
+
+    page.service_provider = _Broken
+    page.regenerate(page._last("assistant"))
+    _finish(qt, page)
+
+    reply = page.conversation.messages[-1]
+    assert reply.versions == ["first try"] and reply.text == "first try"
+
+
 def test_a_generation_that_fails_does_not_leave_an_empty_reply_behind(qt, chat_window):
     class _Broken:
         def client(self, needs_vision=False):

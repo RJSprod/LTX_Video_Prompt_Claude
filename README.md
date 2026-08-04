@@ -411,6 +411,27 @@ renameable. Each is a JSON file under `user_data/chats/<character>/`.
 mode uses, and the same vision projector. Older pictures drop out of the
 context as the conversation grows, and the messages that carried them say so.
 
+**Response** — under *Attach…* — opens a box holding the first words of the
+reply, and every reply in that chat then begins with exactly them. It is
+oobabooga's *start reply with*, and it is how you put the model somewhere it
+would not have gone on its own: ask *"What colour is the sky?"* with a start of
+*"It's always been red"* and the reply opens with that sentence and argues
+forward from it rather than correcting you.
+
+It works by writing the start into the reply before the model is asked for
+anything — so the reply *begins* with it, rather than being asked to and mostly
+complying — and then asking the model to carry on from its last character and
+keep to whatever it commits to. `{{char}}` and `{{user}}` are substituted the
+way they are in a greeting.
+
+**Nothing clears it but emptying the box.** Sending, regenerating, opening
+another chat and closing the application all leave it in force, and the button
+reads **Response ●** while there is one, so a start still steering the replies
+is visible without opening anything. **Clear** is the one thing that takes it
+away. It is filed with the chat rather than the character, so two conversations
+with the same character can be steered differently, and a branch carries it into
+the copy.
+
 **Settings** folds out a panel of temperature, top-p, reply length, seed and a
 custom system message that replaces the built one entirely. They are saved in
 the character's own file, so each character keeps how it is talked to. A seed of

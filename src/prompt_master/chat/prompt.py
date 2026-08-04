@@ -118,6 +118,27 @@ def continue_instruction(character: Character) -> str:
             "the text that follows on.")
 
 
+def prefix_instruction(character: Character) -> str:
+    """Ask for the rest of a reply whose opening was written by hand.
+
+    The opening is already on the wire as the last assistant turn, put there by
+    the caller — which is also what makes the reply *start* with it, rather than
+    the model being asked nicely and mostly complying. So this says two things a
+    plain continuation does not need to: carry on from it, and keep to it. A
+    start the character would never have chosen is the entire point of writing
+    one, and a model told only to "continue" will happily talk its way back out
+    of a premise it disagrees with.
+    """
+    name = character.name.strip() or "the character"
+    return (f"{name}'s reply has already been started for you: the last message above is the "
+            f"opening of it, and it is fixed. Carry straight on from its final character in "
+            f"{name}'s voice, writing as though {name} had chosen those words — accept whatever "
+            "that opening asserts or commits to, even where you would have said something else, "
+            "and follow it through. Do not repeat it, do not begin the reply again, do not "
+            "contradict or walk it back, and do not add any preamble or commentary — write only "
+            "the text that follows on from it.")
+
+
 def impersonate_instruction(persona: Persona) -> str:
     """Ask the model to write your next message instead of the character's."""
     about = f" About them: {persona.description.strip()}" if persona.description.strip() else ""
@@ -194,5 +215,5 @@ def has_image(messages: list[Message]) -> bool:
 
 
 __all__ = ["ASSISTANT", "USER", "build", "clean_reply", "continue_instruction",
-           "greeting_text", "has_image", "impersonate_instruction", "substitute",
-           "system_text"]
+           "greeting_text", "has_image", "impersonate_instruction", "prefix_instruction",
+           "substitute", "system_text"]

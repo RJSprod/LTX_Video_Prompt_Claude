@@ -28,6 +28,14 @@ what arrives only while it is already at the end. Scroll up to read something
 and it stops chasing; scroll back to the bottom and it resumes. Sending a
 message, opening a chat and starting one all count as going back to the end.
 
+*A reply can be started for the model, and the start sticks.* Response opens a
+box holding the first words of every reply in this chat — oobabooga's "start
+reply with", kept where a finger can reach it. It is written into the reply
+before the model is asked for anything, so the reply *begins* with it rather
+than being asked to; the model is then told to carry on from it and to keep to
+what it says. Nothing clears it but emptying the box, and it is filed with the
+chat, so two conversations with one character can be steered differently.
+
 *The transcript is rebuilt, not patched.* Editing, deleting, branching and
 paging all change what the transcript is, and one path that renders the
 conversation from scratch cannot disagree with the conversation the way a dozen
@@ -83,6 +91,13 @@ SETTINGS_WRITE_DELAY = 600
 # status bar is busy saying what the model is doing.
 SETTINGS_SAVED = "Saved with the character."
 SETTINGS_UNSAVED = "Not saved yet — saving…"
+
+# The Response button, and the same button once there is a start to use. The
+# marker is the only thing on screen saying so while the box is shut, and a
+# start that is quietly still in force is exactly what "never auto-cleared"
+# leaves lying around — so it is worth a character of the button's own name.
+PREFIX_BUTTON = "Response"
+PREFIX_BUTTON_SET = "Response ●"
 
 
 class ChatWorker(QObject):
@@ -401,6 +416,10 @@ class ChatPage(QWidget):
         self._streaming_prefix = ""
         self._into_input = False
         self._join_space = False
+        # What of the reply being written was put there rather than generated.
+        # Only a generation that failed cares: a bubble holding nothing but the
+        # start it was handed is as empty as one holding nothing at all.
+        self._seed_text = ""
         self.bubbles: list[MessageBubble] = []
         self._avatar: QPixmap | None = None
         # Which message is showing its menu, and whether the transcript is
@@ -416,6 +435,12 @@ class ChatPage(QWidget):
         self._settings_timer.setSingleShot(True)
         self._settings_timer.setInterval(SETTINGS_WRITE_DELAY)
         self._settings_timer.timeout.connect(self.persist_settings)
+        # The start-of-reply box writes itself back the same way, for the same
+        # reason: it is typed into, and typing must not need a Save.
+        self._prefix_timer = QTimer(self)
+        self._prefix_timer.setSingleShot(True)
+        self._prefix_timer.setInterval(SETTINGS_WRITE_DELAY)
+        self._prefix_timer.timeout.connect(self.persist_prefix)
 
         column = QVBoxLayout(self)
         self.bars = {"character": _bar(self.character_row()),
@@ -425,7 +450,16 @@ class ChatPage(QWidget):
         column.addWidget(self.middle(), 1)
         self.bars["actions"] = _bar(self.quick_actions())
         column.addWidget(self.bars["actions"])
-        column.addLayout(self.input_row())
+        # The input row is built before the panel that sits above it, because
+        # the panel reports its state on a button that lives down there.
+        entry = self.input_row()
+        self.prefix_panel = self.prefix_area()
+        column.addWidget(self.prefix_panel)
+        # After the layout has taken it, never before: an unparented widget that
+        # is told to hide is a top-level window Qt has been asked about, and the
+        # transcript's own rebuild has the scar to prove it.
+        self.prefix_panel.hide()
+        column.addLayout(entry)
         column.addWidget(self.status_label())
         for key, _label in self.BARS:
             self.bars[key].setVisible(self.bar_visible(key))
@@ -583,11 +617,53 @@ class ChatPage(QWidget):
             row.addWidget(button, 1)
         return row
 
+    def prefix_area(self) -> QWidget:
+        """The first words of every reply, written by hand.
+
+        It sits above the input box rather than in a dialog because it is read
+        against the transcript — what the last reply opened with is half of
+        deciding what the next one should — and because a start that is still in
+        force is a thing to be able to see, not to have to go and look for.
+        """
+        box = QGroupBox("Start of the reply")
+        column = QVBoxLayout(box)
+        note = QLabel(
+            "Every reply in this chat begins with exactly this, and the model carries on from "
+            "where it stops — keeping to whatever it commits to. It stays until you empty this "
+            "box: sending, regenerating and reopening the chat all leave it alone.")
+        note.setObjectName("fieldLabel")
+        note.setWordWrap(True)
+        column.addWidget(note)
+        self.prefix_edit = QPlainTextEdit()
+        self.prefix_edit.setPlaceholderText(
+            "Leave empty to let the model open its own replies.   "
+            "{{char}} and {{user}} work here too.")
+        self.prefix_edit.textChanged.connect(self._prefix_touched)
+        touch.flickable(self.prefix_edit)
+        column.addWidget(self.prefix_edit, 1)
+        buttons = QHBoxLayout()
+        self.prefix_clear_button = QPushButton("Clear")
+        self.prefix_clear_button.setToolTip("Stop starting replies, and let the model open them")
+        self.prefix_clear_button.clicked.connect(self.clear_prefix)
+        done = QPushButton("Done")
+        done.setToolTip("Put this away. What is in it stays in force.")
+        done.clicked.connect(lambda: self.prefix_button.setChecked(False))
+        buttons.addWidget(self.prefix_clear_button)
+        buttons.addStretch(1)
+        buttons.addWidget(done)
+        column.addLayout(buttons)
+        return box
+
     def input_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         self.attach_button = QPushButton("Attach…")
         self.attach_button.setToolTip("Send a picture with your message")
         self.attach_button.clicked.connect(self.attach_image)
+        self.prefix_button = QPushButton(PREFIX_BUTTON)
+        self.prefix_button.setCheckable(True)
+        self.prefix_button.setToolTip("Write the first words of the reply yourself, and have "
+                                      "the model carry on from them")
+        self.prefix_button.toggled.connect(self._toggle_prefix)
         self.input = QPlainTextEdit()
         self.input.setPlaceholderText("Say something…   (Ctrl+Enter sends)")
         touch.flickable(self.input)
@@ -600,7 +676,12 @@ class ChatPage(QWidget):
         buttons = QVBoxLayout()
         buttons.addWidget(self.stop_button)
         buttons.addWidget(self.send_button)
-        row.addWidget(self.attach_button)
+        # The two things that go with a message rather than being one, stacked
+        # in the corner the eye already goes to for Attach.
+        beside = QVBoxLayout()
+        beside.addWidget(self.attach_button)
+        beside.addWidget(self.prefix_button)
+        row.addLayout(beside)
         row.addWidget(self.input, 1)
         row.addLayout(buttons)
         return row
@@ -624,6 +705,7 @@ class ChatPage(QWidget):
         if not names:
             self.character = None
             self.conversation = None
+            self.show_prefix_for(None)
             self.render()
             self.set_status("No characters yet — press Characters… to make one, or to import "
                             "one you already have.")
@@ -813,6 +895,9 @@ class ChatPage(QWidget):
     def open_chat(self, identifier: str) -> None:
         if self.character is None:
             return
+        # Whatever was typed into the start box belongs to the chat being left,
+        # and a write still waiting on its timer would otherwise go nowhere.
+        self.persist_prefix()
         try:
             self.conversation = self.chats.load(self.character.name, identifier)
         except (OSError, ValueError, FileNotFoundError):
@@ -820,6 +905,7 @@ class ChatPage(QWidget):
             return
         self.remember(chat=identifier)
         self.pinned = True                # a chat opens on its newest message
+        self.show_prefix_for(self.conversation)
         self.render()
         self.set_status("")
         self._enable(True)
@@ -827,6 +913,7 @@ class ChatPage(QWidget):
     def new_chat(self) -> None:
         if self.character is None:
             return
+        self.persist_prefix()             # the chat being left keeps its start
         self.conversation = self.chats.new(self.character.name)
         greeting = prompt.greeting_text(self.character, self.persona)
         if greeting:
@@ -835,6 +922,7 @@ class ChatPage(QWidget):
         self.remember(chat=self.conversation.identifier)
         self._refresh_chat_box()
         self.pinned = True
+        self.show_prefix_for(self.conversation)     # a new chat starts with none
         self.render()
         self.set_status("")
         self._enable(True)
@@ -988,9 +1076,11 @@ class ChatPage(QWidget):
     def branch(self, index: int) -> None:
         if self.conversation is None:
             return
+        self.persist_prefix()
         self.conversation = self.chats.branch(self.conversation, index)
         self.remember(chat=self.conversation.identifier)
         self._refresh_chat_box()
+        self.show_prefix_for(self.conversation)    # carried into the branch
         self.render()
         self.set_status("Branched — this is a new chat, and the one it came from is untouched.")
 
@@ -1065,6 +1155,83 @@ class ChatPage(QWidget):
         self.attachment = None
         self.attach_button.setText("Attach…")
 
+    # ── the start of the reply ───────────────────────────────────────────────
+
+    def _toggle_prefix(self, shown: bool) -> None:
+        self.prefix_panel.setVisible(shown)
+        if shown:
+            self.prefix_edit.setFocus()
+        else:
+            self.persist_prefix()
+
+    def _prefix_touched(self) -> None:
+        """A key in the box: keep it now, write it once the typing stops.
+
+        Kept on the conversation immediately and written to disk a moment later.
+        The order matters — the next reply reads it off the conversation, so a
+        start typed and sent in the same breath is a start that was used, even
+        though the file it lives in has not been touched yet.
+        """
+        if self.conversation is None:
+            return
+        self.conversation.response_prefix = self.prefix_edit.toPlainText()
+        self._mark_prefix()
+        self._prefix_timer.start()
+
+    def _mark_prefix(self) -> None:
+        """Say on the button whether there is a start in force."""
+        prefix = self.conversation.response_prefix.strip() if self.conversation else ""
+        self.prefix_button.setText(PREFIX_BUTTON_SET if prefix else PREFIX_BUTTON)
+        self.prefix_clear_button.setEnabled(bool(prefix))
+        if prefix:
+            opening = " ".join(prefix.split())
+            self.prefix_button.setToolTip(
+                "Every reply starts with:\n"
+                f"{opening[:120]}{'…' if len(opening) > 120 else ''}")
+        else:
+            self.prefix_button.setToolTip("Write the first words of the reply yourself, and "
+                                          "have the model carry on from them")
+
+    def show_prefix_for(self, conversation: Conversation | None) -> None:
+        """Fill the box in from the chat that was just opened.
+
+        Blocked, because filling it in is not typing into it: the signal would
+        write this chat's start back over itself, and — on the way through a
+        chat being closed — over the next one's.
+        """
+        self._prefix_timer.stop()
+        self.prefix_edit.blockSignals(True)
+        self.prefix_edit.setPlainText(conversation.response_prefix if conversation else "")
+        self.prefix_edit.blockSignals(False)
+        self._mark_prefix()
+
+    def clear_prefix(self) -> None:
+        """The one thing that takes the start away."""
+        self.prefix_edit.clear()          # emptying the box is what empties the chat's
+        self.persist_prefix()             # written now rather than in a moment
+        self._mark_prefix()
+        self.set_status("Replies open however the model chooses again.")
+
+    def persist_prefix(self) -> None:
+        self._prefix_timer.stop()
+        if self.conversation is not None:
+            self.save()
+
+    def response_prefix(self) -> str:
+        """The start the next reply is written with, with its placeholders filled.
+
+        Substituted like the greeting is, because a start written into a
+        character's chat is authored text of the same kind, and ``{{user}}``
+        left standing in a reply is the tell of one that was never read.
+        """
+        if self.conversation is None or self.character is None:
+            return ""
+        prefix = self.conversation.response_prefix
+        if not prefix.strip():
+            return ""
+        return prompt.substitute(prefix, self.character.name.strip() or "the character",
+                                 self.persona.display)
+
     def send(self) -> None:
         if self.busy() or self.conversation is None or self.character is None:
             return
@@ -1088,12 +1255,18 @@ class ChatPage(QWidget):
         self.reply()
 
     def reply(self) -> None:
-        """A fresh assistant message, streamed into."""
+        """A fresh assistant message, streamed into.
+
+        Started with the chat's own opening when it has one — written into the
+        message before anything is asked of the model, which is what makes the
+        reply begin with it rather than usually begin with it.
+        """
         if self.conversation is None:
             return
-        message = self.conversation.append(ASSISTANT, "")
+        opening = self.response_prefix()
+        self.conversation.append(ASSISTANT, opening)
         self.render()
-        self.stream(len(self.conversation.messages) - 1, message.text)
+        self.stream_reply(len(self.conversation.messages) - 1, opening)
 
     def regenerate(self, index: int) -> None:
         """Write this reply again, keeping the one it had as a version."""
@@ -1103,9 +1276,25 @@ class ChatPage(QWidget):
         if message.role != ASSISTANT:
             return
         self.conversation.truncate_after(index)
-        message.add_version("")
+        opening = self.response_prefix()
+        message.add_version(opening)
         self.render()
-        self.stream(index, "")
+        self.stream_reply(index, opening)
+
+    def stream_reply(self, index: int, opening: str) -> None:
+        """One reply, from an opening that may be empty.
+
+        With a start, this is the same shape as continuing a reply: the opening
+        goes on the wire as the assistant turn it already is — hence ``upto``
+        reaching past it — and the model is asked to carry on from it. Without
+        one, it is an ordinary generation, and the message being written is not
+        part of the history it is written from.
+        """
+        if not opening:
+            self.stream(index, "")
+            return
+        self.stream(index, opening, instruction=prompt.prefix_instruction(self.character),
+                    upto=index + 1, seeded=True)
 
     def resend(self, index: int) -> None:
         """Answer this message of yours again, dropping everything after it."""
@@ -1136,12 +1325,15 @@ class ChatPage(QWidget):
                     into_input=True)
 
     def stream(self, index: int, prefix: str, instruction: str | None = None,
-               upto: int | None = None, into_input: bool = False) -> None:
+               upto: int | None = None, into_input: bool = False,
+               seeded: bool = False) -> None:
         """Run one generation, writing into message ``index`` or the input box.
 
         ``prefix`` is what is already there — the text a continuation extends —
         and ``upto`` bounds the history sent, so continuing a reply does not
-        include the empty message being written.
+        include the empty message being written. ``seeded`` says that ``prefix``
+        was put there by this application rather than written by the model, which
+        is what a failure needs to know to tell an empty reply from a real one.
         """
         if self.character is None or self.conversation is None or self.busy():
             return
@@ -1159,6 +1351,7 @@ class ChatPage(QWidget):
                             draw_seed() if seed == RANDOM_SEED else seed)
         self._streaming_index = -1 if into_input else index
         self._streaming_prefix = prefix
+        self._seed_text = prefix if seeded else ""
         self._into_input = into_input
         # A continuation is joined to what is already there, and the model is
         # not reliable about starting with the space that needs.
@@ -1212,7 +1405,11 @@ class ChatPage(QWidget):
         if (self.conversation is not None and not self._into_input
                 and 0 <= self._streaming_index < len(self.conversation.messages)):
             failed = self.conversation.messages[self._streaming_index]
-            if not failed.text.strip():
+            # Nothing came back, or nothing came back and all that is showing is
+            # the start this application wrote in. Both are an empty reply, and
+            # neither is left in the transcript to be mistaken for one.
+            standing = failed.text.strip()
+            if not standing or standing == self._seed_text.strip():
                 if len(failed.versions) > 1:
                     failed.drop_version()
                 elif self._streaming_index == len(self.conversation.messages) - 1:
@@ -1263,7 +1460,8 @@ class ChatPage(QWidget):
     def _enable(self, enabled: bool) -> None:
         ready = enabled and self.character is not None and self.conversation is not None
         for button in (self.send_button, self.regenerate_button, self.continue_button,
-                       self.impersonate_button, self.undo_button, self.attach_button):
+                       self.impersonate_button, self.undo_button, self.attach_button,
+                       self.prefix_button):
             button.setEnabled(ready)
 
     def _last(self, role: str) -> int:
@@ -1285,6 +1483,10 @@ class ChatPage(QWidget):
         self.input.setMinimumHeight(metrics["target"] * 2)
         self.input.setMaximumHeight(metrics["target"] * 4)
         self.system.setMinimumHeight(metrics["target"] * 3)
+        # Shorter than the input box it sits over: a start is a sentence or two,
+        # and the transcript is what the space above belongs to.
+        self.prefix_edit.setMinimumHeight(metrics["target"] * 2)
+        self.prefix_edit.setMaximumHeight(metrics["target"] * 3)
         self.send_button.setMinimumWidth(metrics["target"] * 3)
         self._avatar = None
         self.render()
@@ -1292,6 +1494,7 @@ class ChatPage(QWidget):
     def rebind(self, paths) -> None:
         """Follow a setup run that moved the installation root."""
         self.persist_settings()
+        self.persist_prefix()
         self.paths = paths
         self.characters = CharacterStore.from_paths(paths)
         self.chats = ChatStore.from_paths(paths)
@@ -1344,6 +1547,7 @@ class ChatPage(QWidget):
 
     def shutdown(self) -> None:
         self.persist_settings()
+        self.persist_prefix()
         if self._worker is not None:
             self._worker.cancel()
         if self.thread is not None and self.thread.isRunning():

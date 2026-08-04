@@ -104,6 +104,13 @@ class Conversation:
     created: float = 0.0
     updated: float = 0.0
     messages: list[Message] = field(default_factory=list)
+    # The opening every reply in this chat is made to start with. It belongs to
+    # the chat rather than to the character or to the app: two conversations
+    # with the same character are two different things to be steering, and a
+    # start written in one of them has no business turning up in the other.
+    # Nothing but writing over it takes it away — not sending, not regenerating,
+    # not reopening the chat a week later.
+    response_prefix: str = ""
 
     # ── editing ──────────────────────────────────────────────────────────────
 
@@ -150,13 +157,17 @@ class Conversation:
         title = self.title if self.title != UNTITLED else UNTITLED
         return Conversation(identifier=identifier, character=self.character,
                             title=f"{title} (branch)" if title != UNTITLED else UNTITLED,
-                            created=now, updated=now, messages=kept)
+                            created=now, updated=now, messages=kept,
+                            # A branch carries on from here, and the start the
+                            # replies were being given is part of what "here" is.
+                            response_prefix=self.response_prefix)
 
     # ── storage ──────────────────────────────────────────────────────────────
 
     def to_dict(self) -> dict:
         return {"id": self.identifier, "character": self.character, "title": self.title,
                 "created": self.created, "updated": self.updated,
+                "response_prefix": self.response_prefix,
                 "messages": [message.to_dict() for message in self.messages]}
 
     @classmethod
@@ -168,6 +179,8 @@ class Conversation:
             title=str(data.get("title") or UNTITLED),
             created=float(data.get("created", 0.0) or 0.0),
             updated=float(data.get("updated", 0.0) or 0.0),
+            # A chat written before there was such a thing simply has none.
+            response_prefix=str(data.get("response_prefix") or ""),
             messages=[Message.from_dict(item) for item in messages if isinstance(item, dict)]
             if isinstance(messages, list) else [],
         )
