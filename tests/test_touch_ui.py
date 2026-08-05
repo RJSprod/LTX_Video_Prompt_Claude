@@ -76,15 +76,18 @@ def test_every_control_is_at_least_a_fingertip_tall(qt, window):
 def test_each_page_has_the_biggest_button_on_the_action_it_is_for(qt, window):
     """The button pressed most is the one that should never be hunted for, and
     there is now one of those per page: Generate in prompt mode, Send in
-    conversation mode. Each has to win on its own page rather than in the
-    window, because only one page is ever on screen."""
+    conversation mode, Write H3 Prompt in MiniMax H3 mode. Each has to win on
+    its own page rather than in the window, because only one page is ever on
+    screen."""
     for page, primary in ((window.pages.widget(0), window.generate_button),
-                          (window.chat, window.chat.send_button)):
+                          (window.chat, window.chat.send_button),
+                          (window.minimax, window.minimax.write_button)):
         others = [b for b in page.findChildren(qt.QPushButton) if b is not primary]
         assert primary.objectName() == "primary"
         assert primary.sizeHint().height() > max(button.sizeHint().height() for button in others)
     assert window.generate_button.minimumWidth() >= 4 * FINGERTIP
     assert window.chat.send_button.minimumWidth() >= 3 * FINGERTIP
+    assert window.minimax.write_button.minimumWidth() >= 4 * FINGERTIP
 
 
 def test_the_action_bar_cannot_scroll_away(qt, window):
@@ -350,15 +353,19 @@ def chat_window(qt, tmp_path):
 
 def test_the_mode_lives_in_the_menu_bar_and_is_remembered(qt, chat_window, tmp_path):
     """Settings → Mode, not a control taking a row off the top of the window."""
-    from prompt_master.ui.main_window import CONVERSATION_MODE, PROMPT_MODE, MainWindow
+    from prompt_master.ui.main_window import (CONVERSATION_MODE, MINIMAX_MODE, PROMPT_MODE,
+                                              MainWindow)
 
     assert not hasattr(chat_window, "mode_selector"), "the mode is a menu item now"
     chosen = {action.data(): action for action in chat_window.mode_actions.actions()}
-    assert set(chosen) == {PROMPT_MODE, CONVERSATION_MODE}
-    assert chosen[CONVERSATION_MODE].isChecked() and not chosen[PROMPT_MODE].isChecked()
+    assert set(chosen) == {PROMPT_MODE, CONVERSATION_MODE, MINIMAX_MODE}
+    assert chosen[CONVERSATION_MODE].isChecked()
+    assert not chosen[PROMPT_MODE].isChecked() and not chosen[MINIMAX_MODE].isChecked()
 
     chosen[PROMPT_MODE].trigger()
     assert chat_window.pages.currentWidget() is chat_window.pages.widget(0)
+    chosen[MINIMAX_MODE].trigger()
+    assert chat_window.pages.currentWidget() is chat_window.minimax
     chosen[CONVERSATION_MODE].trigger()
     assert chat_window.pages.currentWidget() is chat_window.chat
 
@@ -1598,3 +1605,221 @@ def test_the_model_dialog_is_finger_sized_too(qt, model_window):
         assert small == []
     finally:
         dialog.close()
+
+
+# ── MiniMax H3 mode ──────────────────────────────────────────────────────────
+
+@pytest.fixture
+def h3_window(qt, tmp_path):
+    """A window opened on MiniMax H3 mode, answered by a scripted server."""
+    from prompt_master.ui.main_window import MINIMAX_MODE, MainWindow
+
+    paths = AppPaths(tmp_path)
+    paths.create_managed_dirs()
+    made = MainWindow(paths)
+    made.resize(1400, 900)
+    made.select_mode(MINIMAX_MODE)
+    yield made
+    made.close()
+
+
+def _picture(path):
+    from PIL import Image
+
+    Image.new("RGB", (48, 32), (90, 20, 20)).save(path)
+    return path
+
+
+def test_writing_a_prompt_from_text_sends_wangps_own_request(qt, h3_window):
+    """One call, and everything in it is the enhancer's: the FL2VA text
+    instructions as the system message, WanGP's labelled user turn, and its
+    temperature, top-p and token budget."""
+    from prompt_master.minimax import enhancer
+    from prompt_master.minimax.prompt_enhancer import FL2VA_TEXT_SYSTEM_PROMPT
+
+    page = h3_window.minimax
+    service = _ScriptedService(["integrated_multimodal_description: [Shot 1] A red ball rolls."])
+    page.service_provider = lambda: service
+    page.prompt.setPlainText("a red ball rolls across a table")
+
+    page.write_prompt()
+    _finish(qt, page)
+
+    assert len(service.scripted.calls) == 1, "no image, so nothing to describe first"
+    sent = service.scripted.calls[0]
+    assert sent["messages"] == [
+        {"role": "system", "content": FL2VA_TEXT_SYSTEM_PROMPT.rstrip()},
+        {"role": "user", "content": "user_prompt: a red ball rolls across a table"}]
+    assert (sent["temperature"], sent["top_p"]) == (enhancer.TEMPERATURE, enhancer.TOP_P)
+    assert sent["max_tokens"] == enhancer.MAX_TOKENS[enhancer.FL2VA]
+    assert page.output.toPlainText().startswith("integrated_multimodal_description:")
+    assert not page.caption.isVisibleTo(page), "there was no picture to describe"
+    assert service.vision_asked == [False]
+
+
+def test_an_image_is_described_first_and_the_caption_carries_the_prompt(qt, h3_window, tmp_path):
+    """WanGP's enhancer never sees pixels: the picture becomes a caption, and
+    the caption becomes the second line of the user turn."""
+    from prompt_master.minimax import enhancer
+    from prompt_master.minimax.prompt_enhancer import FL2VA_IMAGE_SYSTEM_PROMPT
+
+    page = h3_window.minimax
+    service = _ScriptedService(["A red ball on a wooden table.",
+                                "integrated_multimodal_description: ..."])
+    page.service_provider = lambda: service
+    page.image_path = _picture(tmp_path / "still.png")
+    page.prompt.setPlainText("it starts rolling")
+
+    page.write_prompt()
+    _finish(qt, page)
+
+    describe, write = service.scripted.calls
+    assert describe["messages"][0]["content"][0]["type"] == "image_url"
+    assert describe["messages"][0]["content"][1]["text"] == enhancer.CAPTION_INSTRUCTION
+    # A description is not a thing to be creative about, and WanGP does not let
+    # the captioner sample at all.
+    assert (describe["temperature"], describe["max_tokens"]) == (0.0, enhancer.CAPTION_MAX_TOKENS)
+    assert write["messages"][0]["content"] == FL2VA_IMAGE_SYSTEM_PROMPT.rstrip()
+    assert write["messages"][1]["content"] == ("user_prompt: it starts rolling\n"
+                                               "image_caption: A red ball on a wooden table.")
+    assert page.caption.toPlainText() == "A red ball on a wooden table."
+    assert page.caption.isVisibleTo(page), "what the model saw is worth showing"
+    assert service.vision_asked == [True]
+
+
+def test_the_variant_chooses_which_h3_instructions_are_used(qt, h3_window):
+    from prompt_master.minimax import enhancer
+    from prompt_master.minimax.prompt_enhancer import REF2VA_TEXT_SYSTEM_PROMPT
+
+    page = h3_window.minimax
+    service = _ScriptedService(["subject_definitions: ..."])
+    page.service_provider = lambda: service
+    page.variant.setCurrentIndex(page.variant.findData(enhancer.REF2VA))
+    page.prompt.setPlainText("the woman from the photograph walks on")
+
+    assert page.note.text() == "Write an H3 Reference Prompt from Text"
+    page.write_prompt()
+    _finish(qt, page)
+
+    sent = service.scripted.calls[0]
+    assert sent["messages"][0]["content"] == REF2VA_TEXT_SYSTEM_PROMPT.rstrip()
+    # Six sections, one of them 350-500 words, so twice the room.
+    assert sent["max_tokens"] == enhancer.MAX_TOKENS[enhancer.REF2VA]
+
+
+def test_attaching_an_image_renames_the_generation_the_way_wangp_does(qt, h3_window, tmp_path,
+                                                                      monkeypatch):
+    from prompt_master.ui import minimax_page as module
+
+    page = h3_window.minimax
+    assert page.note.text() == "Write an H3 Prompt from Text"
+
+    monkeypatch.setattr(module.QFileDialog, "getOpenFileName",
+                        lambda *a, **k: (str(_picture(tmp_path / "start.png")), ""))
+    page.browse_image()
+    assert page.note.text() == "Write an H3 Prompt from Text + Start Image"
+    assert page.image_label.text() == "Image: start.png"
+    assert page.remove_button.isEnabled()
+
+    page.remove_image()
+    assert page.note.text() == "Write an H3 Prompt from Text"
+    assert not page.remove_button.isEnabled()
+
+
+def test_an_empty_prompt_is_refused_before_anything_starts(qt, h3_window, monkeypatch):
+    from prompt_master.ui import minimax_page as module
+
+    warned = []
+    monkeypatch.setattr(module.QMessageBox, "warning",
+                        lambda _self, _title, text, *a, **k: warned.append(text))
+    h3_window.minimax.service_provider = lambda: pytest.fail("nothing should be asked")
+
+    h3_window.minimax.write_prompt()
+    assert h3_window.minimax.thread is None and warned
+
+
+def test_a_picture_with_nothing_to_see_it_is_refused_before_the_server_starts(
+        qt, h3_window, tmp_path, monkeypatch):
+    """The whole of an H3 image prompt is written from the caption, so a model
+    that cannot be shown the still has nothing to write from."""
+    from prompt_master.ui import minimax_page as module
+
+    refused = []
+    monkeypatch.setattr(module.QMessageBox, "critical",
+                        lambda _self, _title, text, *a, **k: refused.append(text))
+    page = h3_window.minimax
+    monkeypatch.setattr(page, "vision_ready", lambda: False)
+    page.service_provider = lambda: pytest.fail("nothing should be asked")
+    page.image_path = _picture(tmp_path / "still.png")
+    page.prompt.setPlainText("it starts rolling")
+
+    page.write_prompt()
+    assert page.thread is None and refused and "no vision projector" in refused[0]
+
+
+def test_the_h3_page_scrolls_by_dragging_and_its_bar_cannot_scroll_away(qt, h3_window):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QScroller
+
+    page = h3_window.minimax
+    for widget in (page.prompt, page.output, page.caption):
+        viewport = widget.viewport()
+        assert QScroller.hasScroller(viewport), f"{type(widget).__name__} does not flick"
+        assert viewport.testAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents)
+    for widget in (page.write_button, page.cancel_button, page.status):
+        parents, node = [], widget.parentWidget()
+        while node is not None:
+            parents.append(node)
+            node = node.parentWidget()
+        assert not any(isinstance(parent, qt.QScrollArea) for parent in parents)
+
+
+def test_the_structure_guide_is_the_one_for_the_model_chosen(qt, h3_window):
+    from prompt_master.minimax import enhancer
+    from prompt_master.ui.minimax_page import StructureDialog
+
+    page = h3_window.minimax
+    dialog = StructureDialog(page.chosen_variant(), page)
+    try:
+        assert "FL2VA prompt structure" in dialog.findChildren(qt.QTextBrowser)[0].toPlainText()
+    finally:
+        dialog.close()
+
+    page.variant.setCurrentIndex(page.variant.findData(enhancer.REF2VA))
+    dialog = StructureDialog(page.chosen_variant(), page)
+    try:
+        assert "Ref2VA prompt structure" in dialog.findChildren(qt.QTextBrowser)[0].toPlainText()
+    finally:
+        dialog.close()
+
+
+def test_cancelling_stops_the_writing_and_keeps_what_arrived(qt, h3_window):
+    """Cancel is pressed on a prompt that is still being written, so the worker
+    has to be told mid-stream rather than after it."""
+    import time
+
+    class _Blocking:
+        """A server that streams one piece and then waits to be cancelled."""
+
+        def client(self, needs_vision=False):
+            return self
+
+        def stream_chat(self, messages, max_tokens, seed, on_text, cancel=None,
+                        temperature=0.85, top_p=0.95):
+            on_text("integrated_multimodal_description: ")
+            while cancel is not None and not cancel.is_set():
+                time.sleep(0.005)
+            return "integrated_multimodal_description: "
+
+    page = h3_window.minimax
+    page.service_provider = _Blocking
+    page.prompt.setPlainText("a red ball rolls across a table")
+
+    page.write_prompt()
+    assert page.cancel_button.isEnabled() and not page.write_button.isEnabled()
+    page.cancel_generation()
+    _finish(qt, page)
+
+    assert page.status.text() == "Cancelled"
+    assert page.output.toPlainText() == "integrated_multimodal_description: "
+    assert page.write_button.isEnabled() and not page.cancel_button.isEnabled()
