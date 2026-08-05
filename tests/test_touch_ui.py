@@ -1757,12 +1757,105 @@ def test_a_picture_with_nothing_to_see_it_is_refused_before_the_server_starts(
     assert page.thread is None and refused and "no vision projector" in refused[0]
 
 
+def test_the_dialogue_slider_opens_off_and_says_so(qt, h3_window):
+    """Off is the default and the whole of the guarantee: the request the page
+    sends there is asserted, message for message, by the text-prompt test above."""
+    from prompt_master.minimax import dialogue
+
+    page = h3_window.minimax
+    assert page.intensity.value() == dialogue.OFF
+    assert page.intensity.minimum() == dialogue.OFF
+    assert page.intensity.maximum() == dialogue.MOST
+    assert page.dialogue_note.text() == "Speech only where the prompt asks for it"
+    assert not page.spoken.isVisibleTo(page), "nothing has been written to show"
+
+    page.intensity.setValue(dialogue.MOST)
+    assert "95%" in page.dialogue_note.text()
+
+
+def test_the_dialogue_is_written_first_and_travels_into_the_h3_request(qt, h3_window):
+    """Two calls, in the order each needs the one before it: the speech is
+    written from the prompt, then the H3 prompt is written from both."""
+    from prompt_master.minimax import dialogue, enhancer
+
+    page = h3_window.minimax
+    service = _ScriptedService([
+        'SPEAKERS\n(S1) = the woman in the red coat\n\n'
+        'LINES\n(S1) [quiet, uncertain] "You said you would be back before dark."',
+        "integrated_multimodal_description: [Shot 1] She waits at the window."])
+    page.service_provider = lambda: service
+    page.prompt.setPlainText("a woman waits at a rain-streaked window")
+    page.intensity.setValue(7)
+
+    page.write_prompt()
+    _finish(qt, page)
+
+    spoke, wrote = service.scripted.calls
+    assert spoke["messages"][0]["content"] is dialogue.SYSTEM
+    assert "VIDEO: a woman waits at a rain-streaked window" in spoke["messages"][1]["content"]
+
+    # The lines are content of the request, not instructions about it.
+    assert '(S1) [quiet, uncertain] "You said you would be back before dark."' \
+        in wrote["messages"][1]["content"]
+    assert dialogue.directive(7, 1) in wrote["messages"][0]["content"]
+    # And the timeline has room for the speech that was added to it.
+    assert wrote["max_tokens"] > enhancer.MAX_TOKENS[enhancer.FL2VA]
+
+    assert page.spoken.isVisibleTo(page)
+    assert "(S1) = the woman in the red coat" in page.spoken.toPlainText()
+    assert page.output.toPlainText().startswith("integrated_multimodal_description:")
+    # Carried into the finished line rather than left to flash past.
+    assert "Dialogue: 1 lines in one voice" in page.status.text()
+
+
+def test_a_dialogue_pass_that_comes_back_useless_still_writes_the_prompt(qt, h3_window):
+    """Somebody pressed the button to get an H3 prompt. A pass that gave nothing
+    back costs them the extra speech and not the prompt — and the intensity they
+    asked for still reaches the instructions."""
+    from prompt_master.minimax import dialogue
+
+    page = h3_window.minimax
+    service = _ScriptedService(["I am unable to help with this request.",
+                                "integrated_multimodal_description: [Shot 1] ..."])
+    page.service_provider = lambda: service
+    page.prompt.setPlainText("a red ball rolls across a table")
+    page.intensity.setValue(4)
+
+    page.write_prompt()
+    _finish(qt, page)
+
+    assert page.output.toPlainText().startswith("integrated_multimodal_description:")
+    assert not page.spoken.isVisibleTo(page), "there is no script to show"
+    wrote = service.scripted.calls[1]
+    assert dialogue.INVENT in wrote["messages"][0]["content"]
+    assert wrote["messages"][1]["content"] == "user_prompt: a red ball rolls across a table"
+
+
+def test_sliding_back_to_off_puts_away_a_script_the_next_run_will_not_use(qt, h3_window):
+    from prompt_master.minimax import dialogue
+
+    page = h3_window.minimax
+    service = _ScriptedService(['(S1) [flat] "This is one perfectly usable line."',
+                                "integrated_multimodal_description: ..."])
+    page.service_provider = lambda: service
+    page.prompt.setPlainText("a red ball rolls across a table")
+    page.intensity.setValue(3)
+    page.write_prompt()
+    _finish(qt, page)
+    assert page.spoken.isVisibleTo(page)
+
+    page.intensity.setValue(dialogue.OFF)
+    assert not page.spoken.isVisibleTo(page)
+    page.intensity.setValue(3)
+    assert page.spoken.isVisibleTo(page), "the script is still the one that was written"
+
+
 def test_the_h3_page_scrolls_by_dragging_and_its_bar_cannot_scroll_away(qt, h3_window):
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QScroller
 
     page = h3_window.minimax
-    for widget in (page.prompt, page.output, page.caption):
+    for widget in (page.prompt, page.output, page.caption, page.spoken):
         viewport = widget.viewport()
         assert QScroller.hasScroller(viewport), f"{type(widget).__name__} does not flick"
         assert viewport.testAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents)

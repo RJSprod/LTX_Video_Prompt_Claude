@@ -468,9 +468,9 @@ and press **Write H3 Prompt**. The prompt streams in as the model writes it;
 
 ### The two H3 models
 
-**H3 model** is the one setting, because it is the one thing WanGP knows that
-this page cannot: which H3 model the prompt is being written for. They want
-different prompts, so they get different instructions.
+**H3 model** is the first of the two settings, because it is the one thing
+WanGP knows that this page cannot: which H3 model the prompt is being written
+for. They want different prompts, so they get different instructions.
 
 | Variant | What it writes |
 | --- | --- |
@@ -498,6 +498,76 @@ picture to a model that has none says so while the picture is still attached,
 and pressing the button refuses rather than quietly writing a prompt about a
 still nobody looked at.
 
+### Dialogue
+
+**Dialogue** is a slider from Off to 10, and it is how much of the video is
+somebody talking. Off is where it starts, and at Off the H3 request is
+byte-for-byte the one WanGP would have built — no pass runs, no instruction is
+added, no budget moves. Above that the slider is a quantity rather than a
+switch: 1 is a scene with a line or two in it, 10 is a voice talking essentially
+without stopping while the scene you described goes on underneath it. The line
+under the slider names the share of the running time and the number of lines the
+position asks for.
+
+Above Off it works in two halves, and it needs both.
+
+**The speech is written first.** Between the caption and the prompt, a pass
+reads what you typed — and the caption too, when there is a picture, so the
+people in the still can be the ones who speak. It casts whoever is there, gives
+each of them a speaker ID, and writes their lines with the emotional delivery of
+each one beside it:
+
+```text
+(S1) = the woman in the red coat
+(S2) = unseen narrator
+
+(S1) [quiet, uncertain] "You said you would be back before dark."
+(S2) [measured, close] "She had waited three winters for that sentence."
+```
+
+Three cases, and the pass decides between them from the prompt itself:
+
+- **People in the prompt** get the lines, one speaker ID each, in the order they
+  matter to the scene.
+- **Dialogue already quoted** in the prompt establishes a voice, and the new
+  lines continue that conversation rather than starting another.
+- **Nobody who could speak** gets one unseen narrator, whose register comes from
+  what the scene actually is — hushed over a landscape, clipped over a chase,
+  warm over a memory. They are written as an off-screen voice; no person, radio
+  or telephone is invented into the frame to account for them.
+
+The cast and script are shown in **Dialogue added**, under the caption and for
+the same reason it is shown: a prompt in the wrong voice is a script in the
+wrong voice, and that is worth being able to read.
+
+**The H3 instructions are told what to do with it.** The lines alone are not
+enough — the vendored instructions say not to add dialogue that conflicts with
+the user's request, which is exactly what a pile of extra speech runs into. So
+the intensity goes in as a directive after them: the share of the
+running time that has to carry speech, that every supplied line reaches the
+timeline whole and in order, and how H3 marks the things this depends on —
+stable speaker IDs, `<d>[Language] …</d>` around the exact words and nothing
+else, `<scenetrans>` when a line runs across a cut. The delivery bracket is
+direction rather than dialogue: it is written into the prose around the line, so
+the feeling is heard and seen, and never inside the tag, where it would be read
+out loud.
+
+Three more things worth knowing:
+
+- The **token budget moves with the speech.** A timeline carrying twenty-four
+  lines does not fit in the budget for a timeline carrying none, and would stop
+  mid-sentence. Each supplied line buys room for itself; at Off the budget is
+  WanGP's own number and nothing else.
+- **`@` still has the last word.** The directive goes in ahead of whatever `@`
+  added, because WanGP's own preamble promises a prompt's own instructions
+  higher priority. `@@` is the one case worth stating: it replaces WanGP's
+  instructions, and the slider is not those — it is a control you moved on this
+  page — so it survives, before the replacement text rather than after it.
+- The pass **never costs you a prompt.** If it fails or comes back with nothing
+  usable, the H3 prompt is written anyway, the status line says which happened,
+  and the intensity still applies — the enhancer can act on it with no lines at
+  all.
+
 ### What is WanGP's, and what is not
 
 Every word of instruction is
@@ -510,12 +580,20 @@ instructions for that one generation, and text after `@@` replaces them
 entirely. The provenance, digest and call sites are in
 [`UPSTREAM_SOURCE.txt`](src/prompt_master/minimax/UPSTREAM_SOURCE.txt).
 
-Two things are this application's rather than WanGP's, and both are named where
-they are made: the drop-down that chooses the variant, which in WanGP is
-whichever H3 model is loaded, and the newlines. WanGP folds a finished prompt
-onto one line because its prompt box holds one prompt per line — it keeps them
-in the multi-prompt mode where a prompt may span lines, and an H3 prompt is
-fields separated by blank lines, so they are kept here.
+Three things are this application's rather than WanGP's, and each is named where
+it is made. The drop-down that chooses the variant, which in WanGP is whichever
+H3 model is loaded. The newlines: WanGP folds a finished prompt onto one line
+because its prompt box holds one prompt per line — it keeps them in the
+multi-prompt mode where a prompt may span lines, and an H3 prompt is fields
+separated by blank lines, so they are kept here. And the dialogue slider, whose
+every word lives in
+[`minimax/dialogue.py`](src/prompt_master/minimax/dialogue.py) and nowhere else:
+`prompt_enhancer.py` stays pinned to its digest, `enhancer.py` stays a calling
+convention that writes no prompt text of its own, and the directive is appended
+after the vendored instructions rather than woven through them, so cutting it
+off the end leaves exactly what was there before. At Off nothing is appended at
+all, which `test_minimax_dialogue.py` asserts by building the request both ways
+and comparing them.
 
 The page does not generate video. It writes the prompt you paste into whatever
 does.
@@ -594,32 +672,44 @@ nothing else — the file is checked against the same pinned hash a download is,
 and lands at the same path, so everything downstream of setup cannot tell the
 two apart.
 
-Conversation mode adds no fifth change, because it is not on the path a prompt
-takes. It imports nothing from `prompt_engine`, writes its own system message
-from the character and the persona, and reaches the model through the same
-`InferenceService` and `LlamaClient` prompt mode uses. A prompt generated with
-the mode drop-down set either way is the same prompt.
+Conversation mode and MiniMax H3 mode add no fifth change, because neither is on
+the path a prompt takes. Both import nothing from `prompt_engine` — conversation
+mode writes its own system message from the character and the persona, and the
+H3 page builds its request from instructions vendored from WanGP — and both
+reach the model through the same `InferenceService` and `LlamaClient` prompt mode
+uses. The H3 page's own dialogue slider is bounded the same way the motion
+presets are, one layer down: `minimax/dialogue.py` holds the whole of what it
+does, it appends after the vendored instructions rather than into them, and at
+Off it appends nothing, so an untouched slider is WanGP's request unchanged. A
+prompt generated with the mode drop-down set any of the three ways is the same
+prompt.
 
 ## Tests
 
 ```
-python -m pytest tests/        # 779 passed
+python -m pytest tests/        # 818 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
 - `test_prompt_engine.py` (44) — the adapter seam, the motion presets, speech
   expansion and the UI option sources
-- `test_touch_ui.py` (88) — target sizes, drag-to-scroll, the sliders and the
+- `test_touch_ui.py` (92) — target sizes, drag-to-scroll, the sliders and the
   five display sizes, the menu-bar mode switch and the View toggles, the
   runtime device menu and unloading, the transcript's layout and its sticky
-  bottom, and conversation mode and MiniMax H3 mode driven end to end against a
-  scripted server, measured on a real window built offscreen
+  bottom, and conversation mode and MiniMax H3 mode — including the dialogue
+  slider's two passes — driven end to end against a scripted server, measured
+  on a real window built offscreen
 - `test_chat.py` (40) — the character format and its three imports, chat
   history and branching, and what a chat turn puts on the wire
 - `test_minimax.py` (19) — the vendored H3 instructions against the digest they
   arrived with, and the request built around them against WanGP's: which
   instructions apply, the labelled user turn, the captioner's own instruction,
   the sampler, and what `@` and `@@` do
+- `test_minimax_dialogue.py` (35) — the dialogue slider: that Off builds the
+  same request and the same budget the enhancer alone does, that the directive
+  is appended after the vendored instructions and comes off cleanly, that both
+  quantities the slider drives only ever rise, and that prose, refusals,
+  repeats and over-long lines never reach an H3 prompt
 - `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
   download resume and retry
 - `test_install_flow.py` (139) — install-root discovery, GPU sizing, the CPU
@@ -658,6 +748,7 @@ src/prompt_master/
   minimax/                 MiniMax H3 mode, below the window
   minimax/prompt_enhancer.py  WanGP's H3 instructions, vendored verbatim
   minimax/enhancer.py      WanGP's calling convention around them — ported, not written
+  minimax/dialogue.py      The dialogue slider — ours, appended after the instructions
   ui/                      Main window, chat page, H3 page, character editor, setup wizard
   ui/touch.py              Fingertip sizing and drag-to-scroll, in one place
 installer_files/           Created by the installer (gitignored)
