@@ -147,11 +147,13 @@ with a card in mixed mode — with `--gpu`, or the first card without it.
 | --- | --- |
 | **Prompt mode** | Everything below — an intent in, an LTX-Video 2.3 positive and negative prompt out. This is what the packaged build does, unchanged. |
 | **Conversation mode** | A chat with a character you wrote, on the same local model. See [Conversation mode](#conversation-mode). |
+| **MiniMax H3 mode** | A prompt in, a MiniMax H3 prompt out — WanGP's own prompt enhancer, on the same local model. See [MiniMax H3 mode](#minimax-h3-mode). |
 
-The two share the window, the display size and the one `llama-server` the
-application runs, and nothing else: a conversation cannot reach the prompt
-engine, which is what keeps the engine byte-identical to upstream. The mode is
-remembered, so the application reopens on the one you were using.
+The three share the window, the display size and the one `llama-server` the
+application runs, and nothing else: neither a conversation nor an H3 prompt can
+reach the prompt engine, which is what keeps the engine byte-identical to
+upstream. The mode is remembered, so the application reopens on the one you were
+using.
 
 ### Prompt mode
 
@@ -450,6 +452,74 @@ The conversation is trimmed from the front to fit the context window
 `llama-server` was started with. The character survives a long chat; the
 beginning of the chat does not.
 
+## MiniMax H3 mode
+
+The third thing the menu offers, and the smallest: what you want on the left,
+the finished [MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) prompt on
+the right, and one button between them. It writes nothing for LTX-Video and
+touches nothing that does — it is
+[WanGP](https://github.com/deepbeepmeep/Wan2GP)'s prompt enhancer for H3, run on
+the model this application already installed instead of on a second one
+downloaded beside it.
+
+Type what the video and its sound should be, attach a picture if there is one,
+and press **Write H3 Prompt**. The prompt streams in as the model writes it;
+**Copy** and **Save .txt…** are what it is for.
+
+### The two H3 models
+
+**H3 model** is the one setting, because it is the one thing WanGP knows that
+this page cannot: which H3 model the prompt is being written for. They want
+different prompts, so they get different instructions.
+
+| Variant | What it writes |
+| --- | --- |
+| **FL2VA** | The three-field audiovisual prompt — `integrated_multimodal_description`, `overall_soundscape`, `non_diegetic_music` — for text-to-video, or for a first or last frame. |
+| **Ref2VA** | The six-section reference prompt, from `subject_definitions` through `retention_analysis` to a 350–500 word `detailed_description`. Twice the token budget, because it is twice the prompt. |
+
+**Prompt structure…** opens MiniMax's own guide to whichever of the two is
+selected: what the fields are, how shots are timestamped, and how dialogue is
+marked. The line under the drop-down names the generation the way WanGP names
+it, so *Write an H3 Prompt from Text + Start Image* is what you are about to
+get.
+
+### What the picture does
+
+WanGP's enhancer never sees pixels. It captions the image with a vision model
+first and hands the enhancer the paragraph, so that is what happens here: the
+picture is described, the description goes into the request as its
+`image_caption` line, and the H3 prompt is written from it. The caption is shown
+under the prompt rather than thrown away — a prompt that describes the wrong
+jacket is a caption that got the jacket wrong, and that is worth being able to
+see.
+
+This is the one thing on the page that needs a vision projector. Attaching a
+picture to a model that has none says so while the picture is still attached,
+and pressing the button refuses rather than quietly writing a prompt about a
+still nobody looked at.
+
+### What is WanGP's, and what is not
+
+Every word of instruction is
+[vendored verbatim](src/prompt_master/minimax/prompt_enhancer.py) from the H3
+module written for WanGP, and the request built around it is WanGP's too: its
+labelled `user_prompt:` turn, its 0.6 temperature and 0.9 top-p, its randomized
+seed, its token budgets, and its captioner's own instruction. `@` and `@@` in
+the prompt work as they do there — text after `@` is added to the H3
+instructions for that one generation, and text after `@@` replaces them
+entirely. The provenance, digest and call sites are in
+[`UPSTREAM_SOURCE.txt`](src/prompt_master/minimax/UPSTREAM_SOURCE.txt).
+
+Two things are this application's rather than WanGP's, and both are named where
+they are made: the drop-down that chooses the variant, which in WanGP is
+whichever H3 model is loaded, and the newlines. WanGP folds a finished prompt
+onto one line because its prompt box holds one prompt per line — it keeps them
+in the multi-prompt mode where a prompt may span lines, and an H3 prompt is
+fields separated by blank lines, so they are kept here.
+
+The page does not generate video. It writes the prompt you paste into whatever
+does.
+
 ## Requirements
 
 - Windows x64
@@ -533,22 +603,26 @@ the mode drop-down set either way is the same prompt.
 ## Tests
 
 ```
-python -m pytest tests/        # 701 passed
+python -m pytest tests/        # 779 passed
 ```
 
 - `test_upstream_parity.py` (434) — the upstream self-test, ported
 - `test_prompt_engine.py` (44) — the adapter seam, the motion presets, speech
   expansion and the UI option sources
-- `test_touch_ui.py` (59) — target sizes, drag-to-scroll, the sliders and the
+- `test_touch_ui.py` (88) — target sizes, drag-to-scroll, the sliders and the
   five display sizes, the menu-bar mode switch and the View toggles, the
   runtime device menu and unloading, the transcript's layout and its sticky
-  bottom, and conversation mode driven end to end against a scripted server,
-  measured on a real window built offscreen
-- `test_chat.py` (36) — the character format and its three imports, chat
+  bottom, and conversation mode and MiniMax H3 mode driven end to end against a
+  scripted server, measured on a real window built offscreen
+- `test_chat.py` (40) — the character format and its three imports, chat
   history and branching, and what a chat turn puts on the wire
+- `test_minimax.py` (19) — the vendored H3 instructions against the digest they
+  arrived with, and the request built around them against WanGP's: which
+  instructions apply, the labelled user turn, the captioner's own instruction,
+  the sampler, and what `@` and `@@` do
 - `test_core.py` (15) — multimodal requests, atomic JSON, SSE, zip-slip,
   download resume and retry
-- `test_install_flow.py` (113) — install-root discovery, GPU sizing, the CPU
+- `test_install_flow.py` (139) — install-root discovery, GPU sizing, the CPU
   and mixed devices, manifest resolution, console setup, supplying a model from
   disk, changing device without re-downloading the model, and the installer's
   interpreter and environment checks
@@ -581,7 +655,10 @@ src/prompt_master/
   chat/history.py          Messages, their versions, branching, saved chats
   chat/prompt.py           What one chat turn puts on the wire
   chat/yamlish.py          The YAML subset a character file is written in
-  ui/                      Main window, chat page, character editor, setup wizard
+  minimax/                 MiniMax H3 mode, below the window
+  minimax/prompt_enhancer.py  WanGP's H3 instructions, vendored verbatim
+  minimax/enhancer.py      WanGP's calling convention around them — ported, not written
+  ui/                      Main window, chat page, H3 page, character editor, setup wizard
   ui/touch.py              Fingertip sizing and drag-to-scroll, in one place
 installer_files/           Created by the installer (gitignored)
 user_data/                 Default install root (gitignored)

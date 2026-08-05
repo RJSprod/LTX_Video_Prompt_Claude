@@ -20,15 +20,21 @@ from prompt_master.inference.service import InferenceService
 from prompt_master.provisioning import installer
 from prompt_master.ui import touch
 from prompt_master.ui.chat_page import ChatPage
+from prompt_master.ui.minimax_page import MiniMaxPage
 from prompt_master.ui.model_chooser import ModelDialog
 from prompt_master.ui.setup_wizard import SetupWizard
 
-# The two things this application does, and the order they appear in the mode
-# drop-down. Prompt mode is first because it is what the app was, and what an
-# install that has no characters yet can do.
+# The three things this application does, and the order they appear in the mode
+# menu. Prompt mode is first because it is what the app was, and what an install
+# that has no characters yet can do.
 PROMPT_MODE = "prompt"
 CONVERSATION_MODE = "conversation"
-MODES = ((PROMPT_MODE, "Prompt mode"), (CONVERSATION_MODE, "Conversation mode"))
+MINIMAX_MODE = "minimax"
+MODES = ((PROMPT_MODE, "Prompt mode"), (CONVERSATION_MODE, "Conversation mode"),
+         (MINIMAX_MODE, "MiniMax H3 mode"))
+
+# Which page in the stack each mode is, in the order the constructor adds them.
+PAGES = {PROMPT_MODE: 0, CONVERSATION_MODE: 1, MINIMAX_MODE: 2}
 
 
 class GenerationWorker(QObject):
@@ -103,19 +109,22 @@ class MainWindow(QMainWindow):
     the scale that multiplies them is a menu item, since a tablet held at arm's
     length and a desk monitor do not agree on how big "big enough" is.
 
-    The window holds two of these pages, chosen by the drop-down along the top:
-    prompt mode, described above, and conversation mode. They share the window,
-    the display size and the one llama-server the application runs, and nothing
-    else — a chat cannot reach the prompt engine, which is what keeps the engine
-    the byte-for-byte copy of upstream that ``PARITY_REPORT.md`` says it is.
+    The window holds three of these pages, chosen from the menu bar: prompt
+    mode, described above, conversation mode, and MiniMax H3 mode. They share
+    the window, the display size and the one llama-server the application runs,
+    and nothing else — a chat cannot reach the prompt engine, and neither can
+    the H3 page, which is what keeps the engine the byte-for-byte copy of
+    upstream that ``PARITY_REPORT.md`` says it is and keeps H3's own vendored
+    instructions equally untouched.
     """
 
     def __init__(self, paths: AppPaths | None = None):
         super().__init__(); self.paths = paths or AppPaths.discover(); self.service = InferenceService(self.paths); self.thread = None; self.setWindowTitle("Prompt Master Standalone"); self.image_path: Path | None = None; self.engine = PromptEngine(); self.devices = None
         self.pages=QStackedWidget(); self.pages.addWidget(self.prompt_page())
         # The service is handed over as a callable rather than as itself: re-running
-        # setup replaces it, and the chat page must talk to the one running now.
+        # setup replaces it, and the pages must talk to the one running now.
         self.chat=ChatPage(self.paths, lambda: self.service, self); self.pages.addWidget(self.chat)
+        self.minimax=MiniMaxPage(self.paths, lambda: self.service, self); self.pages.addWidget(self.minimax)
         # After the pages, because the View menu switches parts of one of them on
         # and off and reads their current state to check its own boxes.
         self.build_menus()
@@ -137,7 +146,7 @@ class MainWindow(QMainWindow):
         return page
 
     def select_mode(self, mode: str, remember: bool = True):
-        self.pages.setCurrentIndex(1 if mode == CONVERSATION_MODE else 0)
+        self.pages.setCurrentIndex(PAGES.get(mode, PAGES[PROMPT_MODE]))
         for action in self.mode_actions.actions(): action.setChecked(action.data() == mode)
         if remember:
             settings=self.paths.data/touch.SETTINGS_FILE
@@ -193,8 +202,7 @@ class MainWindow(QMainWindow):
         # it needs, and reading 16-27 GiB back in is not something to do because
         # a menu was used.
         self.service.stop()
-        note=f"Now running on {device.name} — the model loads again on your next generation."
-        self.refresh_status(note); self.chat.set_status(note)
+        self.announce(f"Now running on {device.name} — the model loads again on your next generation.")
 
     def switch_warning(self, device, state) -> str:
         lines=[describe(device),"",
@@ -238,9 +246,8 @@ class MainWindow(QMainWindow):
         except (RuntimeError,OSError,ValueError) as exc:
             QMessageBox.critical(self,"Could not change the model",str(exc)); return
         self.service.stop()
-        note=(f"Now running {dialog.model_path().name} — it loads on your next generation."
-              + ("" if state.get("mmproj") else " No vision projector: images cannot be sent to it."))
-        self.refresh_status(note); self.chat.set_status(note)
+        self.announce(f"Now running {dialog.model_path().name} — it loads on your next generation."
+                      + ("" if state.get("mmproj") else " No vision projector: images cannot be sent to it."))
 
     def unload_model(self):
         """Give the memory back now, rather than when the application closes."""
@@ -248,18 +255,27 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self,"Still generating","Wait for the current generation to finish, or press Stop, before unloading the model."); return
         was_running=self.service.process.running
         self.service.stop()
-        note=("Model unloaded — it loads again on your next generation." if was_running
-              else "No model was loaded.")
-        self.refresh_status(note); self.chat.set_status(note)
+        self.announce("Model unloaded — it loads again on your next generation." if was_running
+                      else "No model was loaded.")
+
+    def announce(self, note: str):
+        """Say the same thing on whichever page is being looked at.
+
+        What runs the model is a property of the application rather than of a
+        page, so a change to it belongs on all three status lines and not only
+        on the one that happened to be in front when the menu was used.
+        """
+        self.refresh_status(note); self.chat.set_status(note); self.minimax.set_status(note)
 
     def busy(self) -> bool:
-        """Whether either page is mid-generation."""
-        return bool(self.thread and self.thread.isRunning()) or self.chat.busy()
+        """Whether any page is mid-generation."""
+        return (bool(self.thread and self.thread.isRunning())
+                or self.chat.busy() or self.minimax.busy())
 
     def remembered_mode(self) -> str:
         try: mode=read_json(self.paths.data/touch.SETTINGS_FILE).get("mode")
         except (OSError,ValueError): return PROMPT_MODE
-        return mode if mode in (PROMPT_MODE,CONVERSATION_MODE) else PROMPT_MODE
+        return mode if mode in PAGES else PROMPT_MODE
 
     def build_menus(self):
         """Settings chooses what the window is doing; View, how much of it shows."""
@@ -447,9 +463,11 @@ class MainWindow(QMainWindow):
         for edit in (self.positive,self.negative): edit.setMinimumHeight(m["target"]*3)
         self.generate_button.setMinimumWidth(m["target"]*4)
         for box in self.findChildren(QComboBox): box.setMaxVisibleItems(8)
-        # Conversation mode is sized by the same choice; it holds the numbers
-        # itself because a bubble's picture and avatar are measured from them.
+        # The other two pages are sized by the same choice; they hold the
+        # numbers themselves because a bubble's picture and avatar are measured
+        # from them.
         if hasattr(self,"chat"): self.chat.apply_metrics(m)
+        if hasattr(self,"minimax"): self.minimax.apply_metrics(m)
         if remember: touch.save_scale(self.paths,name)
 
     def fill_screen(self):
@@ -590,7 +608,7 @@ class MainWindow(QMainWindow):
     def open_setup(self):
         self.service.stop(); wizard=SetupWizard(self.paths,self)
         if wizard.exec() and wizard.completed:
-            self.paths=wizard.paths; self.service=InferenceService(self.paths); self.chat.rebind(self.paths); self.refresh_status()
+            self.paths=wizard.paths; self.service=InferenceService(self.paths); self.chat.rebind(self.paths); self.minimax.rebind(self.paths); self.refresh_status()
     def closeEvent(self,event):
         if self.thread and self.thread.isRunning(): self.thread.quit(); self.thread.wait(3000)
-        self.chat.shutdown(); self.service.stop(); event.accept()
+        self.chat.shutdown(); self.minimax.shutdown(); self.service.stop(); event.accept()
